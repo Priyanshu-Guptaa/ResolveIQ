@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+data/resolveiq.db
+data/chroma/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

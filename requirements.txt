@@ -1,0 +1,20 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-multipart==0.0.20
+python-dateutil==2.9.0.post0
+SQLAlchemy==2.0.36
+chromadb==0.5.23
+sentence-transformers==3.3.1
+# Pinned explicitly: sentence-transformers doesn't pin transformers tightly
+# enough, and a too-new transformers pulls a tokenizers version newer than
+# chromadb (via its embedding-function deps) allows -- pinning both here
+# keeps pip's resolver from picking an inconsistent combination.
+transformers==4.46.3
+tokenizers==0.20.3
+protobuf<6,>=4.21
+streamlit==1.41.1
+requests==2.32.3
+pytest==8.3.4
+httpx==0.28.1

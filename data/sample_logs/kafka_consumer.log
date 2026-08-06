@@ -1,0 +1,7 @@
+2026-08-05 11:02:44 INFO [billing-consumer-7c9b7f8d9c-x2vqk] com.acme.billing.KafkaConsumer - Starting consumer session_id=KC-55291 consumer_group=billing-events-consumer-group topic=billing.events.v1
+2026-08-05 11:05:10 WARN [billing-consumer-7c9b7f8d9c-x2vqk] com.acme.billing.KafkaConsumer - Consumer lag increasing on topic=billing.events.v1 consumer_group=billing-events-consumer-group
+2026-08-05 11:06:02 ERROR [billing-consumer-7c9b7f8d9c-x2vqk] com.acme.billing.DownstreamClient - Call to https://payments.internal.acme.com/api/v1/charge failed
+java.io.IOException: 429 Too Many Requests
+    at com.acme.billing.DownstreamClient.call(DownstreamClient.java:77)
+    at com.acme.billing.KafkaConsumer.processRecord(KafkaConsumer.java:120)
+2026-08-05 11:06:03 ERROR [billing-consumer-7c9b7f8d9c-x2vqk] com.acme.billing.KafkaConsumer - retrying record, consumer stuck host=10.12.4.31 correlation_id=CORR-51ffa2

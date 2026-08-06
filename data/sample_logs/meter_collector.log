@@ -1,0 +1,4 @@
+2026-08-05 03:12:00 INFO CollectorService - Starting poll cycle host=COLL-14 command_log_id=CMD-778213
+2026-08-05 03:12:01 ERROR CollectorService - CommandTimeout for meter=80071234567 endpoint_id=EP-99213 serial_number=SN-4471882 command_log_id=CMD-778213
+2026-08-05 03:12:01 ERROR CollectorService - CommandTimeout for meter=80071234568 endpoint_id=EP-99214 serial_number=SN-4471883 command_log_id=CMD-778214
+2026-08-05 03:14:30 WARN CollectorService - Mesh network health degraded for endpoint_id=EP-99213, retry scheduled event_id=4402

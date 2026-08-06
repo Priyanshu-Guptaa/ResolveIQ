@@ -1,0 +1,10 @@
+2026-08-05 14:22:01,123 INFO [http-nio-8080-exec-7] com.acme.order.OrderController - Received checkout request request_id=REQ-88213 correlation_id=CORR-9f31ac user_id=cust-4471
+2026-08-05 14:22:01,201 DEBUG [http-nio-8080-exec-7] com.acme.order.OrderProcessor - session_id=SESS-a83f2c host=order-svc-01 service=order-service
+2026-08-05 14:22:01,345 ERROR [http-nio-8080-exec-7] com.acme.order.OrderProcessor - Failed to calculate total for customer cust-4471
+java.lang.NullPointerException: Cannot invoke "Address.getZip()" because "shippingAddress" is null
+    at com.acme.order.OrderProcessor.calculateTotal(OrderProcessor.java:142)
+    at com.acme.order.OrderController.checkout(OrderController.java:58)
+    at java.base/java.lang.reflect.Method.invoke(Method.java:568)
+    Caused by: java.lang.IllegalStateException: address cache miss
+    ... 42 more
+2026-08-05 14:22:01,346 ERROR [http-nio-8080-exec-7] com.acme.order.OrderController - request_id=REQ-88213 correlation_id=CORR-9f31ac checkout failed with HTTP 500

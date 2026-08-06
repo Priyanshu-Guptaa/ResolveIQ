@@ -1,0 +1,51 @@
+[
+  {
+    "id": "doc-001",
+    "title": "Playbook: Diagnosing SQL Server blocking and deadlocks",
+    "content": "When you see SqlException timeouts or slow queries, first check sys.dm_exec_requests for sessions with a non-null blocking_session_id. The head blocker is the session with blocking_session_id = 0 (or itself) that others are waiting on. Use sp_who2 or sys.dm_os_waiting_tasks to see the wait_type. For persistent blocking, check for missing indexes causing table scans, or long-running reporting queries against OLTP tables. Deadlocks are logged in the SQL Server error log and can be captured with a deadlock graph via Extended Events.",
+    "tags": ["sql-server", "blocking", "deadlock", "playbook"],
+    "source": "internal-wiki"
+  },
+  {
+    "id": "doc-002",
+    "title": "Playbook: Kafka consumer lag triage",
+    "content": "Consumer lag is the difference between the latest offset on a partition and the consumer group's committed offset. Use kafka-consumer-groups.sh --describe --group <group> to see per-partition lag. Lag growing steadily (not bursty) usually means the consumer is slower than the producer -- check consumer processing time per message. Lag that spikes and stays flat usually means a consumer is stuck or dead -- check consumer thread dumps and downstream call latency/retries.",
+    "tags": ["kafka", "consumer-lag", "playbook"],
+    "source": "internal-wiki"
+  },
+  {
+    "id": "doc-003",
+    "title": "Playbook: IIS Application Pool crashes and 502.3 errors",
+    "content": "A 502.3 Bad Gateway from IIS with an ASP.NET Core app usually means the backend process (w3wp.exe or the out-of-process dotnet.exe) crashed or failed to start. Check Windows Event Viewer > Application log for .NET Runtime and IIS AspNetCoreModule error events around the timestamp. Application Pool 'Rapid-Fail Protection' will stop the pool after repeated crashes within a time window -- check the pool's state in IIS Manager. Unhandled exceptions in Startup.cs or request middleware are the most common cause.",
+    "tags": ["iis", "windows-event-viewer", "502", "playbook"],
+    "source": "internal-wiki"
+  },
+  {
+    "id": "doc-004",
+    "title": "Playbook: Meter/collector communication failure triage",
+    "content": "When meters stop reporting, first check whether the issue is isolated to specific endpoint IDs, a single collector, or a whole mesh network segment. Pull the collector's command log for the affected endpoint IDs and check for CommandTimeout vs NoResponse vs AuthenticationFailure error codes -- each points to a different layer (network, device, or credential). If many meters on the same collector are affected simultaneously, suspect a collector or backhaul network issue rather than individual device failures.",
+    "tags": ["meter", "collector", "ami", "playbook"],
+    "source": "internal-wiki"
+  },
+  {
+    "id": "doc-005",
+    "title": "Playbook: Kubernetes CrashLoopBackOff and OOMKilled diagnosis",
+    "content": "kubectl describe pod <name> shows the last termination reason in the pod's status. OOMKilled means the container exceeded its memory limit. Use kubectl logs <name> --previous to see the crashed container's last log output (the current container's logs are from after the restart). Compare requested/limit memory in the pod spec against actual usage trends -- a genuine leak shows steadily climbing memory across the container's lifetime, not a sudden spike.",
+    "tags": ["kubernetes", "oomkilled", "playbook"],
+    "source": "internal-wiki"
+  },
+  {
+    "id": "doc-006",
+    "title": "Playbook: RabbitMQ queue depth and consumer connectivity",
+    "content": "Growing queue depth with zero or falling consumer count in the RabbitMQ management UI means consumers have disconnected or stopped acknowledging. Check for 'connection reset', 'channel error', or heartbeat timeout entries in the consumer service logs. Client libraries need automatic connection recovery enabled explicitly in most cases -- verify this setting if consumers don't reconnect on their own after a network blip.",
+    "tags": ["rabbitmq", "playbook"],
+    "source": "internal-wiki"
+  },
+  {
+    "id": "doc-007",
+    "title": "Playbook: Tracing a request by correlation ID across microservices",
+    "content": "Every inbound API request should be tagged with a correlation ID (propagated via the X-Correlation-Id header). To find where time is spent in a slow or failing request, grep all service logs for the correlation ID and sort by timestamp to reconstruct the call chain. If a distributed tracing system is available, search the correlation ID there first -- it gives per-hop latency without manual log stitching.",
+    "tags": ["correlation-id", "microservices", "tracing", "playbook"],
+    "source": "internal-wiki"
+  }
+]

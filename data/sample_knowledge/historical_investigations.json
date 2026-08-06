@@ -1,0 +1,82 @@
+[
+  {
+    "id": "hist-001",
+    "title": "SQL Server queries timing out under load on OrdersDB",
+    "description": "Application reported request timeouts and SqlException: Timeout expired errors during peak hours. Multiple sessions were queued waiting on the same table.",
+    "root_cause": "A long-running reporting query was holding row locks on the Orders table, blocking OLTP writes from the order-service. The blocking session (spid) had been open for over 20 minutes.",
+    "resolution": "Killed the blocking SQL session, added a NOLOCK-safe reporting replica, and scheduled the report to run off-peak.",
+    "next_step": "Run sys.dm_exec_requests filtered by blocking_session_id to identify the head blocker, then check its wait_type and last executed query text.",
+    "tags": ["sql-server", "blocking", "timeout", "deadlock", "database"],
+    "domain": "sql-server"
+  },
+  {
+    "id": "hist-002",
+    "title": "Kafka consumer group lag growing unbounded on billing-events topic",
+    "description": "Consumer lag alert fired for the billing-events-consumer-group on topic billing.events.v1. Downstream billing records were delayed by over an hour.",
+    "root_cause": "One consumer instance in the group was stuck in a retry loop calling a downstream API that was returning 429 Too Many Requests, blocking partition processing for the whole group.",
+    "resolution": "Restarted the stuck consumer instance, added exponential backoff with a circuit breaker on the downstream call, and added a per-partition lag alert.",
+    "next_step": "Check consumer group lag per partition (kafka-consumer-groups --describe) and inspect the stuck consumer's thread dump for the partition it owns.",
+    "tags": ["kafka", "consumer-lag", "billing", "retry-storm"],
+    "domain": "kafka"
+  },
+  {
+    "id": "hist-003",
+    "title": "IIS 502.3 Bad Gateway on checkout-api after deployment",
+    "description": "Users hit intermittent 502.3 Bad Gateway errors on the checkout API. Windows Event Viewer showed the w3wp.exe worker process for the app pool terminating unexpectedly.",
+    "root_cause": "An unhandled NullReferenceException in a new pricing-calculation code path crashed the IIS worker process (w3wp.exe), which IIS then restarted mid-request, producing 502.3 for in-flight requests.",
+    "resolution": "Rolled back the deployment, added null checks around the pricing calculation, and added an IIS Application Pool rapid-fail-protection alert.",
+    "next_step": "Check Windows Event Viewer Application log for w3wp.exe crash events and the IIS Application Pool recycling/failure history around the timestamps of the 502 errors.",
+    "tags": ["iis", "502", "app-pool-crash", "windows-event-viewer", "dotnet"],
+    "domain": "iis"
+  },
+  {
+    "id": "hist-004",
+    "title": "Meter communication timeout for a batch of endpoints on collector COLL-14",
+    "description": "A batch of ~40 meters stopped reporting interval data. Collector COLL-14 logs showed repeated CommandTimeout errors when polling the affected meter endpoints.",
+    "root_cause": "A firmware update pushed to the mesh network router serving those endpoints caused it to drop RF communication with the collector, so commands never reached the meters.",
+    "resolution": "Rolled back the router firmware and re-triggered a full mesh network rebuild for the affected endpoint IDs.",
+    "next_step": "Check the collector's command log for the affected meter/endpoint IDs to confirm whether commands are timing out at the RF/mesh layer versus the head-end system.",
+    "tags": ["meter", "collector", "mesh-network", "endpoint", "ami"],
+    "domain": "meter-comm"
+  },
+  {
+    "id": "hist-005",
+    "title": "Kubernetes pod CrashLoopBackOff for payment-service",
+    "description": "The payment-service deployment showed multiple pods in CrashLoopBackOff. Pod events showed OOMKilled as the termination reason.",
+    "root_cause": "A memory leak introduced in a recent release caused heap usage to grow until the container exceeded its memory limit and was OOMKilled by the kubelet.",
+    "resolution": "Rolled back to the previous image, raised the memory limit temporarily, and opened a follow-up to fix the leak (unbounded in-memory cache).",
+    "next_step": "Run kubectl describe pod on the affected pod to confirm OOMKilled, then check kubectl logs --previous for the last log lines before the container was killed.",
+    "tags": ["kubernetes", "oomkilled", "crashloopbackoff", "memory-leak"],
+    "domain": "kubernetes"
+  },
+  {
+    "id": "hist-006",
+    "title": "RabbitMQ queue backlog on notifications.email queue",
+    "description": "The notifications.email queue depth grew to over 500,000 messages with no consumers acknowledging messages.",
+    "root_cause": "The consumer service lost its RabbitMQ connection after a network blip and did not automatically reconnect due to a missing connection-recovery configuration.",
+    "resolution": "Restarted the consumer service, enabled automatic connection recovery in the RabbitMQ client, and added a queue-depth alert.",
+    "next_step": "Check the RabbitMQ management UI for consumer count on the queue and check the consumer service logs for connection reset/channel error entries.",
+    "tags": ["rabbitmq", "queue-backlog", "connection-recovery"],
+    "domain": "rabbitmq"
+  },
+  {
+    "id": "hist-007",
+    "title": "NullPointerException in order-service during checkout",
+    "description": "Java stack traces showed java.lang.NullPointerException in OrderProcessor.calculateTotal when customers with an empty saved-address list attempted checkout.",
+    "root_cause": "A recent refactor removed a null check on the customer's default shipping address, which is null for customers who never saved an address.",
+    "resolution": "Added the null check back and a unit test covering customers with no saved address; deployed hotfix.",
+    "next_step": "Search application logs for the exact exception type and stack trace frame (OrderProcessor.calculateTotal) across all order-service instances to gauge blast radius.",
+    "tags": ["java", "nullpointerexception", "checkout", "order-service"],
+    "domain": "application"
+  },
+  {
+    "id": "hist-008",
+    "title": "Intermittent 500 errors on /api/v1/orders due to downstream timeout",
+    "description": "The orders API endpoint intermittently returned 500 errors. Correlation IDs showed the requests were spending most of their time waiting on the inventory-service call.",
+    "root_cause": "The inventory-service was under-provisioned and its P99 latency exceeded the orders API's HTTP client timeout, causing the orders API to fail the whole request.",
+    "resolution": "Scaled out inventory-service, increased the client timeout with a sane upper bound, and added a fallback for stale-but-available inventory data.",
+    "next_step": "Trace the correlation ID across services to identify which downstream call is consuming most of the request latency before assuming the failure originates in the orders API itself.",
+    "tags": ["api", "correlation-id", "timeout", "microservices"],
+    "domain": "application"
+  }
+]

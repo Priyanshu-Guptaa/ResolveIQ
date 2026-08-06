@@ -1,0 +1,7 @@
+2026-08-05 09:15:02 ERROR Application: w3wp.exe (process_id=5420) worker process for AppPool 'CheckoutApiPool' terminated unexpectedly. event_id=5011 host=WEB-PROD-03
+2026-08-05 09:15:03 WARN IIS AspNetCoreModuleV2: process crashed while handling request x-correlation-id=CORR-7d21bb, aborted with 502.3
+2026-08-05 09:15:03 ERROR IIS AspNetCoreModuleV2: System.NullReferenceException: Object reference not set to an instance of an object.
+    at CheckoutApi.PricingCalculator.Calculate(CheckoutRequest request)
+    at CheckoutApi.Controllers.CheckoutController.Post(CheckoutRequest request)
+2026-08-05 09:15:05 INFO IIS AspNetCoreModuleV2: restarting worker process for AppPool 'CheckoutApiPool' process_id=5488
+2026-08-05 09:16:10 ERROR Application: event_id=1000 Faulting application name: w3wp.exe, exception code 0xc0000005 host=WEB-PROD-03

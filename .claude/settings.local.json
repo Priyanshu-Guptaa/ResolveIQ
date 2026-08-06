@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./.venv/Scripts/python.exe -m pip install --upgrade pip -q)",
+      "Bash(./.venv/Scripts/python.exe -m pip install -r requirements.txt)",
+      "Bash(py -0p)",
+      "Bash(where python *)",
+      "Bash(py -3.12 --version)",
+      "Bash(py -3.11 --version)",
+      "Bash(rm -rf .venv)",
+      "Bash(\"/c/Users/guptapr/AppData/Local/Programs/Python/Python313/python.exe\" -m venv .venv)",
+      "Bash(./.venv/Scripts/python.exe --version)",
+      "Bash(./.venv/Scripts/python.exe -m pip index versions chroma-hnswlib)",
+      "Bash(./.venv/Scripts/python.exe -m pip install --only-binary=:all: chroma-hnswlib==0.7.6)",
+      "Bash(winget install *)",
+      "Bash(./.venv/Scripts/python.exe -m pip list)",
+      "Bash(grep -v -i '^chromadb' requirements.txt)",
+      "Read(//tmp/**)",
+      "Bash(./.venv/Scripts/python.exe -m pip install -r /tmp/requirements-no-chroma.txt)",
+      "Bash(./.venv/Scripts/python.exe -m pytest -v)",
+      "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\guptapr\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-guptapr-Projects-ResolveIQ\\\\14fa2d7d-146a-4b0e-8f91-00f9a3efd0b3\\\\scratchpad\\\\smoke_test_no_chroma.py\")",
+      "Bash(./.venv/Scripts/python.exe -c \"from app.api.main import app; print\\('FastAPI app imported OK:', app.title\\); print\\('Routes:', [r.path for r in app.routes]\\)\")",
+      "Bash(./.venv/Scripts/python.exe -m pip install chromadb==0.5.23)",
+      "Bash(./.venv/Scripts/python.exe -m pip install \"protobuf>=4.21,<6\" \"tokenizers>=0.20,<=0.20.3\")",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "Bash(./.venv/Scripts/python.exe -m pip show transformers tokenizers chromadb sentence-transformers)",
+      "Bash(./.venv/Scripts/python.exe -m scripts.seed_knowledge)",
+      "Bash(mkdir -p \"/c/Users/guptapr/Projects/ResolveIQ/.claude\")",
+      "Bash(python -m json.tool)"
+    ]
+  }
+}
