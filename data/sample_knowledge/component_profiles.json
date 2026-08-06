@@ -1,0 +1,142 @@
+[
+  {
+    "id": "command-processor-host",
+    "name": "CommandProcessorHost",
+    "product": "Command Center",
+    "responsibilities": [
+      "Receives meter commands from the Scheduler",
+      "Validates commands against the meter's current DCW",
+      "Dispatches validated commands to the mesh network via collectors"
+    ],
+    "related_components": ["CommandPayloadProcessorHost", "MsgProcCmdRspHost", "Scheduler"],
+    "typical_failures": [
+      "Firmware/DCW mismatch after upgrade without GEI",
+      "Command payload built against a stale DCW version",
+      "Command queue backlog under high load"
+    ],
+    "required_logs": ["CommandProcessorHost.log", "CommandPayloadProcessorHost.log"],
+    "common_sql": ["SELECT * FROM CommandLog WHERE CommandLogId = :command_log_id"],
+    "known_bugs": ["GLP commands return a Ping response when DCW is stale (no GEI sent post-upgrade)"],
+    "documentation_links": ["Playbook: GLP/DCW mismatch triage"],
+    "playbooks": [
+      "Verify firmware/DCW version",
+      "Check GEI sent after firmware upgrade",
+      "Compare GLP payload against expected DCW"
+    ]
+  },
+  {
+    "id": "command-payload-processor-host",
+    "name": "CommandPayloadProcessorHost",
+    "product": "Command Center",
+    "responsibilities": [
+      "Builds the binary command payload for a validated command",
+      "Encodes command parameters according to the meter's DCW"
+    ],
+    "related_components": ["CommandProcessorHost", "MsgProcCmdRspHost"],
+    "typical_failures": [
+      "Payload encoding mismatch when DCW version is stale",
+      "Unsupported command type for the meter's firmware"
+    ],
+    "required_logs": ["CommandPayloadProcessorHost.log"],
+    "common_sql": ["SELECT * FROM CommandPayload WHERE CommandLogId = :command_log_id"],
+    "known_bugs": [],
+    "documentation_links": ["Playbook: GLP/DCW mismatch triage"],
+    "playbooks": ["Review CommandPayloadProcessorHost log for encoding errors"]
+  },
+  {
+    "id": "msg-proc-cmd-rsp-host",
+    "name": "MsgProcCmdRspHost",
+    "product": "Command Center",
+    "responsibilities": [
+      "Receives and parses command responses from meters",
+      "Matches responses back to the originating command log entry",
+      "Flags mismatched or unexpected response types"
+    ],
+    "related_components": ["CommandProcessorHost", "Scheduler"],
+    "typical_failures": [
+      "Response type mismatch (e.g. a Ping response returned instead of GLP)",
+      "Response timeout not correlated back to the command log",
+      "Duplicate response handling errors"
+    ],
+    "required_logs": ["MsgProcCmdRspHost.log"],
+    "common_sql": ["SELECT * FROM CommandResponse WHERE CommandLogId = :command_log_id"],
+    "known_bugs": ["Get Load Profile command returning a Ping response for stale-DCW meters"],
+    "documentation_links": ["Playbook: GLP/DCW mismatch triage"],
+    "playbooks": [
+      "Compare expected vs actual response type",
+      "Review CommandLogId correlation across CommandProcessorHost and MsgProcCmdRspHost"
+    ]
+  },
+  {
+    "id": "scheduler",
+    "name": "Scheduler",
+    "product": "Command Center",
+    "responsibilities": [
+      "Schedules and queues meter commands based on business rules and priority",
+      "Triggers periodic jobs (load profile collection, firmware pushes)",
+      "Retries failed commands per policy"
+    ],
+    "related_components": ["CommandProcessorHost", "GapRecon"],
+    "typical_failures": [
+      "Job backlog due to downstream CommandProcessorHost slowdown",
+      "Retry storm after a mass timeout event",
+      "Misconfigured schedule causing duplicate command submission"
+    ],
+    "required_logs": ["Scheduler.log"],
+    "common_sql": ["SELECT * FROM ScheduledJob WHERE Status = 'Failed' ORDER BY ScheduledTime DESC"],
+    "known_bugs": [],
+    "documentation_links": ["Playbook: Command timeout triage"],
+    "playbooks": [
+      "Check for job backlog in the Scheduler queue",
+      "Verify the retry policy hasn't triggered a retry storm"
+    ]
+  },
+  {
+    "id": "gap-recon",
+    "name": "GapRecon",
+    "product": "Command Center",
+    "responsibilities": [
+      "Detects gaps in expected meter data (e.g. missing interval reads)",
+      "Reconciles missing data by scheduling backfill commands via the Scheduler",
+      "Reports unresolved gaps for engineer review"
+    ],
+    "related_components": ["Scheduler", "NMS"],
+    "typical_failures": [
+      "Gap detection false positives after a collector outage",
+      "Backfill commands not submitted due to Scheduler backlog",
+      "Reconciliation loop stalls on persistently unreachable meters"
+    ],
+    "required_logs": ["GapRecon.log"],
+    "common_sql": ["SELECT * FROM DataGap WHERE Status = 'Open' ORDER BY DetectedAt DESC"],
+    "known_bugs": [],
+    "documentation_links": ["Playbook: Low reads / missing interval data triage"],
+    "playbooks": [
+      "Check the DataGap table for unresolved gaps",
+      "Confirm backfill commands were submitted to the Scheduler"
+    ]
+  },
+  {
+    "id": "nms",
+    "name": "NMS",
+    "product": "Command Center",
+    "responsibilities": [
+      "Monitors mesh network and collector health",
+      "Tracks device connectivity and RF signal quality",
+      "Raises alarms for network-level failures (collector down, mesh segment unreachable)"
+    ],
+    "related_components": ["GapRecon", "Collectors"],
+    "typical_failures": [
+      "False alarms during firmware rollout windows",
+      "Alarm storm after a mesh router firmware regression",
+      "Stale connectivity status due to polling delay"
+    ],
+    "required_logs": ["NMS.log", "collector health log"],
+    "common_sql": ["SELECT * FROM NetworkAlarm WHERE Status = 'Active' ORDER BY RaisedAt DESC"],
+    "known_bugs": ["Mesh routers on firmware v3.4.0 intermittently stop forwarding commands"],
+    "documentation_links": ["Playbook: Meter/collector communication failure triage"],
+    "playbooks": [
+      "Check NMS for active alarms on the affected collector/segment",
+      "Confirm mesh router firmware version"
+    ]
+  }
+]

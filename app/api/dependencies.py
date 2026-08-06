@@ -25,6 +25,8 @@ from app.engines.knowledge.knowledge_store import ChromaKnowledgeStore, Knowledg
 from app.engines.log_intelligence.engine import LogIntelligenceEngine
 from app.engines.log_intelligence.entity_extractor import EntityExtractor, RegexEntityExtractor
 from app.engines.log_intelligence.log_parser import GenericLogParser, LogParser
+from app.engines.product_intelligence.component_registry import ComponentRegistry
+from app.engines.product_intelligence.engine import ProductIntelligenceEngine
 from app.engines.recommendation.engine import RecommendationEngine
 from app.infrastructure.db.repository import InvestigationRepository, SqlAlchemyInvestigationRepository
 from app.infrastructure.db.session import get_session_factory
@@ -83,6 +85,17 @@ def _ingestion_engine() -> IngestionEngine:
     return IngestionEngine(_file_type_registry())
 
 
+@lru_cache
+def _component_registry() -> ComponentRegistry:
+    settings = get_settings()
+    return ComponentRegistry.load_from_file(settings.sample_knowledge_dir / "component_profiles.json")
+
+
+@lru_cache
+def _product_intelligence_engine() -> ProductIntelligenceEngine:
+    return ProductIntelligenceEngine(_component_registry())
+
+
 # --- Public dependencies (used via FastAPI's Depends(...)) -----------------
 
 
@@ -102,6 +115,10 @@ def get_recommendation_engine() -> RecommendationEngine:
     return RecommendationEngine(_knowledge_engine_singleton(), get_settings())
 
 
+def get_product_intelligence_engine() -> ProductIntelligenceEngine:
+    return _product_intelligence_engine()
+
+
 def reset_singletons() -> None:
     """Test/dev helper: clears every cached singleton so the next
     dependency call rebuilds from current settings. Not used by the app
@@ -117,5 +134,7 @@ def reset_singletons() -> None:
         _log_intelligence_engine,
         _file_type_registry,
         _ingestion_engine,
+        _component_registry,
+        _product_intelligence_engine,
     ):
         fn.cache_clear()

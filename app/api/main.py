@@ -18,6 +18,7 @@ from app.api.routers import (
     health,
     investigations,
     knowledge,
+    product_intelligence,
     settings as settings_router,
     sql_studio,
 )
@@ -54,3 +55,4 @@ app.include_router(dashboard.router)
 app.include_router(settings_router.router)
 app.include_router(knowledge.router)
 app.include_router(sql_studio.router)
+app.include_router(product_intelligence.router)

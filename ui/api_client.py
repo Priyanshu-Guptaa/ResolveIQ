@@ -135,3 +135,11 @@ def list_investigations_cached() -> list | None:
     applies; the actual Workspace/Log Intelligence/AI Assistant *content*
     for a selected investigation is never cached."""
     return api_get("/investigations")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_component_profiles_cached() -> list | None:
+    """5min TTL, same reasoning as the Query Library: the Component
+    Registry is a static JSON seed file in this phase -- it can't change
+    without a deploy, which restarts the process and clears this cache."""
+    return api_get("/product-intelligence/components")

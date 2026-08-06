@@ -11,8 +11,9 @@ Scope discipline for this phase: every panel here displays EXISTING
 computed data (Log Intelligence's merged_entities, the Recommendation
 Engine's existing output) -- no new recommendation logic, per "do not
 expand Recommendation Engine logic yet." Product Intelligence's right-rail
-section is an honest "arrives in Phase 2B" placeholder, not fabricated
-content, since that module doesn't exist yet.
+section (Phase 2B, incremental) renders real Component Registry data via
+a plain manual picker -- no auto-matching of evidence to a component,
+that's Recommendation Engine V2's job.
 
 Design note on the left/center relationship: the RFC's wireframe shows
 the left explorer and center tabs as loosely coupled (clicking an
@@ -25,7 +26,15 @@ structure. Documented here rather than silently deviating.
 from __future__ import annotations
 
 import streamlit as st
-from api_client import api_get, api_patch, api_post, ensure_api_available, list_investigations_cached
+from api_client import (
+    api_get,
+    api_patch,
+    api_post,
+    ensure_api_available,
+    get_component_profiles_cached,
+    list_investigations_cached,
+)
+from components.component_profile import render_component_profile
 from components.investigation_picker import render_investigation_picker
 from components.summary_card import render_details_editor, render_summary_card
 from context import get_active_investigation_id, set_active_investigation_id
@@ -216,12 +225,22 @@ with center:
             "General notes. Categorized types (Customer Update, L2 Notes, L3 Escalation, "
             "RCA) arrive with Documentation Generators in a later phase."
         )
+        if not notes:
+            st.caption("No notes yet.")
         for note in notes:
             st.markdown(f"`{note['created_at'][:16].replace('T', ' ')}`")
             st.text(note["raw_content"][:800])
             st.divider()
-        new_note = st.text_area("Add a note", key="workspace_note_text")
-        if st.button("Add note", key="workspace_add_note_btn") and new_note.strip():
+
+        # A plain text_area + button (no form) keeps its typed value in
+        # session_state across the st.rerun() below -- after successfully
+        # adding a note, the box would still show the old text, reading
+        # as "did that actually save?" clear_on_submit=True is exactly
+        # for this: the widget resets once the form submits successfully.
+        with st.form(f"add_note_form_{investigation_id}", clear_on_submit=True):
+            new_note = st.text_area("Add a note")
+            submitted = st.form_submit_button("Add note")
+        if submitted and new_note.strip():
             result = api_post(f"/investigations/{investigation_id}/evidence/notes", {"text": new_note})
             if result is not None:
                 st.success("Note added.")
@@ -248,7 +267,15 @@ with right:
             st.caption("Detailed match reasoning (component/firmware/version) arrives with Product Intelligence -- Phase 2B.")
 
     with st.expander("🧩 Product Intelligence", expanded=False):
-        st.caption("Product Intelligence module arrives in Phase 2B -- component profiles, dependencies, and version differences will appear here.")
+        components = get_component_profiles_cached() or []
+        if not components:
+            st.caption("No component profiles loaded.")
+        else:
+            names = [c["name"] for c in components]
+            selected_name = st.selectbox("Component", names, key=f"pi_component_{investigation_id}")
+            selected_profile = next(c for c in components if c["name"] == selected_name)
+            render_component_profile(selected_profile)
+            st.caption("Version differences and automatic evidence matching arrive with Recommendation Engine V2 -- Phase 2C.")
 
     with st.expander("🐞 Known Bugs", expanded=False):
         if not recommendation or not recommendation["known_bugs"]:
