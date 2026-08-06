@@ -36,6 +36,14 @@ class InvestigationModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     last_viewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
 
+    # Manually-entered case metadata (Phase 2A, persistent Summary Card).
+    # Nullable/optional -- see InvestigationSession's docstring for why.
+    customer: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    product: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    version: Mapped[str | None] = mapped_column(String(100), nullable=True, default=None)
+    technology: Mapped[str | None] = mapped_column(String(100), nullable=True, default=None)
+    assigned_engineer: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+
     evidence: Mapped[list["EvidenceModel"]] = relationship(
         back_populates="investigation",
         cascade="all, delete-orphan",

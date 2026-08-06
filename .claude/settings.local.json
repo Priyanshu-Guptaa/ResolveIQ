@@ -71,7 +71,10 @@
       "Bash(curl -sI http://localhost:8511)",
       "Bash(grep -v \"^$\")",
       "Bash(powershell -Command 'Get-NetTCPConnection -LocalPort 8010,8511 -ErrorAction SilentlyContinue | Select-Object -Unique OwningProcess | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }')",
-      "Bash(rm -rf \"/c/Users/guptapr/AppData/Local/Temp/claude/C--Users-guptapr-Projects-ResolveIQ/14fa2d7d-146a-4b0e-8f91-00f9a3efd0b3/scratchpad/ingest_test\")"
+      "Bash(rm -rf \"/c/Users/guptapr/AppData/Local/Temp/claude/C--Users-guptapr-Projects-ResolveIQ/14fa2d7d-146a-4b0e-8f91-00f9a3efd0b3/scratchpad/ingest_test\")",
+      "Bash(./.venv/Scripts/python.exe -m py_compile ui/views/2_Investigation_Workspace.py ui/components/summary_card.py ui/api_client.py)",
+      "Bash(powershell -Command 'Get-NetTCPConnection -LocalPort 8511 -ErrorAction SilentlyContinue | Select-Object -Unique OwningProcess | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }')",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_investigation_engine.py -v)"
     ]
   }
 }

@@ -25,6 +25,18 @@ class AddNoteRequest(BaseModel):
     text: str = Field(min_length=1)
 
 
+class UpdateInvestigationDetailsRequest(BaseModel):
+    """Persistent Summary Card fields (RFC rev 3, Phase 2A) -- all
+    optional, engineer-entered. Fields left as None are left unchanged,
+    not cleared (see InvestigationEngine.update_details)."""
+
+    customer: str | None = None
+    product: str | None = None
+    version: str | None = None
+    technology: str | None = None
+    assigned_engineer: str | None = None
+
+
 class InvestigationSummary(BaseModel):
     """Lightweight shape for the investigation list view."""
 

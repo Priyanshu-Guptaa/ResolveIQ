@@ -52,6 +52,19 @@ def api_post(path: str, json_body: dict | None = None, files=None) -> dict | lis
         return None
 
 
+def api_patch(path: str, json_body: dict | None = None) -> dict | list | None:
+    try:
+        response = requests.patch(f"{API_BASE_URL}{path}", json=json_body, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        detail = ""
+        if getattr(exc, "response", None) is not None:
+            detail = f" -- {exc.response.text}"
+        st.error(f"API request failed: PATCH {path} -- {exc}{detail}")
+        return None
+
+
 def api_available() -> bool:
     """Cheap liveness check -- pages use this to show one clear banner
     instead of a wall of individual request errors when the API is down."""

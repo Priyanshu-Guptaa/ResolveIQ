@@ -51,6 +51,17 @@ class InvestigationSession(BaseModel):
     backs the "Recently Viewed" panel (RFC rev 3, Dashboard)."""
     evidence: list[Evidence] = Field(default_factory=list)
 
+    # --- Manually-entered case metadata (Phase 2A, persistent Summary Card) ---
+    # These are engineer-entered, not derived -- Product Intelligence (Phase
+    # 2B) and richer entity extraction may later suggest/prefill them, but
+    # nothing today can compute them, so they start blank rather than
+    # fabricated. All optional; the Summary Card shows "--" when unset.
+    customer: str | None = None
+    product: str | None = None
+    version: str | None = None
+    technology: str | None = None
+    assigned_engineer: str | None = None
+
     @property
     def merged_entities(self) -> list[ExtractedEntity]:
         """De-duplicated entities across all evidence, most-frequent first.

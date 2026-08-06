@@ -9,9 +9,14 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 
 from app.api.dependencies import get_investigation_engine, get_recommendation_engine
-from app.api.schemas import AddNoteRequest, CreateInvestigationRequest, InvestigationSummary
+from app.api.schemas import (
+    AddNoteRequest,
+    CreateInvestigationRequest,
+    InvestigationSummary,
+    UpdateInvestigationDetailsRequest,
+)
 from app.domain.evidence import Evidence
-from app.domain.investigation import InvestigationListItem, InvestigationSession
+from app.domain.investigation import ActivityItem, InvestigationListItem, InvestigationSession
 from app.domain.recommendation import Recommendation
 from app.engines.investigation.engine import InvestigationEngine, InvestigationNotFoundError
 from app.engines.recommendation.engine import RecommendationEngine
@@ -104,6 +109,33 @@ async def upload_logs(
     except InvestigationNotFoundError as exc:
         raise _not_found(exc) from exc
     return results
+
+
+@router.patch("/{investigation_id}/details", response_model=InvestigationSession)
+def update_investigation_details(
+    investigation_id: str,
+    request: UpdateInvestigationDetailsRequest,
+    engine: InvestigationEngine = Depends(get_investigation_engine),
+) -> InvestigationSession:
+    """Saves the persistent Summary Card's engineer-entered fields
+    (customer, product, version, technology, assigned engineer)."""
+    try:
+        return engine.update_details(investigation_id, **request.model_dump())
+    except InvestigationNotFoundError as exc:
+        raise _not_found(exc) from exc
+
+
+@router.get("/{investigation_id}/timeline", response_model=list[ActivityItem])
+def get_investigation_timeline(
+    investigation_id: str,
+    engine: InvestigationEngine = Depends(get_investigation_engine),
+) -> list[ActivityItem]:
+    """Real chronological events for one investigation -- backs the
+    Workspace's Timeline nav item (Phase 2A)."""
+    try:
+        return engine.get_timeline(investigation_id)
+    except InvestigationNotFoundError as exc:
+        raise _not_found(exc) from exc
 
 
 @router.get("/{investigation_id}/recommendations", response_model=Recommendation)

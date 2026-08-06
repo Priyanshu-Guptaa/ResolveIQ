@@ -156,6 +156,40 @@ class InvestigationEngine:
     def list_recent_activity(self, limit: int = 10) -> list[ActivityItem]:
         return self._repository.list_recent_activity(limit)
 
+    def get_timeline(self, investigation_id: str, limit: int = 50) -> list[ActivityItem]:
+        """Real events for one investigation, chronological -- backs the
+        Workspace's Timeline nav item (Phase 2A). Built from the same
+        Evidence rows Dashboard's activity feed uses; a dedicated Timeline
+        Engine (later phase) can enrich this with recommendation-generated
+        and status-change events without changing this method's shape."""
+        self._ensure_exists(investigation_id)
+        return self._repository.list_activity_for_investigation(investigation_id, limit)
+
+    def update_details(
+        self,
+        investigation_id: str,
+        *,
+        customer: str | None = None,
+        product: str | None = None,
+        version: str | None = None,
+        technology: str | None = None,
+        assigned_engineer: str | None = None,
+    ) -> InvestigationSession:
+        """Saves engineer-entered case metadata for the persistent Summary
+        Card (Phase 2A). Only fields explicitly passed are updated --
+        pass only what changed, existing values for other fields are
+        preserved (see the router for how partial updates are built)."""
+        self._ensure_exists(investigation_id)
+        fields = {
+            "customer": customer,
+            "product": product,
+            "version": version,
+            "technology": technology,
+            "assigned_engineer": assigned_engineer,
+        }
+        self._repository.update_details(investigation_id, **{k: v for k, v in fields.items() if v is not None})
+        return self.get_investigation(investigation_id)
+
     def get_dashboard_stats(self) -> DashboardStats:
         # Lightweight summaries -- stats only need status/created_at/
         # updated_at, never evidence content (Phase 1.5 fix).

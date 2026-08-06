@@ -53,3 +53,45 @@ section[data-testid="stSidebar"] {
     opacity: 0.6;
     margin: 4px 0 8px;
 }
+
+/* Persistent Investigation Summary card (Phase 2A) */
+.riq-summary-card {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    border: 1.5px solid rgba(47, 110, 140, 0.5);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 10px;
+}
+.riq-summary-cell {
+    padding: 8px 12px;
+    border-right: 1px solid rgba(128, 128, 128, 0.2);
+    border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+}
+.riq-summary-key {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 0.62rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    opacity: 0.6;
+}
+.riq-summary-value {
+    font-size: 0.82rem;
+    font-weight: 600;
+    margin-top: 2px;
+}
+
+/* Left explorer nav (Phase 2A) */
+.riq-nav-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    margin-bottom: 2px;
+}
+.riq-nav-item.active {
+    background: rgba(47, 110, 140, 0.15);
+    font-weight: 600;
+}

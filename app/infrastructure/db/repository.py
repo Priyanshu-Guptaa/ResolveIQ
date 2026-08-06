@@ -49,6 +49,12 @@ class InvestigationRepository(Protocol):
     def list_recently_viewed(self, limit: int = 5) -> list[InvestigationListItem]:
         ...
 
+    def update_details(self, investigation_id: str, **fields: str | None) -> None:
+        ...
+
+    def list_activity_for_investigation(self, investigation_id: str, limit: int = 50) -> list[ActivityItem]:
+        ...
+
 
 class SqlAlchemyInvestigationRepository:
     """SQLite-backed (via SQLAlchemy) implementation."""
@@ -67,6 +73,11 @@ class SqlAlchemyInvestigationRepository:
             model.created_at = investigation.created_at
             model.updated_at = investigation.updated_at
             model.last_viewed_at = investigation.last_viewed_at
+            model.customer = investigation.customer
+            model.product = investigation.product
+            model.version = investigation.version
+            model.technology = investigation.technology
+            model.assigned_engineer = investigation.assigned_engineer
             session.commit()
             logger.debug("Saved investigation %s", investigation.id)
 
@@ -251,6 +262,73 @@ class SqlAlchemyInvestigationRepository:
                 for row in rows
             ]
 
+    def update_details(self, investigation_id: str, **fields: str | None) -> None:
+        """Saves engineer-entered case metadata (customer, product,
+        version, technology, assigned_engineer) for the persistent Summary
+        Card. Only known InvestigationModel columns are ever set --
+        unrecognized kwargs are ignored rather than raising, so callers
+        can pass a partial dict without filtering it first."""
+        with self._session_factory() as session:
+            model = session.get(InvestigationModel, investigation_id)
+            if model is None:
+                return
+            for key, value in fields.items():
+                if hasattr(model, key):
+                    setattr(model, key, value)
+            session.commit()
+
+    def list_activity_for_investigation(self, investigation_id: str, limit: int = 50) -> list[ActivityItem]:
+        """Same shape as list_recent_activity(), scoped to one
+        investigation -- backs the Workspace's Timeline nav item until the
+        dedicated Timeline Engine (a later phase) replaces the underlying
+        query without changing this method's contract."""
+        with self._session_factory() as session:
+            items: list[ActivityItem] = []
+
+            investigation_row = (
+                session.query(InvestigationModel.id, InvestigationModel.title, InvestigationModel.created_at)
+                .filter(InvestigationModel.id == investigation_id)
+                .first()
+            )
+            if investigation_row is None:
+                return []
+            inv_id, inv_title, created_at = investigation_row
+            items.append(
+                ActivityItem(
+                    investigation_id=inv_id,
+                    investigation_title=inv_title,
+                    kind="investigation_created",
+                    label=f"Investigation created: {inv_title}",
+                    occurred_at=created_at,
+                )
+            )
+
+            evidence_rows = (
+                session.query(
+                    EvidenceModel.evidence_type,
+                    EvidenceModel.title,
+                    EvidenceModel.created_at,
+                )
+                .filter(EvidenceModel.investigation_id == investigation_id)
+                .order_by(EvidenceModel.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            for ev_type, ev_title, ev_created_at in evidence_rows:
+                items.append(
+                    ActivityItem(
+                        investigation_id=investigation_id,
+                        investigation_title=inv_title,
+                        kind="evidence_added",
+                        label=f"{ev_title or ev_type} added",
+                        evidence_type=ev_type,
+                        occurred_at=ev_created_at,
+                    )
+                )
+
+            items.sort(key=lambda item: item.occurred_at, reverse=True)
+            return items[:limit]
+
 
 def _to_domain(model: InvestigationModel) -> InvestigationSession:
     evidence_list = [
@@ -275,5 +353,10 @@ def _to_domain(model: InvestigationModel) -> InvestigationSession:
         created_at=model.created_at,
         updated_at=model.updated_at,
         last_viewed_at=model.last_viewed_at,
+        customer=model.customer,
+        product=model.product,
+        version=model.version,
+        technology=model.technology,
+        assigned_engineer=model.assigned_engineer,
         evidence=evidence_list,
     )
