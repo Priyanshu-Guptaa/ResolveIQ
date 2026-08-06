@@ -42,7 +42,9 @@ app/
 │   ├── db/             SQLite persistence (SQLAlchemy) via the repository pattern
 │   └── vectorstore/    ChromaDB client wrapper
 └── api/                FastAPI app: routers, schemas, DI wiring
-ui/streamlit_app.py     Thin UI client over the API
+ui/Home.py              Multi-page Streamlit entrypoint (Dashboard, Workspace, ...)
+ui/pages/               One file per module -- see RFC rev 3 for the Sprint 2 phase plan
+ui/components/          Shared widgets (status badges, ...)
 scripts/seed_knowledge.py   Standalone knowledge (re)seed CLI
 data/sample_knowledge/  Sample historical investigations / docs / known bugs
 data/sample_logs/       Sample log files (Java, IIS, Kafka, meter/collector)
@@ -76,10 +78,11 @@ pip install -r requirements.txt
 uvicorn app.api.main:app --reload
 
 # Terminal 2: UI
-streamlit run ui/streamlit_app.py
+streamlit run ui/Home.py
 ```
 
-Then open the Streamlit URL, start an investigation, paste a description
+Then open the Streamlit URL. The Dashboard is the home page; use the sidebar
+to reach Investigation Workspace, start an investigation, paste a description
 (or use one that mentions e.g. a `NullPointerException` or `spid=61`),
 upload one of the files in `data/sample_logs/`, and click **Analyze**.
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.domain.enums import KnowledgeCollection
@@ -55,7 +56,8 @@ class KnowledgeEngine:
             return 0
 
         records = [HistoricalInvestigationRecord(**raw) for raw in json.loads(path.read_text())]
-        for record in records:
+        base_time = datetime.now(timezone.utc)
+        for index, record in enumerate(records):
             searchable_text = (
                 f"{record.title}\n{record.description}\nRoot cause: {record.root_cause}\n"
                 f"Resolution: {record.resolution}\nTags: {', '.join(record.tags)}"
@@ -71,6 +73,7 @@ class KnowledgeEngine:
                     "next_step": record.next_step,
                     "tags": ", ".join(record.tags),
                     "domain": record.domain,
+                    "imported_at": _seed_timestamp(base_time, index),
                 },
             )
         return len(records)
@@ -84,14 +87,19 @@ class KnowledgeEngine:
             return 0
 
         records = [DocumentationRecord(**raw) for raw in json.loads(path.read_text())]
-        for record in records:
+        base_time = datetime.now(timezone.utc)
+        for index, record in enumerate(records):
             searchable_text = f"{record.title}\n{record.content}\nTags: {', '.join(record.tags)}"
             self._store.upsert(
                 collection,
                 record.id,
                 searchable_text,
                 record.title,
-                metadata={"source": record.source, "tags": ", ".join(record.tags)},
+                metadata={
+                    "source": record.source,
+                    "tags": ", ".join(record.tags),
+                    "imported_at": _seed_timestamp(base_time, index),
+                },
             )
         return len(records)
 
@@ -104,7 +112,8 @@ class KnowledgeEngine:
             return 0
 
         records = [KnownBugRecord(**raw) for raw in json.loads(path.read_text())]
-        for record in records:
+        base_time = datetime.now(timezone.utc)
+        for index, record in enumerate(records):
             searchable_text = (
                 f"{record.title}\n{record.description}\n"
                 f"Affected: {', '.join(record.affected_components)}\n"
@@ -119,6 +128,7 @@ class KnowledgeEngine:
                     "status": record.status,
                     "affected_components": ", ".join(record.affected_components),
                     "workaround": record.workaround or "",
+                    "imported_at": _seed_timestamp(base_time, index),
                 },
             )
         return len(records)
@@ -133,3 +143,20 @@ class KnowledgeEngine:
 
     def search_known_bugs(self, query_text: str, top_k: int = 5) -> list[KnowledgeMatch]:
         return self._store.query(KnowledgeCollection.KNOWN_BUGS, query_text, top_k)
+
+    # --- Recent (Dashboard, Knowledge Center default sort) -----------------
+
+    def list_recent_documentation(self, limit: int = 5) -> list[KnowledgeMatch]:
+        return self._store.list_recent(KnowledgeCollection.DOCUMENTATION, limit)
+
+    def list_recent_known_bugs(self, limit: int = 5) -> list[KnowledgeMatch]:
+        return self._store.list_recent(KnowledgeCollection.KNOWN_BUGS, limit)
+
+
+def _seed_timestamp(base_time: datetime, index: int) -> str:
+    """Deterministic, monotonically increasing ISO timestamp for seed
+    records: later entries in the JSON file are treated as more recently
+    imported. This is the literal truth of a JSON-seeded Sprint 1/2 system
+    -- not a stand-in for real per-record import history, which arrives
+    with real connectors (RFC rev 2, Future Connectors)."""
+    return (base_time + timedelta(seconds=index)).isoformat()

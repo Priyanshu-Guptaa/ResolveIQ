@@ -1,0 +1,55 @@
+/* ResolveIQ baseline theme.
+ *
+ * Sprint 2 Phase 1 scope: enough spacing/typography discipline that the
+ * app doesn't look like a default Streamlit form. Full visual language
+ * (cards, icon system, sticky panels) is Phase 9 -- this file grows,
+ * it doesn't get replaced.
+ */
+
+section[data-testid="stSidebar"] {
+    border-right: 1px solid rgba(128, 128, 128, 0.15);
+}
+
+.riq-kpi {
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 4px;
+}
+.riq-kpi .riq-kpi-value {
+    font-family: ui-monospace, Consolas, monospace;
+    font-weight: 700;
+    font-size: 1.25rem;
+}
+.riq-kpi .riq-kpi-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.65;
+}
+
+.riq-card {
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+}
+.riq-card-title {
+    font-weight: 600;
+    font-size: 0.88rem;
+    margin-bottom: 2px;
+}
+.riq-card-meta {
+    font-size: 0.76rem;
+    opacity: 0.65;
+    font-family: ui-monospace, Consolas, monospace;
+}
+
+.riq-panel-title {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    opacity: 0.6;
+    margin: 4px 0 8px;
+}

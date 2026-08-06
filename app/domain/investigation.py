@@ -46,6 +46,9 @@ class InvestigationSession(BaseModel):
     status: InvestigationStatus = InvestigationStatus.OPEN
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+    last_viewed_at: datetime | None = None
+    """Set whenever the Dashboard/Workspace opens this investigation --
+    backs the "Recently Viewed" panel (RFC rev 3, Dashboard)."""
     evidence: list[Evidence] = Field(default_factory=list)
 
     @property
@@ -76,3 +79,34 @@ class InvestigationSession(BaseModel):
     def add_evidence(self, evidence: Evidence) -> None:
         self.evidence.append(evidence)
         self.updated_at = _utcnow()
+
+
+class ActivityItem(BaseModel):
+    """One entry in the Dashboard's Recent Activity feed / Recent Documents
+    panel -- always derived from real Evidence rows, never fabricated.
+
+    ``kind`` distinguishes "investigation created" from "evidence added" so
+    the feed reads as a timeline even before the dedicated Investigation
+    Timeline (RFC rev 3, Timeline) exists.
+    """
+
+    investigation_id: str
+    investigation_title: str
+    kind: str
+    """"investigation_created" | "evidence_added" """
+    label: str
+    evidence_type: str | None = None
+    occurred_at: datetime
+
+
+class DashboardStats(BaseModel):
+    """Investigation statistics for the Dashboard's KPI row -- computed
+    from real InvestigationSession rows, no illustrative/fake numbers.
+    """
+
+    total_count: int = 0
+    active_count: int = 0
+    resolved_count: int = 0
+    avg_resolution_hours: float | None = None
+    """None (rendered as "--") until at least one investigation has
+    status=resolved -- there is no fabricated default."""

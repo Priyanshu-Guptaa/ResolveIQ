@@ -42,6 +42,9 @@ class KnowledgeStore(Protocol):
     def count(self, collection: KnowledgeCollection) -> int:
         ...
 
+    def list_recent(self, collection: KnowledgeCollection, limit: int = 5) -> list[KnowledgeMatch]:
+        ...
+
 
 class ChromaKnowledgeStore:
     """ChromaDB-backed :class:`KnowledgeStore`.
@@ -119,3 +122,41 @@ class ChromaKnowledgeStore:
 
     def count(self, collection: KnowledgeCollection) -> int:
         return self._collection(collection).count()
+
+    def list_recent(self, collection: KnowledgeCollection, limit: int = 5) -> list[KnowledgeMatch]:
+        """Most recently imported records, newest first -- not a search,
+        so ``score`` is not a similarity and is always 1.0. Backs the
+        Dashboard's Recent Knowledge panel and Knowledge Center's default
+        sort order.
+
+        Chroma has no server-side "order by metadata field" for ``get()``,
+        so this fetches everything in the collection and sorts in Python --
+        fine at the seed-data/early-adoption scale this targets (dozens to
+        low hundreds of records). Revisit if a collection grows large.
+        """
+        if self.count(collection) == 0:
+            return []
+
+        results = self._collection(collection).get(include=["documents", "metadatas"])
+        ids = results.get("ids", [])
+        documents = results.get("documents", [])
+        metadatas = results.get("metadatas", [])
+
+        rows = list(zip(ids, documents, metadatas))
+        rows.sort(key=lambda row: row[2].get("imported_at", ""), reverse=True)
+
+        matches: list[KnowledgeMatch] = []
+        for record_id, document, metadata in rows[:limit]:
+            metadata = dict(metadata or {})
+            title = metadata.pop("title", record_id)
+            matches.append(
+                KnowledgeMatch(
+                    collection=collection,
+                    record_id=record_id,
+                    title=title,
+                    snippet=(document or "")[:400],
+                    score=1.0,
+                    metadata=metadata,
+                )
+            )
+        return matches

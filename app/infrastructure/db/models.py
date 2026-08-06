@@ -34,6 +34,7 @@ class InvestigationModel(Base):
     status: Mapped[str] = mapped_column(String(20), default="open")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    last_viewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
 
     evidence: Mapped[list["EvidenceModel"]] = relationship(
         back_populates="investigation",

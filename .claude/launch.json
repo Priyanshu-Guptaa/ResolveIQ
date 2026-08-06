@@ -14,7 +14,7 @@
         "-m",
         "streamlit",
         "run",
-        "ui/streamlit_app.py",
+        "ui/Home.py",
         "--server.port",
         "8502",
         "--server.headless",

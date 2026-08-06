@@ -38,17 +38,7 @@ def list_investigations(
     engine: InvestigationEngine = Depends(get_investigation_engine),
 ) -> list[InvestigationSummary]:
     investigations = engine.list_investigations()
-    return [
-        InvestigationSummary(
-            id=inv.id,
-            title=inv.title,
-            status=inv.status.value,
-            created_at=inv.created_at.isoformat(),
-            updated_at=inv.updated_at.isoformat(),
-            evidence_count=len(inv.evidence),
-        )
-        for inv in investigations
-    ]
+    return [_to_summary(inv) for inv in investigations]
 
 
 @router.get("/{investigation_id}", response_model=InvestigationSession)
@@ -56,10 +46,27 @@ def get_investigation(
     investigation_id: str,
     engine: InvestigationEngine = Depends(get_investigation_engine),
 ) -> InvestigationSession:
+    """Fetching an investigation counts as "viewing" it -- backs the
+    Dashboard's Recently Viewed panel. Called once when the Workspace page
+    loads, not on every poll, so it reflects real engineer attention."""
     try:
-        return engine.get_investigation(investigation_id)
+        investigation = engine.get_investigation(investigation_id)
     except InvestigationNotFoundError as exc:
         raise _not_found(exc) from exc
+    engine.mark_viewed(investigation_id)
+    return investigation
+
+
+def _to_summary(inv: InvestigationSession) -> InvestigationSummary:
+    return InvestigationSummary(
+        id=inv.id,
+        title=inv.title,
+        status=inv.status.value,
+        created_at=inv.created_at.isoformat(),
+        updated_at=inv.updated_at.isoformat(),
+        last_viewed_at=inv.last_viewed_at.isoformat() if inv.last_viewed_at else None,
+        evidence_count=len(inv.evidence),
+    )
 
 
 @router.post("/{investigation_id}/evidence/notes", response_model=Evidence, status_code=201)

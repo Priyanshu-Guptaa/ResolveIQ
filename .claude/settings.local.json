@@ -26,7 +26,11 @@
       "Bash(./.venv/Scripts/python.exe -m pip show transformers tokenizers chromadb sentence-transformers)",
       "Bash(./.venv/Scripts/python.exe -m scripts.seed_knowledge)",
       "Bash(mkdir -p \"/c/Users/guptapr/Projects/ResolveIQ/.claude\")",
-      "Bash(python -m json.tool)"
+      "Bash(python -m json.tool)",
+      "Bash(./.venv/Scripts/python.exe -m pytest -q)",
+      "Bash(curl -s http://localhost:8000/dashboard)",
+      "Bash(curl -sv http://localhost:8000/dashboard)",
+      "Bash(python -c ' *)"
     ]
   }
 }

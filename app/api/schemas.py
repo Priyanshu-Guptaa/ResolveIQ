@@ -11,6 +11,10 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from app.domain.investigation import ActivityItem, DashboardStats
+from app.domain.recommendation import KnowledgeMatch
+from app.domain.sql_studio import QueryTemplate
+
 
 class CreateInvestigationRequest(BaseModel):
     title: str = Field(min_length=1, max_length=500)
@@ -29,4 +33,18 @@ class InvestigationSummary(BaseModel):
     status: str
     created_at: str
     updated_at: str
+    last_viewed_at: str | None = None
     evidence_count: int
+
+
+class DashboardResponse(BaseModel):
+    """Everything the Dashboard (RFC rev 3, §08) renders, in one call --
+    every field backed by a real query, none of it illustrative."""
+
+    stats: DashboardStats
+    active_investigations: list[InvestigationSummary]
+    recently_viewed: list[InvestigationSummary]
+    recent_activity: list[ActivityItem]
+    recent_knowledge: list[KnowledgeMatch]
+    recent_known_bugs: list[KnowledgeMatch]
+    query_library_preview: list[QueryTemplate]

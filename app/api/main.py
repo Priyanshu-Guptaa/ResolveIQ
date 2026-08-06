@@ -13,7 +13,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.dependencies import get_knowledge_engine
-from app.api.routers import health, investigations
+from app.api.routers import (
+    dashboard,
+    health,
+    investigations,
+    knowledge,
+    settings as settings_router,
+    sql_studio,
+)
 from app.config import get_settings
 from app.logging_config import configure_logging
 
@@ -43,3 +50,7 @@ app = FastAPI(
 
 app.include_router(health.router)
 app.include_router(investigations.router)
+app.include_router(dashboard.router)
+app.include_router(settings_router.router)
+app.include_router(knowledge.router)
+app.include_router(sql_studio.router)

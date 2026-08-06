@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import logging
 
-from app.domain.enums import EvidenceType
+from app.domain.enums import EvidenceType, InvestigationStatus
 from app.domain.evidence import Evidence
-from app.domain.investigation import InvestigationSession
+from app.domain.investigation import ActivityItem, DashboardStats, InvestigationSession
 from app.engines.log_intelligence.engine import LogIntelligenceEngine
 from app.infrastructure.db.repository import InvestigationRepository
 
@@ -106,6 +106,36 @@ class InvestigationEngine:
 
     def list_investigations(self) -> list[InvestigationSession]:
         return self._repository.list_all()
+
+    def mark_viewed(self, investigation_id: str) -> None:
+        """Record that an engineer opened this investigation -- backs the
+        Dashboard's Recently Viewed panel. Call from the Workspace page on
+        load, not from every API poll."""
+        self._ensure_exists(investigation_id)
+        self._repository.touch_viewed(investigation_id)
+
+    def list_recently_viewed(self, limit: int = 5) -> list[InvestigationSession]:
+        return self._repository.list_recently_viewed(limit)
+
+    def list_recent_activity(self, limit: int = 10) -> list[ActivityItem]:
+        return self._repository.list_recent_activity(limit)
+
+    def get_dashboard_stats(self) -> DashboardStats:
+        investigations = self._repository.list_all()
+        active = [i for i in investigations if i.status in (InvestigationStatus.OPEN, InvestigationStatus.IN_PROGRESS)]
+        resolved = [i for i in investigations if i.status == InvestigationStatus.RESOLVED]
+
+        avg_hours: float | None = None
+        if resolved:
+            total_seconds = sum((i.updated_at - i.created_at).total_seconds() for i in resolved)
+            avg_hours = round((total_seconds / len(resolved)) / 3600, 1)
+
+        return DashboardStats(
+            total_count=len(investigations),
+            active_count=len(active),
+            resolved_count=len(resolved),
+            avg_resolution_hours=avg_hours,
+        )
 
     def _ensure_exists(self, investigation_id: str) -> None:
         if self._repository.get(investigation_id) is None:
