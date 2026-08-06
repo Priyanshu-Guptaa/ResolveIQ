@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from app.api.dependencies import get_investigation_engine, get_recommendation_engine
 from app.api.schemas import AddNoteRequest, CreateInvestigationRequest, InvestigationSummary
 from app.domain.evidence import Evidence
-from app.domain.investigation import InvestigationSession
+from app.domain.investigation import InvestigationListItem, InvestigationSession
 from app.domain.recommendation import Recommendation
 from app.engines.investigation.engine import InvestigationEngine, InvestigationNotFoundError
 from app.engines.recommendation.engine import RecommendationEngine
@@ -37,8 +37,10 @@ def create_investigation(
 def list_investigations(
     engine: InvestigationEngine = Depends(get_investigation_engine),
 ) -> list[InvestigationSummary]:
-    investigations = engine.list_investigations()
-    return [_to_summary(inv) for inv in investigations]
+    """Lightweight list -- deliberately does not hydrate evidence content
+    (see InvestigationListItem). Every current caller of this endpoint
+    (Dashboard, investigation pickers) only needs id/title/status/count."""
+    return [_to_summary(item) for item in engine.list_investigation_summaries()]
 
 
 @router.get("/{investigation_id}", response_model=InvestigationSession)
@@ -57,7 +59,7 @@ def get_investigation(
     return investigation
 
 
-def _to_summary(inv: InvestigationSession) -> InvestigationSummary:
+def _to_summary(inv: InvestigationListItem) -> InvestigationSummary:
     return InvestigationSummary(
         id=inv.id,
         title=inv.title,
@@ -65,7 +67,7 @@ def _to_summary(inv: InvestigationSession) -> InvestigationSummary:
         created_at=inv.created_at.isoformat(),
         updated_at=inv.updated_at.isoformat(),
         last_viewed_at=inv.last_viewed_at.isoformat() if inv.last_viewed_at else None,
-        evidence_count=len(inv.evidence),
+        evidence_count=inv.evidence_count,
     )
 
 
@@ -87,13 +89,18 @@ async def upload_logs(
     files: list[UploadFile],
     engine: InvestigationEngine = Depends(get_investigation_engine),
 ) -> list[Evidence]:
+    """Accepts any file the Evidence Ingestion Pipeline recognizes (log,
+    txt, csv, json, xml, docx, xlsx, pdf, jpg, png, evtx) or a zip of any
+    of those -- the pipeline detects the type and runs the matching
+    parser before this evidence is ever looked at for entities. A zip can
+    expand into multiple Evidence items per uploaded file, which is why
+    the response is a flat list rather than one-to-one with the upload."""
     results: list[Evidence] = []
     try:
         for file in files:
             raw_bytes = await file.read()
-            content = raw_bytes.decode("utf-8", errors="replace")
-            evidence = engine.add_log_evidence(investigation_id, file.filename or "upload.log", content)
-            results.append(evidence)
+            evidence_items = engine.add_file_evidence(investigation_id, file.filename or "upload", raw_bytes)
+            results.extend(evidence_items)
     except InvestigationNotFoundError as exc:
         raise _not_found(exc) from exc
     return results

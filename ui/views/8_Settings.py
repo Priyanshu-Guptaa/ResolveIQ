@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
-from api_client import api_available, api_get
-from theme import inject_theme
-
 import streamlit as st
+from api_client import ensure_api_available, get_settings_cached
+from theme import inject_theme
 
 inject_theme()
 st.title("⚙ Settings")
+ensure_api_available()
 
-if not api_available():
-    st.error("Can't reach the ResolveIQ API. Start it with `uvicorn app.api.main:app --reload`.")
-    st.stop()
-
-settings = api_get("/settings")
+settings = get_settings_cached()
 if settings is None:
     st.stop()
 

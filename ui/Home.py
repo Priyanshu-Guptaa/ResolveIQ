@@ -17,14 +17,14 @@ import streamlit as st
 st.set_page_config(page_title="ResolveIQ", page_icon="🔎", layout="wide")
 
 pages = [
-    st.Page("pages/1_Dashboard.py", title="Dashboard", icon="🏠", default=True),
-    st.Page("pages/2_Investigation_Workspace.py", title="Investigation Workspace", icon="🔍"),
-    st.Page("pages/3_Log_Intelligence.py", title="Log Intelligence", icon="📂"),
-    st.Page("pages/4_Knowledge_Center.py", title="Knowledge Center", icon="📚"),
-    st.Page("pages/5_Historical_Investigations.py", title="Historical Investigations", icon="📊"),
-    st.Page("pages/6_SQL_Studio.py", title="SQL Studio", icon="🗄"),
-    st.Page("pages/7_AI_Assistant.py", title="AI Assistant", icon="🤖"),
-    st.Page("pages/8_Settings.py", title="Settings", icon="⚙"),
+    st.Page("views/1_Dashboard.py", title="Dashboard", icon="🏠", default=True),
+    st.Page("views/2_Investigation_Workspace.py", title="Investigation Workspace", icon="🔍"),
+    st.Page("views/3_Log_Intelligence.py", title="Log Intelligence", icon="📂"),
+    st.Page("views/4_Knowledge_Center.py", title="Knowledge Center", icon="📚"),
+    st.Page("views/5_Historical_Investigations.py", title="Historical Investigations", icon="📊"),
+    st.Page("views/6_SQL_Studio.py", title="SQL Studio", icon="🗄"),
+    st.Page("views/7_AI_Assistant.py", title="AI Assistant", icon="🤖"),
+    st.Page("views/8_Settings.py", title="Settings", icon="⚙"),
 ]
 
 navigation = st.navigation(pages)

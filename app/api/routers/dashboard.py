@@ -25,7 +25,8 @@ def get_dashboard(
     investigation_engine: InvestigationEngine = Depends(get_investigation_engine),
     knowledge_engine: KnowledgeEngine = Depends(get_knowledge_engine),
 ) -> DashboardResponse:
-    all_investigations = investigation_engine.list_investigations()
+    # Lightweight summaries -- Dashboard rows never need evidence content.
+    all_investigations = investigation_engine.list_investigation_summaries()
     active = [
         inv
         for inv in all_investigations

@@ -1,6 +1,6 @@
 """Injects ui/theme.css into the current Streamlit page.
 
-Call once near the top of every page (Home.py and each ui/pages/*.py).
+Call once near the top of every page (Home.py and each ui/views/*.py).
 """
 
 from __future__ import annotations

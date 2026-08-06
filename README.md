@@ -43,7 +43,7 @@ app/
 │   └── vectorstore/    ChromaDB client wrapper
 └── api/                FastAPI app: routers, schemas, DI wiring
 ui/Home.py              Multi-page Streamlit entrypoint (Dashboard, Workspace, ...)
-ui/pages/               One file per module -- see RFC rev 3 for the Sprint 2 phase plan
+ui/views/               One file per module -- see RFC rev 3 for the Sprint 2 phase plan
 ui/components/          Shared widgets (status badges, ...)
 scripts/seed_knowledge.py   Standalone knowledge (re)seed CLI
 data/sample_knowledge/  Sample historical investigations / docs / known bugs

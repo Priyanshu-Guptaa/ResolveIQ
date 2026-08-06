@@ -18,3 +18,11 @@ streamlit==1.41.1
 requests==2.32.3
 pytest==8.3.4
 httpx==0.28.1
+
+# Evidence Ingestion Pipeline (RFC rev 1, §04)
+python-docx==1.1.2
+openpyxl==3.1.5
+PyMuPDF==1.25.2
+pytesseract==0.3.13
+Pillow==11.1.0
+python-evtx==0.8.1

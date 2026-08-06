@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings, get_settings
+from app.engines.ingestion.engine import IngestionEngine
+from app.engines.ingestion.file_type_registry import FileTypeRegistry
 from app.engines.investigation.engine import InvestigationEngine
 from app.engines.knowledge.embedding_provider import EmbeddingProvider, SentenceTransformerEmbeddingProvider
 from app.engines.knowledge.engine import KnowledgeEngine
@@ -71,6 +73,16 @@ def _log_intelligence_engine() -> LogIntelligenceEngine:
     return LogIntelligenceEngine(_log_parser(), _entity_extractor())
 
 
+@lru_cache
+def _file_type_registry() -> FileTypeRegistry:
+    return FileTypeRegistry()
+
+
+@lru_cache
+def _ingestion_engine() -> IngestionEngine:
+    return IngestionEngine(_file_type_registry())
+
+
 # --- Public dependencies (used via FastAPI's Depends(...)) -----------------
 
 
@@ -79,7 +91,7 @@ def get_settings_dep() -> Settings:
 
 
 def get_investigation_engine() -> InvestigationEngine:
-    return InvestigationEngine(_investigation_repository(), _log_intelligence_engine())
+    return InvestigationEngine(_investigation_repository(), _log_intelligence_engine(), _ingestion_engine())
 
 
 def get_knowledge_engine() -> KnowledgeEngine:
@@ -103,5 +115,7 @@ def reset_singletons() -> None:
         _entity_extractor,
         _log_parser,
         _log_intelligence_engine,
+        _file_type_registry,
+        _ingestion_engine,
     ):
         fn.cache_clear()

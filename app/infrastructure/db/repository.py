@@ -10,12 +10,13 @@ from __future__ import annotations
 import logging
 from typing import Protocol
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import sessionmaker
 
 from app.domain.entities import ExtractedEntity, LogEvent
 from app.domain.evidence import Evidence
-from app.domain.investigation import ActivityItem, InvestigationSession
+from app.domain.investigation import ActivityItem, InvestigationListItem, InvestigationSession
 from app.infrastructure.db.models import EvidenceModel, InvestigationModel
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,9 @@ class InvestigationRepository(Protocol):
     def list_all(self) -> list[InvestigationSession]:
         ...
 
+    def list_summaries(self, limit: int | None = None) -> list[InvestigationListItem]:
+        ...
+
     def add_evidence(self, investigation_id: str, evidence: Evidence) -> None:
         ...
 
@@ -42,7 +46,7 @@ class InvestigationRepository(Protocol):
     def list_recent_activity(self, limit: int = 10) -> list[ActivityItem]:
         ...
 
-    def list_recently_viewed(self, limit: int = 5) -> list[InvestigationSession]:
+    def list_recently_viewed(self, limit: int = 5) -> list[InvestigationListItem]:
         ...
 
 
@@ -80,6 +84,40 @@ class SqlAlchemyInvestigationRepository:
             ).all()
             return [_to_domain(model) for model in models]
 
+    def list_summaries(self, limit: int | None = None) -> list[InvestigationListItem]:
+        """Lightweight list view: one grouped query, no evidence-content
+        hydration, no N+1. Phase 1.5 fix -- see InvestigationListItem's
+        docstring for why this exists alongside list_all()."""
+        with self._session_factory() as session:
+            query = (
+                session.query(
+                    InvestigationModel.id,
+                    InvestigationModel.title,
+                    InvestigationModel.status,
+                    InvestigationModel.created_at,
+                    InvestigationModel.updated_at,
+                    InvestigationModel.last_viewed_at,
+                    func.count(EvidenceModel.id).label("evidence_count"),
+                )
+                .outerjoin(EvidenceModel, EvidenceModel.investigation_id == InvestigationModel.id)
+                .group_by(InvestigationModel.id)
+                .order_by(InvestigationModel.updated_at.desc())
+            )
+            if limit is not None:
+                query = query.limit(limit)
+            return [
+                InvestigationListItem(
+                    id=row.id,
+                    title=row.title,
+                    status=row.status,
+                    created_at=row.created_at,
+                    updated_at=row.updated_at,
+                    last_viewed_at=row.last_viewed_at,
+                    evidence_count=row.evidence_count,
+                )
+                for row in query.all()
+            ]
+
     def add_evidence(self, investigation_id: str, evidence: Evidence) -> None:
         with self._session_factory() as session:
             model = EvidenceModel(
@@ -115,57 +153,103 @@ class SqlAlchemyInvestigationRepository:
                 session.commit()
 
     def list_recent_activity(self, limit: int = 10) -> list[ActivityItem]:
-        """Cross-investigation feed: every investigation-created and
-        evidence-added event, most recent first. Backs the Dashboard's
-        Recent Activity feed and Recent Documents panel -- real Evidence
-        rows only, nothing fabricated.
+        """Cross-investigation feed: recent investigation-created and
+        evidence-added events, most recent first. Backs the Dashboard's
+        Recent Activity feed and Recent Documents panel -- real rows only,
+        nothing fabricated.
+
+        Phase 1.5 fix: this previously loaded every investigation ever
+        created (unbounded ``.all()``) and full ``EvidenceModel`` ORM
+        objects -- including their ``raw_content``/``extracted_entities``/
+        ``log_events`` JSON blobs -- plus one lazy-loaded query per row to
+        read ``evidence.investigation.title`` (N+1). None of that is
+        needed for an activity label. Both queries below select only the
+        columns used, join instead of lazy-loading, and bound to ``limit``
+        rather than "everything, sorted after the fact."
         """
         with self._session_factory() as session:
             items: list[ActivityItem] = []
 
-            for inv in session.query(InvestigationModel).all():
+            recent_investigations = (
+                session.query(
+                    InvestigationModel.id,
+                    InvestigationModel.title,
+                    InvestigationModel.created_at,
+                )
+                .order_by(InvestigationModel.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            for inv_id, inv_title, created_at in recent_investigations:
                 items.append(
                     ActivityItem(
-                        investigation_id=inv.id,
-                        investigation_title=inv.title,
+                        investigation_id=inv_id,
+                        investigation_title=inv_title,
                         kind="investigation_created",
-                        label=f"Investigation created: {inv.title}",
-                        occurred_at=inv.created_at,
+                        label=f"Investigation created: {inv_title}",
+                        occurred_at=created_at,
                     )
                 )
 
-            evidence_rows = (
-                session.query(EvidenceModel)
+            recent_evidence = (
+                session.query(
+                    EvidenceModel.investigation_id,
+                    EvidenceModel.evidence_type,
+                    EvidenceModel.title,
+                    EvidenceModel.created_at,
+                    InvestigationModel.title.label("investigation_title"),
+                )
+                .join(InvestigationModel, EvidenceModel.investigation_id == InvestigationModel.id)
                 .order_by(EvidenceModel.created_at.desc())
-                .limit(limit * 3)  # over-fetch; final sort/limit happens below
+                .limit(limit)
                 .all()
             )
-            for ev in evidence_rows:
-                inv_title = ev.investigation.title if ev.investigation else "(deleted investigation)"
+            for inv_id, ev_type, ev_title, created_at, inv_title in recent_evidence:
                 items.append(
                     ActivityItem(
-                        investigation_id=ev.investigation_id,
+                        investigation_id=inv_id,
                         investigation_title=inv_title,
                         kind="evidence_added",
-                        label=f"{ev.title or ev.evidence_type} added to {inv_title}",
-                        evidence_type=ev.evidence_type,
-                        occurred_at=ev.created_at,
+                        label=f"{ev_title or ev_type} added to {inv_title}",
+                        evidence_type=ev_type,
+                        occurred_at=created_at,
                     )
                 )
 
             items.sort(key=lambda item: item.occurred_at, reverse=True)
             return items[:limit]
 
-    def list_recently_viewed(self, limit: int = 5) -> list[InvestigationSession]:
+    def list_recently_viewed(self, limit: int = 5) -> list[InvestigationListItem]:
         with self._session_factory() as session:
-            models = (
-                session.query(InvestigationModel)
+            rows = (
+                session.query(
+                    InvestigationModel.id,
+                    InvestigationModel.title,
+                    InvestigationModel.status,
+                    InvestigationModel.created_at,
+                    InvestigationModel.updated_at,
+                    InvestigationModel.last_viewed_at,
+                    func.count(EvidenceModel.id).label("evidence_count"),
+                )
+                .outerjoin(EvidenceModel, EvidenceModel.investigation_id == InvestigationModel.id)
                 .filter(InvestigationModel.last_viewed_at.isnot(None))
+                .group_by(InvestigationModel.id)
                 .order_by(InvestigationModel.last_viewed_at.desc())
                 .limit(limit)
                 .all()
             )
-            return [_to_domain(model) for model in models]
+            return [
+                InvestigationListItem(
+                    id=row.id,
+                    title=row.title,
+                    status=row.status,
+                    created_at=row.created_at,
+                    updated_at=row.updated_at,
+                    last_viewed_at=row.last_viewed_at,
+                    evidence_count=row.evidence_count,
+                )
+                for row in rows
+            ]
 
 
 def _to_domain(model: InvestigationModel) -> InvestigationSession:

@@ -1,8 +1,19 @@
 """Shared HTTP client for every Streamlit page.
 
-Extracted from Sprint 1's single-page app so the multi-page shell (RFC
-rev 3) doesn't duplicate request/error-handling logic across 8 pages.
-Every page imports from here rather than calling ``requests`` directly.
+Extracted from Sprint 1's single-page app so the multi-page shell doesn't
+duplicate request/error-handling logic across 8 pages. Every page imports
+from here rather than calling ``requests`` directly.
+
+Caching (Phase 1.5): ``st.cache_data`` wraps the four endpoints RFC rev 3
+Phase 1.5 named as safe candidates -- Dashboard, Settings, Knowledge
+search, Query Library. Nothing investigation-specific is cached (an open
+Workspace must always show the true current state). See each cached
+function's docstring for its TTL and why.
+
+Cache scope: ``st.cache_data`` caches at the Streamlit *process* level,
+shared across every browser session hitting this server -- there is no
+per-user cache partitioning, consistent with the rest of Sprint 2's
+single-tenant assumption (no auth yet).
 """
 
 from __future__ import annotations
@@ -49,3 +60,65 @@ def api_available() -> bool:
         return response.ok
     except requests.RequestException:
         return False
+
+
+def ensure_api_available() -> None:
+    """Call once at the top of a page. Stops page execution with one clear
+    message if the API is unreachable -- replaces the 4-line
+    check/error/stop block that was copy-pasted across all 8 pages."""
+    if not api_available():
+        st.error(
+            "Can't reach the ResolveIQ API. Start it with "
+            "`uvicorn app.api.main:app --reload` and reload this page."
+        )
+        st.stop()
+
+
+# --- Cached reads (Phase 1.5 caching strategy) ------------------------------
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def get_dashboard_cached() -> dict | None:
+    """15s TTL: Dashboard changes often (every evidence upload, every
+    status change), so this is the shortest TTL of the four. Paired with
+    an explicit Refresh button on the Dashboard page (calls
+    ``get_dashboard_cached.clear()``) for when 15s isn't fast enough --
+    e.g. right after uploading evidence in Workspace and clicking back."""
+    return api_get("/dashboard")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_settings_cached() -> dict | None:
+    """5min TTL: nothing in Sprint 2 changes Settings at runtime (it's a
+    read-only view), so this is effectively "cache until manually
+    cleared," bounded generously in case that changes later."""
+    return api_get("/settings")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_query_library_cached() -> list | None:
+    """5min TTL: the Query Library is a static code-defined list in
+    Sprint 2 (see app/domain/sql_studio.py) -- it cannot change without a
+    deploy, which restarts the process and clears this cache anyway."""
+    return api_get("/sql/library")
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def search_knowledge_cached(q: str, collection: str | None = None, top_k: int = 10) -> list | None:
+    """30s TTL, keyed on (q, collection, top_k): protects against
+    re-running the same search repeatedly within a session. Longer than
+    Dashboard's TTL because there's no live knowledge-import UI yet in
+    Sprint 2 -- the knowledge base only changes via a manual reseed."""
+    return api_get("/knowledge/search", params={"q": q, "collection": collection, "top_k": top_k})
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def list_investigations_cached() -> list | None:
+    """Same 15s TTL as Dashboard, for the same reason -- this backs the
+    shared investigation picker (components/investigation_picker.py),
+    which every investigation-scoped page renders. Not in the RFC's
+    explicit "safe candidates" list, but it's the same shape (lightweight
+    summary list, not investigation-specific state) so the same reasoning
+    applies; the actual Workspace/Log Intelligence/AI Assistant *content*
+    for a selected investigation is never cached."""
+    return api_get("/investigations")

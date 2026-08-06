@@ -81,6 +81,27 @@ class InvestigationSession(BaseModel):
         self.updated_at = _utcnow()
 
 
+class InvestigationListItem(BaseModel):
+    """Lightweight investigation shape for list views -- Dashboard rows,
+    dropdowns, pickers.
+
+    Phase 1.5 fix: list views were going through ``InvestigationSession``
+    (full evidence hydration -- raw_content, extracted_entities, log_events
+    for every piece of evidence, on every investigation) just to render a
+    title and a count. List views never need evidence content, only a
+    count of it, so this model -- and the repository query that produces
+    it -- deliberately never touch the evidence table's JSON columns.
+    """
+
+    id: str
+    title: str
+    status: InvestigationStatus
+    created_at: datetime
+    updated_at: datetime
+    last_viewed_at: datetime | None = None
+    evidence_count: int = 0
+
+
 class ActivityItem(BaseModel):
     """One entry in the Dashboard's Recent Activity feed / Recent Documents
     panel -- always derived from real Evidence rows, never fabricated.
