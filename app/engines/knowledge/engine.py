@@ -1,10 +1,21 @@
 """Knowledge Engine: import + semantic search over historical
 investigations, documentation, and known bugs.
 
-Sprint 1 imports sample JSON files (standing in for ServiceNow/Wiki/ADO
-exports, which arrive as connectors in a later sprint). The import format
-is intentionally the same shape the real connectors will eventually
-produce, so swapping the source later doesn't change this engine.
+Sprint 1 imported sample JSON files directly. Since Sprint 3 Phase 3.1,
+historical investigations and known bugs are governed database tables
+(``historical_investigations``, ``known_bugs`` -- see
+``seed_migration.py``); this engine seeds ChromaDB *from those tables*
+rather than re-parsing JSON, so an administrator's future edit (Phase
+3.3+) is what search actually reflects. Documentation is unchanged this
+phase -- its content still comes straight from the sample JSON file, per
+Phase 3.1's explicit "storage mechanism can remain unchanged for now"
+scope; only its metadata is separately mirrored into a governed table.
+
+``repository`` is optional so existing callers/tests that construct
+``KnowledgeEngine(store)`` directly (no database, no repository) keep
+working unchanged -- they exercise search only, which never touches the
+repository. Production wiring (``app/api/dependencies.py``) always
+supplies one.
 """
 
 from __future__ import annotations
@@ -13,11 +24,15 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from app.domain.enums import KnowledgeCollection
 from app.domain.evidence import DocumentationRecord, HistoricalInvestigationRecord, KnownBugRecord
 from app.domain.recommendation import KnowledgeMatch
 from app.engines.knowledge.knowledge_store import KnowledgeStore
+
+if TYPE_CHECKING:
+    from app.infrastructure.db.knowledge_repository import KnowledgeRepository
 
 logger = logging.getLogger(__name__)
 
@@ -25,37 +40,35 @@ logger = logging.getLogger(__name__)
 class KnowledgeEngine:
     """Facade over the :class:`KnowledgeStore` for import and search."""
 
-    def __init__(self, store: KnowledgeStore) -> None:
+    def __init__(self, store: KnowledgeStore, repository: "KnowledgeRepository | None" = None) -> None:
         self._store = store
+        self._repository = repository
 
     # --- Import ------------------------------------------------------------
 
     def seed_from_directory(self, sample_dir: Path, *, force: bool = False) -> dict[str, int]:
-        """Load sample knowledge JSON into their respective collections.
-
-        Idempotent by default: a collection already holding data is left
-        alone unless ``force=True``. Returns a count of records loaded per
-        collection, for logging/diagnostics.
+        """Seeds ChromaDB from each collection's source of truth.
+        Idempotent by default: a Chroma collection already holding data
+        is left alone unless ``force=True``. Returns a count of records
+        seeded per collection, for logging/diagnostics.
         """
         loaded = {
-            "historical_investigations": self._seed_historical_investigations(
-                sample_dir / "historical_investigations.json", force=force
-            ),
+            "historical_investigations": self._seed_historical_investigations(force=force),
             "documentation": self._seed_documentation(sample_dir / "documentation.json", force=force),
-            "known_bugs": self._seed_known_bugs(sample_dir / "known_bugs.json", force=force),
+            "known_bugs": self._seed_known_bugs(force=force),
         }
         logger.info("Knowledge Engine seed complete: %s", loaded)
         return loaded
 
-    def _seed_historical_investigations(self, path: Path, *, force: bool) -> int:
+    def _seed_historical_investigations(self, *, force: bool) -> int:
         collection = KnowledgeCollection.HISTORICAL_INVESTIGATIONS
         if not force and self._store.count(collection) > 0:
             return 0
-        if not path.exists():
-            logger.warning("Sample file not found: %s", path)
+        if self._repository is None:
+            logger.warning("No KnowledgeRepository wired -- skipping historical investigation seeding")
             return 0
 
-        records = [HistoricalInvestigationRecord(**raw) for raw in json.loads(path.read_text())]
+        records = self._repository.list_historical_investigations()
         base_time = datetime.now(timezone.utc)
         for index, record in enumerate(records):
             searchable_text = (
@@ -77,6 +90,23 @@ class KnowledgeEngine:
                 },
             )
         return len(records)
+
+    # --- Plain listing (Phase 3.1 -- ready for Phase 3.3+'s admin UI) ------
+
+    def list_known_bugs(self) -> list[KnownBugRecord]:
+        return self._repository.list_known_bugs() if self._repository else []
+
+    def get_known_bug(self, bug_id: str) -> KnownBugRecord | None:
+        return self._repository.get_known_bug(bug_id) if self._repository else None
+
+    def list_historical_investigations(self) -> list[HistoricalInvestigationRecord]:
+        return self._repository.list_historical_investigations() if self._repository else []
+
+    def get_historical_investigation(self, record_id: str) -> HistoricalInvestigationRecord | None:
+        return self._repository.get_historical_investigation(record_id) if self._repository else None
+
+    def list_documentation_metadata(self) -> list[DocumentationRecord]:
+        return self._repository.list_documentation_metadata() if self._repository else []
 
     def _seed_documentation(self, path: Path, *, force: bool) -> int:
         collection = KnowledgeCollection.DOCUMENTATION
@@ -103,15 +133,15 @@ class KnowledgeEngine:
             )
         return len(records)
 
-    def _seed_known_bugs(self, path: Path, *, force: bool) -> int:
+    def _seed_known_bugs(self, *, force: bool) -> int:
         collection = KnowledgeCollection.KNOWN_BUGS
         if not force and self._store.count(collection) > 0:
             return 0
-        if not path.exists():
-            logger.warning("Sample file not found: %s", path)
+        if self._repository is None:
+            logger.warning("No KnowledgeRepository wired -- skipping known bug seeding")
             return 0
 
-        records = [KnownBugRecord(**raw) for raw in json.loads(path.read_text())]
+        records = self._repository.list_known_bugs()
         base_time = datetime.now(timezone.utc)
         for index, record in enumerate(records):
             searchable_text = (

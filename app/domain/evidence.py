@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from app.domain.entities import ExtractedEntity, LogEvent
 from app.domain.enums import EvidenceType
+from app.domain.governance import GovernanceFields
 
 
 def _new_id() -> str:
@@ -49,10 +50,13 @@ class Evidence(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class HistoricalInvestigationRecord(BaseModel):
+class HistoricalInvestigationRecord(GovernanceFields):
     """A closed, resolved investigation loaded from sample knowledge (and,
     in future sprints, from ServiceNow/ADO exports). This is what the
     Knowledge Engine indexes and the Recommendation Engine matches against.
+
+    Governed table since Sprint 3 Phase 3.1 (``historical_investigations``)
+    -- previously a static seed JSON file, see ``seed_migration.py``.
     """
 
     id: str
@@ -65,24 +69,52 @@ class HistoricalInvestigationRecord(BaseModel):
     domain: str = "general"
     """Free-text domain tag, e.g. 'sql-server', 'kafka', 'meter-comm',
     'kubernetes' -- used for display, not a hard filter."""
+    related_components: list[str] = Field(default_factory=list)
+    """Component Registry names this investigation is linked to via a real
+    foreign-key association table (``historical_investigation_components``)
+    -- not free text. Populated at migration time by an exact,
+    normalized-name match against ``component_profiles``; may legitimately
+    be empty when no component was mentioned. Distinct from ``tags``,
+    which stays free text."""
 
 
-class DocumentationRecord(BaseModel):
-    """A knowledge-base / playbook snippet the Knowledge Engine indexes."""
+class DocumentationRecord(GovernanceFields):
+    """A knowledge-base / playbook snippet the Knowledge Engine indexes.
+
+    Sprint 3 Phase 3.1 note: only *metadata* (title/tags/source +
+    governance fields) is governed in a database table
+    (``documentation``) this phase -- ``content`` keeps coming from the
+    sample JSON file / whatever produced this record, per the explicit
+    Phase 3.1 scope ("the actual document storage mechanism can remain
+    unchanged for now"). ``content`` is empty when this record was
+    constructed from the metadata-only table rather than the JSON file.
+    """
 
     id: str
     title: str
-    content: str
+    content: str = ""
     tags: list[str] = Field(default_factory=list)
     source: str = "sample"
 
 
-class KnownBugRecord(BaseModel):
-    """A known-bug record the Knowledge Engine indexes."""
+class KnownBugRecord(GovernanceFields):
+    """A known-bug record the Knowledge Engine indexes.
+
+    Governed table since Sprint 3 Phase 3.1 (``known_bugs``) -- previously
+    a static seed JSON file, see ``seed_migration.py``.
+    """
 
     id: str
     title: str
     description: str
     status: str = "open"
     affected_components: list[str] = Field(default_factory=list)
+    """Original free-text component/service names, preserved exactly as
+    authored -- unchanged by the Sprint 3 migration."""
     workaround: Optional[str] = None
+    related_components: list[str] = Field(default_factory=list)
+    """The subset of ``affected_components`` (if any) that exactly
+    matches a real Component Registry entry, resolved via a foreign-key
+    association table (``known_bug_components``). See
+    ``HistoricalInvestigationRecord.related_components`` for the same
+    pattern."""

@@ -25,6 +25,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from app.domain.governance import GovernanceFields
+
 
 class VersionDifference(BaseModel):
     """One behavior change for a component between versions. Free-text,
@@ -36,7 +38,7 @@ class VersionDifference(BaseModel):
     change: str
 
 
-class ComponentProfile(BaseModel):
+class ComponentProfile(GovernanceFields):
     """Everything known about one Command Center (or other product)
     component. All list fields default to empty rather than requiring
     every profile to fill in every field -- a sparse profile is still a

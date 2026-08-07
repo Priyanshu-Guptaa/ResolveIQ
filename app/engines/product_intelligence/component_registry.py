@@ -15,8 +15,12 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from app.domain.product_intelligence import ComponentProfile
+
+if TYPE_CHECKING:
+    from app.infrastructure.db.component_repository import ComponentProfileRepository
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +32,28 @@ class ComponentRegistry:
 
     @classmethod
     def load_from_file(cls, path: Path) -> "ComponentRegistry":
+        """Reads the JSON seed file directly. Kept for tests and for the
+        one-time migration in ``seed_migration.py`` -- the running
+        application no longer loads the registry this way (see
+        ``load_from_repository``, used by dependency wiring since
+        Sprint 3 Phase 3.1)."""
         if not path.exists():
             logger.warning("Component profile file not found: %s", path)
             return cls([])
         raw = json.loads(path.read_text())
         profiles = [ComponentProfile(**item) for item in raw]
         logger.info("Loaded %d component profile(s) from %s", len(profiles), path)
+        return cls(profiles)
+
+    @classmethod
+    def load_from_repository(cls, repository: "ComponentProfileRepository") -> "ComponentRegistry":
+        """Builds the in-memory registry from the governed
+        ``component_profiles`` table instead of the JSON seed file --
+        the production path since Sprint 3 Phase 3.1. Still a plain
+        in-memory index after loading (six-ish rows, no per-request DB
+        hit needed for a name lookup); only the *source* changed."""
+        profiles = repository.list_all()
+        logger.info("Loaded %d component profile(s) from the database", len(profiles))
         return cls(profiles)
 
     def get(self, name: str) -> ComponentProfile | None:

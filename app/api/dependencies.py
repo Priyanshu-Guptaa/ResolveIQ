@@ -28,8 +28,13 @@ from app.engines.log_intelligence.log_parser import GenericLogParser, LogParser
 from app.engines.product_intelligence.component_registry import ComponentRegistry
 from app.engines.product_intelligence.engine import ProductIntelligenceEngine
 from app.engines.recommendation.engine import RecommendationEngine
+from app.engines.sql_library.engine import SqlLibraryEngine
+from app.infrastructure.db.component_repository import ComponentProfileRepository, SqlAlchemyComponentProfileRepository
+from app.infrastructure.db.knowledge_repository import KnowledgeRepository, SqlAlchemyKnowledgeRepository
 from app.infrastructure.db.repository import InvestigationRepository, SqlAlchemyInvestigationRepository
+from app.infrastructure.db.seed_migration import migrate_all
 from app.infrastructure.db.session import get_session_factory
+from app.infrastructure.db.sql_template_repository import SqlAlchemySqlTemplateRepository, SqlTemplateRepository
 
 
 @lru_cache
@@ -45,11 +50,6 @@ def _knowledge_store() -> KnowledgeStore:
 
 
 @lru_cache
-def _knowledge_engine_singleton() -> KnowledgeEngine:
-    return KnowledgeEngine(_knowledge_store())
-
-
-@lru_cache
 def _db_session_factory() -> sessionmaker[OrmSession]:
     settings = get_settings()
     return get_session_factory(settings.sqlite_url)
@@ -58,6 +58,34 @@ def _db_session_factory() -> sessionmaker[OrmSession]:
 @lru_cache
 def _investigation_repository() -> InvestigationRepository:
     return SqlAlchemyInvestigationRepository(_db_session_factory())
+
+
+# --- Governed knowledge repositories (Sprint 3, Phase 3.1) ------------------
+
+
+@lru_cache
+def _component_profile_repository() -> ComponentProfileRepository:
+    return SqlAlchemyComponentProfileRepository(_db_session_factory())
+
+
+@lru_cache
+def _knowledge_repository() -> KnowledgeRepository:
+    return SqlAlchemyKnowledgeRepository(_db_session_factory())
+
+
+@lru_cache
+def _sql_template_repository() -> SqlTemplateRepository:
+    return SqlAlchemySqlTemplateRepository(_db_session_factory())
+
+
+@lru_cache
+def _knowledge_engine_singleton() -> KnowledgeEngine:
+    return KnowledgeEngine(_knowledge_store(), _knowledge_repository())
+
+
+@lru_cache
+def _sql_library_engine() -> SqlLibraryEngine:
+    return SqlLibraryEngine(_sql_template_repository())
 
 
 @lru_cache
@@ -87,8 +115,7 @@ def _ingestion_engine() -> IngestionEngine:
 
 @lru_cache
 def _component_registry() -> ComponentRegistry:
-    settings = get_settings()
-    return ComponentRegistry.load_from_file(settings.sample_knowledge_dir / "component_profiles.json")
+    return ComponentRegistry.load_from_repository(_component_profile_repository())
 
 
 @lru_cache
@@ -119,6 +146,25 @@ def get_product_intelligence_engine() -> ProductIntelligenceEngine:
     return _product_intelligence_engine()
 
 
+def get_sql_library_engine() -> SqlLibraryEngine:
+    return _sql_library_engine()
+
+
+def run_knowledge_foundation_migration() -> dict[str, int]:
+    """Idempotent JSON/constant -> governed-table migration (Sprint 3,
+    Phase 3.1). Called once from the FastAPI lifespan, before Chroma
+    seeding -- see ``app/api/main.py``. Safe to call on every startup;
+    re-running never duplicates rows (see ``seed_migration.migrate_all``).
+    """
+    settings = get_settings()
+    return migrate_all(
+        component_repo=_component_profile_repository(),
+        knowledge_repo=_knowledge_repository(),
+        sql_repo=_sql_template_repository(),
+        sample_knowledge_dir=settings.sample_knowledge_dir,
+    )
+
+
 def reset_singletons() -> None:
     """Test/dev helper: clears every cached singleton so the next
     dependency call rebuilds from current settings. Not used by the app
@@ -136,5 +182,9 @@ def reset_singletons() -> None:
         _ingestion_engine,
         _component_registry,
         _product_intelligence_engine,
+        _component_profile_repository,
+        _knowledge_repository,
+        _sql_template_repository,
+        _sql_library_engine,
     ):
         fn.cache_clear()

@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.dependencies import get_knowledge_engine
+from app.api.dependencies import get_knowledge_engine, run_knowledge_foundation_migration
 from app.api.routers import (
     dashboard,
     health,
@@ -35,6 +35,10 @@ async def lifespan(app: FastAPI):
     logger.info("Starting %s", settings.app_name)
 
     if settings.auto_seed_knowledge:
+        # Phase 3.1: JSON/constant -> governed SQLite tables (idempotent,
+        # safe on every startup) *before* Chroma seeding, since Chroma
+        # is now seeded from those tables, not from JSON directly.
+        run_knowledge_foundation_migration()
         knowledge_engine = get_knowledge_engine()
         knowledge_engine.seed_from_directory(settings.sample_knowledge_dir)
 

@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 
+from app.domain.governance import GovernanceFields
+
 
 def _new_id() -> str:
     return str(uuid.uuid4())
@@ -22,11 +24,14 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class QueryTemplate(BaseModel):
+class QueryTemplate(GovernanceFields):
     """A canned, parameterized diagnostic query. The static seed set below
-    is the Query Library; ``QUERY_LIBRARY`` is imported by both the
-    Recommendation Engine (Sprint 1's ``suggested_sql``) and SQL Studio
-    (Phase 8) so the two surfaces never drift apart."""
+    (``QUERY_LIBRARY``) is now only this table's *migration source*, not
+    its runtime source -- SQL Studio and the Recommendation Engine both
+    read from the governed ``sql_templates`` table since Sprint 3 Phase
+    3.1 (see ``seed_migration.py``), so the two surfaces still never
+    drift apart, just via the database instead of a shared Python
+    constant."""
 
     id: str
     title: str
@@ -34,6 +39,13 @@ class QueryTemplate(BaseModel):
     sql_text: str
     explanation: str
     tags: list[str] = Field(default_factory=list)
+    related_components: list[str] = Field(default_factory=list)
+    """Component Registry names this query is linked to via a real
+    foreign-key association table (``sql_template_components``), resolved
+    at migration time by normalizing each tag (e.g. "command-processor-
+    host") and matching it against a Component Registry name (e.g.
+    "CommandProcessorHost"). Distinct from ``tags``, which stays free
+    text and may include non-component terms."""
 
 
 class SavedQuery(BaseModel):

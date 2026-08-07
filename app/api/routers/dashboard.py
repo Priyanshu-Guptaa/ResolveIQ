@@ -9,13 +9,13 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from app.api.dependencies import get_investigation_engine, get_knowledge_engine
+from app.api.dependencies import get_investigation_engine, get_knowledge_engine, get_sql_library_engine
 from app.api.routers.investigations import _to_summary
 from app.api.schemas import DashboardResponse
 from app.domain.enums import InvestigationStatus
-from app.domain.sql_studio import QUERY_LIBRARY
 from app.engines.investigation.engine import InvestigationEngine
 from app.engines.knowledge.engine import KnowledgeEngine
+from app.engines.sql_library.engine import SqlLibraryEngine
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -24,6 +24,7 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 def get_dashboard(
     investigation_engine: InvestigationEngine = Depends(get_investigation_engine),
     knowledge_engine: KnowledgeEngine = Depends(get_knowledge_engine),
+    sql_library_engine: SqlLibraryEngine = Depends(get_sql_library_engine),
 ) -> DashboardResponse:
     # Lightweight summaries -- Dashboard rows never need evidence content.
     all_investigations = investigation_engine.list_investigation_summaries()
@@ -41,5 +42,5 @@ def get_dashboard(
         recent_activity=investigation_engine.list_recent_activity(10),
         recent_knowledge=knowledge_engine.list_recent_documentation(4),
         recent_known_bugs=knowledge_engine.list_recent_known_bugs(4),
-        query_library_preview=QUERY_LIBRARY[:4],
+        query_library_preview=sql_library_engine.list_templates()[:4],
     )
