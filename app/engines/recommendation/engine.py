@@ -31,6 +31,24 @@ from app.engines.knowledge.engine import KnowledgeEngine
 
 logger = logging.getLogger(__name__)
 
+_MAX_SNIPPET_CHARS = 600
+"""Cap for any historical-match text (resolution, root_cause) surfaced
+directly in a recommendation. Found necessary on real imported
+ServiceNow tickets: `resolution` is the ticket's full "Comments and
+Work notes" column -- every work-note entry ever added, sometimes
+thousands of characters spanning weeks -- and dumping that verbatim
+into "Next best step" (meant to be a short, scannable hint) reads as
+unusable wall-of-text, not a recommendation. The full resolution is
+still one click away (Historical Matches -> that investigation's own
+record); this cap only bounds what's echoed inline."""
+
+
+def _snippet(text: str) -> str:
+    text = text.strip()
+    if len(text) <= _MAX_SNIPPET_CHARS:
+        return text
+    return text[:_MAX_SNIPPET_CHARS].rstrip() + "…"
+
 
 @dataclass(frozen=True)
 class _EntityHeuristic:
@@ -148,7 +166,7 @@ class RecommendationEngine:
                 continue
             hypotheses.append(
                 RootCauseHypothesis(
-                    description=root_cause,
+                    description=_snippet(root_cause),
                     confidence=match.score,
                     rationale=f"Matches historical investigation '{match.title}' "
                     f"({match.score:.0%} similarity).",
@@ -199,10 +217,10 @@ class RecommendationEngine:
             top = similar_investigations[0]
             next_step = top.metadata.get("next_step")
             if next_step:
-                return next_step
+                return _snippet(next_step)
             resolution = top.metadata.get("resolution")
             if resolution:
-                return f"Based on similar past investigation '{top.title}', try: {resolution}"
+                return f"Based on similar past investigation '{top.title}', try: {_snippet(resolution)}"
 
         entity_by_type = {e.entity_type: e for e in entities}
         for heuristic in _ENTITY_HEURISTICS:

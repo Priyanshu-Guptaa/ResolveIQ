@@ -138,6 +138,54 @@ def test_matches_with_no_captured_root_cause_are_not_surfaced_as_a_finding():
     ]
 
 
+def test_next_best_step_truncates_a_long_historical_resolution():
+    """Regression guard for a real bug: `resolution` on a bulk-imported
+    ServiceNow ticket is the ticket's entire "Comments and Work notes"
+    column -- every work-note entry ever added, potentially thousands
+    of characters. Dumping that verbatim into "Next best step" (meant
+    to be a short, scannable hint) made a real match read as an
+    unreadable wall of text, easily mistaken for "unrelated task
+    information" leaking in. The full text must be capped and marked
+    truncated, not echoed in full."""
+    long_resolution = "Work note entry. " * 200  # 3,600 chars, well over the cap
+    match = KnowledgeMatch(
+        collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS,
+        record_id="hist-long",
+        title="A resolved ticket with a long work-note history",
+        snippet="...",
+        score=0.9,
+        metadata={"resolution": long_resolution, "root_cause": ""},
+    )
+    store = FakeKnowledgeStore({KnowledgeCollection.HISTORICAL_INVESTIGATIONS: [match]})
+    engine = RecommendationEngine(KnowledgeEngine(store), Settings())
+
+    investigation = _investigation_with_evidence("some log content")
+    recommendation = engine.generate(investigation)
+
+    assert len(recommendation.next_best_step) < len(long_resolution)
+    assert recommendation.next_best_step.endswith("…")
+
+
+def test_root_cause_description_is_truncated_for_a_long_historical_root_cause():
+    long_root_cause = "Detailed root cause narrative. " * 100  # well over the cap
+    match = KnowledgeMatch(
+        collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS,
+        record_id="hist-long-rc",
+        title="A resolved ticket with a long root cause writeup",
+        snippet="...",
+        score=0.9,
+        metadata={"root_cause": long_root_cause},
+    )
+    store = FakeKnowledgeStore({KnowledgeCollection.HISTORICAL_INVESTIGATIONS: [match]})
+    engine = RecommendationEngine(KnowledgeEngine(store), Settings())
+
+    investigation = _investigation_with_evidence("some log content")
+    recommendation = engine.generate(investigation)
+
+    assert len(recommendation.root_causes[0].description) < len(long_root_cause)
+    assert recommendation.root_causes[0].description.endswith("…")
+
+
 def test_no_evidence_prompts_for_more_information():
     store = FakeKnowledgeStore()
     engine = RecommendationEngine(KnowledgeEngine(store), Settings())
