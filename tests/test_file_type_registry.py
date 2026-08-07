@@ -10,6 +10,7 @@ parsers use, rather than static binary files checked into the repo.
 from __future__ import annotations
 
 import io
+import re
 import zipfile
 
 import pytest
@@ -175,6 +176,38 @@ def test_xlsx_parser_reports_sheet_names():
     registry = FileTypeRegistry()
     parsed = registry.parse("book.xlsx", _make_xlsx_bytes([["x"]]))[0]
     assert parsed.metadata.get("sheet_names")
+
+
+def _corrupt_xlsx_dimension(xlsx_bytes: bytes, *, stale_ref: str = "A1:A1") -> bytes:
+    """Rewrites sheet1.xml's declared ``<dimension ref="...">`` to a
+    range smaller than the real data -- reproduces the stale-dimension
+    export (seen from a real ServiceNow report export) that made
+    openpyxl's ``read_only=True`` mode silently iterate almost nothing.
+    """
+    src = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as dst:
+        for name in src.namelist():
+            data = src.read(name)
+            if name == "xl/worksheets/sheet1.xml":
+                data = re.sub(rb'<dimension ref="[^"]*"/>', f'<dimension ref="{stale_ref}"/>'.encode(), data)
+            dst.writestr(name, data)
+    return buf.getvalue()
+
+
+def test_xlsx_parser_extracts_all_rows_even_with_stale_dimension_metadata():
+    """Regression test: a workbook whose declared <dimension> undercounts
+    its real data must still be fully extracted, not silently truncated
+    to that declared range with no warning."""
+    registry = FileTypeRegistry()
+    real_bytes = _make_xlsx_bytes(
+        [["Number", "Description"], ["TASK001", "First row"], ["TASK002", "Second row"], ["TASK003", "Third row"]]
+    )
+    corrupted = _corrupt_xlsx_dimension(real_bytes)
+    parsed = registry.parse("stale_dimension.xlsx", corrupted)[0]
+    assert "TASK001" in parsed.text
+    assert "TASK002" in parsed.text
+    assert "TASK003" in parsed.text
 
 
 def test_pdf_parser_extracts_text():

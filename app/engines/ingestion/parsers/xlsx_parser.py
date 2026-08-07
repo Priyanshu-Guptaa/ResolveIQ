@@ -4,6 +4,17 @@
 parser). Cells are rendered as pipe-delimited rows per sheet, which keeps
 tabular structure legible to both a human reading raw_content and the
 regex-based entity extractor.
+
+Deliberately does NOT use openpyxl's ``read_only=True`` streaming mode:
+that mode trusts the sheet's declared ``<dimension>`` XML element to
+know how many rows/columns to iterate, and some real-world exporters
+(observed with a ServiceNow report export) write a stale or minimal
+dimension tag that doesn't match the actual data -- read_only mode then
+silently iterates only that tiny declared range (e.g. one row, one
+cell) and drops everything else with no error or warning. Normal
+(eager) loading does not have this failure mode. The tradeoff is higher
+memory use on very large workbooks, which is acceptable given the
+200MB upload cap.
 """
 
 from __future__ import annotations
@@ -29,7 +40,7 @@ class XlsxParser:
         try:
             from openpyxl import load_workbook
 
-            workbook = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+            workbook = load_workbook(io.BytesIO(content), data_only=True, read_only=False)
             sections: list[str] = []
             for sheet in workbook.worksheets:
                 sections.append(f"--- Sheet: {sheet.title} ---")
