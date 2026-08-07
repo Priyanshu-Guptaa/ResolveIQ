@@ -94,6 +94,50 @@ def test_weak_match_falls_back_to_entity_heuristic():
     assert "Something unrelated." not in descriptions
 
 
+def test_matches_with_no_captured_root_cause_are_not_surfaced_as_a_finding():
+    """Regression guard for a real bug: bulk-imported ServiceNow tickets
+    (app/engines/task_import) have no distinct root-cause field in their
+    source data, so their `root_cause` is deliberately left empty rather
+    than filled with a boilerplate placeholder -- an earlier version did
+    use a placeholder sentence, and when two such tickets both ranked as
+    top matches, the Investigation Workspace showed the identical
+    boilerplate sentence twice as if it were two distinct diagnosed root
+    causes. A high-scoring match with an empty root_cause must be
+    skipped entirely, not surfaced as an empty/fabricated finding."""
+    matches = [
+        KnowledgeMatch(
+            collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS,
+            record_id="hist-imported-1",
+            title="CC - Check Kafka Consumer Group Lag",
+            snippet="...",
+            score=0.85,
+            metadata={"root_cause": ""},
+        ),
+        KnowledgeMatch(
+            collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS,
+            record_id="hist-imported-2",
+            title="CC - Check Drive Usage",
+            snippet="...",
+            score=0.80,
+            metadata={"root_cause": ""},
+        ),
+    ]
+    store = FakeKnowledgeStore({KnowledgeCollection.HISTORICAL_INVESTIGATIONS: matches})
+    engine = RecommendationEngine(KnowledgeEngine(store), Settings())
+
+    investigation = _investigation_with_evidence("Kafka consumer group lag spike on billing-events")
+    recommendation = engine.generate(investigation)
+
+    assert recommendation.root_causes == []
+    # The matches themselves are still useful precedent -- they must
+    # still appear in Historical Matches even though they contribute no
+    # root-cause hypothesis.
+    assert [m.title for m in recommendation.similar_investigations] == [
+        "CC - Check Kafka Consumer Group Lag",
+        "CC - Check Drive Usage",
+    ]
+
+
 def test_no_evidence_prompts_for_more_information():
     store = FakeKnowledgeStore()
     engine = RecommendationEngine(KnowledgeEngine(store), Settings())

@@ -263,15 +263,24 @@ class KnowledgeObjectService:
         happens as a side effect of create/edit/publish going forward.
         Idempotent (upsert-by-id), safe to call anytime. Only touches the
         three indexed types (see ``_INDEXED_TYPES``); other types are
-        silently skipped if explicitly requested."""
+        silently skipped if explicitly requested.
+
+        Re-fetches each row via ``adapter.get(id)`` rather than trusting
+        ``list_all()`` directly -- for DOCUMENT, ``list_all()`` returns
+        lightweight summaries (no ``content``) for the picker/search-
+        object use it was originally built for; indexing needs the full
+        record.
+        """
         types = [object_type] if object_type else list(_INDEXED_TYPES)
         counts: dict[str, int] = {}
         for t in types:
             if t not in _INDEXED_TYPES:
                 continue
+            adapter = self._adapter(t)
             n = 0
-            for instance in self._adapter(t).list_all():
-                if self._should_index(t, instance):
+            for summary in adapter.list_all():
+                instance = adapter.get(summary.id)
+                if instance is not None and self._should_index(t, instance):
                     self._index(t, instance)
                     n += 1
             counts[t.value] = n

@@ -292,6 +292,23 @@ def test_reindex_existing_backfills_rows_created_outside_the_framework(setup):
     assert bug.id in knowledge_store.upserts
 
 
+def test_reindex_existing_works_for_published_documents(setup):
+    """Regression guard: the DOCUMENT adapter's list_all() returns
+    lightweight summaries (no `content`) for the picker/search-object
+    use it was built for -- reindex_existing() must re-fetch the full
+    record via adapter.get(), not index the summary directly (which
+    would AttributeError on the missing `content` field)."""
+    service, _ = setup
+    created = service.create(T.DOCUMENT, title="Reindex me", content="full body text")
+    service.publish(T.DOCUMENT, created.id)
+    knowledge_store: _StubKnowledgeStore = service._knowledge._store  # type: ignore[attr-defined]
+    knowledge_store.upserts.clear()  # only care whether reindex_existing itself succeeds
+
+    counts = service.reindex_existing(T.DOCUMENT)
+    assert counts["document"] >= 1
+    assert created.id in knowledge_store.upserts
+
+
 # --- Delete / Impact gate -----------------------------------------------------
 
 

@@ -24,6 +24,7 @@ from app.api.routers import (
 )
 from app.api.routers.admin import knowledge_management as admin_knowledge_management
 from app.api.routers.admin import knowledge_objects as admin_knowledge_objects
+from app.api.routers.admin import task_import as admin_task_import
 from app.api.routers.admin import knowledge_relationships as admin_knowledge_relationships
 from app.config import get_settings
 from app.logging_config import configure_logging
@@ -66,3 +67,4 @@ app.include_router(product_intelligence.router)
 app.include_router(admin_knowledge_management.router)
 app.include_router(admin_knowledge_relationships.router)
 app.include_router(admin_knowledge_objects.router)
+app.include_router(admin_task_import.router)

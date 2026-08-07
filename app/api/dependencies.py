@@ -33,6 +33,7 @@ from app.engines.product_intelligence.component_registry import ComponentRegistr
 from app.engines.product_intelligence.engine import ProductIntelligenceEngine
 from app.engines.recommendation.engine import RecommendationEngine
 from app.engines.sql_library.engine import SqlLibraryEngine
+from app.engines.task_import.importer import TaskImporter
 from app.infrastructure.db.component_repository import ComponentProfileRepository, SqlAlchemyComponentProfileRepository
 from app.infrastructure.db.knowledge_repository import KnowledgeRepository, SqlAlchemyKnowledgeRepository
 from app.infrastructure.db.lookup_repository import LookupRepository, SqlAlchemyLookupRepository
@@ -170,6 +171,11 @@ def _knowledge_object_service() -> KnowledgeObjectService:
 
 
 @lru_cache
+def _task_importer() -> TaskImporter:
+    return TaskImporter(_knowledge_object_service(), _knowledge_relationship_engine())
+
+
+@lru_cache
 def _entity_extractor() -> EntityExtractor:
     return RegexEntityExtractor()
 
@@ -243,6 +249,10 @@ def get_knowledge_object_service() -> KnowledgeObjectService:
     return _knowledge_object_service()
 
 
+def get_task_importer() -> TaskImporter:
+    return _task_importer()
+
+
 def run_knowledge_foundation_migration() -> dict[str, int]:
     """Idempotent JSON/constant -> governed-table migration (Sprint 3,
     Phase 3.1, extended in Phase 3.3 with Product/Technology lookup
@@ -289,5 +299,6 @@ def reset_singletons() -> None:
         _version_repository,
         _knowledge_object_adapters,
         _knowledge_object_service,
+        _task_importer,
     ):
         fn.cache_clear()
