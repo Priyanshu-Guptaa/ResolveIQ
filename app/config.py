@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # --- Persistence -----------------------------------------------------
     sqlite_path: Path = BASE_DIR / "data" / "resolveiq.db"
     chroma_persist_dir: Path = BASE_DIR / "data" / "chroma"
+    knowledge_upload_dir: Path = BASE_DIR / "data" / "uploads" / "knowledge"
+    """Where Knowledge Management (Sprint 3, Phase 3.2) keeps the
+    original bytes of an admin's uploaded document, for provenance --
+    search only ever uses the extracted ``content`` stored in SQLite,
+    never reads this back."""
 
     # --- Knowledge / embeddings -------------------------------------------
     embedding_model_name: str = "all-MiniLM-L6-v2"

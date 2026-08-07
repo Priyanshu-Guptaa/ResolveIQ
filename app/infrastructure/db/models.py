@@ -113,6 +113,14 @@ historical_investigation_components = Table(
     Index("ix_historical_investigation_components_component_id", "component_id"),
 )
 
+documentation_components = Table(
+    "documentation_components",
+    Base.metadata,
+    Column("documentation_id", ForeignKey("documentation.id"), primary_key=True),
+    Column("component_id", ForeignKey("component_profiles.id"), primary_key=True),
+    Index("ix_documentation_components_component_id", "component_id"),
+)
+
 
 # Every governed model below repeats the same five columns identically
 # (created_at/updated_at: DateTime(timezone=True); created_by/updated_by:
@@ -219,19 +227,32 @@ class HistoricalInvestigationModel(Base):
 
 
 class DocumentationModel(Base):
-    """Metadata only, per Phase 3.1 scope -- no ``content`` column. The
-    actual document body continues to live wherever it lives today (the
-    sample JSON file's ``content`` field, indexed straight into
-    ChromaDB); this table exists so Documentation has a governable,
-    listable row ready for Phase 3.5's real ingestion pipeline, without
-    duplicating or migrating document storage this phase."""
+    """The Knowledge Management module's document table (Sprint 3, Phase
+    3.2). Phase 3.1 stored metadata only, deferring content; the
+    ``content``/``product``/``version``/``technology``/``status``/
+    upload-provenance columns below were added this phase via the
+    existing additive-column migration (``session.py``'s
+    ``_add_missing_columns`` -- no manual ALTER needed for the seven
+    pre-existing rows, and their ``content`` is backfilled once by
+    ``seed_migration.py``)."""
 
     __tablename__ = "documentation"
 
     id: Mapped[str] = mapped_column(String(100), primary_key=True)
     title: Mapped[str] = mapped_column(String(500))
+    content: Mapped[str] = mapped_column(Text, default="")
     tags: Mapped[list] = mapped_column(JSON, default=list)
     source: Mapped[str] = mapped_column(String(100), default="sample")
+
+    product: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    version: Mapped[str | None] = mapped_column(String(100), nullable=True, default=None)
+    technology: Mapped[str | None] = mapped_column(String(100), nullable=True, default=None)
+
+    status: Mapped[str] = mapped_column(String(20), default="draft", index=True)
+
+    original_filename: Mapped[str | None] = mapped_column(String(500), nullable=True, default=None)
+    file_type: Mapped[str | None] = mapped_column(String(20), nullable=True, default=None)
+    file_path: Mapped[str | None] = mapped_column(String(1000), nullable=True, default=None)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

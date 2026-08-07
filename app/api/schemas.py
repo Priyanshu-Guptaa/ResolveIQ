@@ -37,6 +37,21 @@ class UpdateInvestigationDetailsRequest(BaseModel):
     assigned_engineer: str | None = None
 
 
+class UpdateDocumentMetadataRequest(BaseModel):
+    """Knowledge Management's Metadata step (Sprint 3, Phase 3.2) --
+    all optional, same "None means unchanged" convention as
+    UpdateInvestigationDetailsRequest. ``tags``/``related_components``
+    are lists, not strings, so an empty list *does* mean "clear it" --
+    only ``None`` (the field omitted from the request) leaves it alone."""
+
+    title: str | None = None
+    tags: list[str] | None = None
+    product: str | None = None
+    version: str | None = None
+    technology: str | None = None
+    related_components: list[str] | None = None
+
+
 class InvestigationSummary(BaseModel):
     """Lightweight shape for the investigation list view."""
 

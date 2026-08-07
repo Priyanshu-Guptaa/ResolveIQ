@@ -26,3 +26,6 @@ PyMuPDF==1.25.2
 pytesseract==0.3.13
 Pillow==11.1.0
 python-evtx==0.8.1
+python-pptx==1.0.2
+# Sprint 3 Phase 3.2: Knowledge Management's PPTX support -- pulls in
+# XlsxWriter as a transitive dependency; not used directly.

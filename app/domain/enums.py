@@ -86,6 +86,24 @@ class InvestigationStatus(str, Enum):
     CLOSED = "closed"
 
 
+class DocumentStatus(str, Enum):
+    """Lifecycle state of a governed :class:`~app.domain.evidence.DocumentationRecord`
+    (Sprint 3, Phase 3.2 -- Knowledge Management).
+
+    Only ``PUBLISHED`` documents are indexed/searchable by the Knowledge
+    Engine. ``UNDER_REVIEW`` is defined now (cheap) but nothing transitions
+    a document into it yet -- RFC-003's full Draft -> Under Review ->
+    Approved -> Published -> Archived approval workflow is a later phase;
+    this is the "initially support Draft/Published/Archived, keep the
+    design extensible" version of it.
+    """
+
+    DRAFT = "draft"
+    UNDER_REVIEW = "under_review"
+    PUBLISHED = "published"
+    ARCHIVED = "archived"
+
+
 class KnowledgeCollection(str, Enum):
     """Logical ChromaDB collections the Knowledge Engine searches over.
 

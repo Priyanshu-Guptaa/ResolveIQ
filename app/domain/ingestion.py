@@ -18,6 +18,7 @@ class FileKind(str, Enum):
     TEXT = "text"
     DOCX = "docx"
     XLSX = "xlsx"
+    PPTX = "pptx"
     PDF = "pdf"
     IMAGE = "image"
     EVTX = "evtx"

@@ -54,6 +54,9 @@ class FakeKnowledgeStore:
     def list_recent(self, collection, limit: int = 5) -> list[KnowledgeMatch]:  # pragma: no cover
         return []
 
+    def delete(self, collection, record_id: str) -> None:
+        self.upserts = [u for u in self.upserts if not (u[0] == collection and u[1] == record_id)]
+
 
 @pytest.fixture
 def repos():
@@ -112,7 +115,7 @@ def test_migration_is_idempotent(repos):
     assert component_repo.count() == first["component_profiles"]
     assert knowledge_repo.count_known_bugs() == first["known_bugs"]
     assert knowledge_repo.count_historical_investigations() == first["historical_investigations"]
-    assert knowledge_repo.count_documentation_metadata() == first["documentation"]
+    assert knowledge_repo.count_documentation() == first["documentation"]
     assert sql_repo.count() == first["sql_templates"]
 
 
@@ -262,10 +265,11 @@ def test_sql_library_engine_reads_migrated_templates(repos):
 
 def test_knowledge_engine_seeds_chroma_from_the_database_not_json(repos):
     """The Recommendation Engine's search still works after migration
-    because KnowledgeEngine.seed_from_directory() now sources known
-    bugs and historical investigations from the repository -- this
-    verifies that sourcing, independent of RecommendationEngine's own
-    scoring logic (unchanged, covered by test_recommendation_engine.py)."""
+    because KnowledgeEngine.seed_from_directory() sources known bugs,
+    historical investigations, *and* (since Phase 3.2) documentation
+    from the repository -- this verifies that sourcing, independent of
+    RecommendationEngine's own scoring logic (unchanged, covered by
+    test_recommendation_engine.py)."""
     _migrate(repos)
     component_repo, knowledge_repo, _ = repos
 
@@ -275,13 +279,17 @@ def test_knowledge_engine_seeds_chroma_from_the_database_not_json(repos):
 
     assert loaded["known_bugs"] == 4
     assert loaded["historical_investigations"] == 8
-    assert loaded["documentation"] == 7  # unchanged JSON path, still works
+    assert loaded["documentation"] == 7  # all 7 sample docs are Published post-migration
 
     # Spot-check one upserted record's content actually came from the DB row.
     from app.domain.enums import KnowledgeCollection
 
     known_bug_upserts = [u for u in fake_store.upserts if u[0] == KnowledgeCollection.KNOWN_BUGS]
     assert any("order-service" in text for _, _, text, _, _ in known_bug_upserts)
+
+    doc_upserts = [u for u in fake_store.upserts if u[0] == KnowledgeCollection.DOCUMENTATION]
+    assert len(doc_upserts) == 7
+    assert any("blocking" in text.lower() for _, _, text, _, _ in doc_upserts)
 
 
 def test_knowledge_engine_constructed_without_repository_still_works():

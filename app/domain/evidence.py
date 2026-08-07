@@ -15,7 +15,7 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from app.domain.entities import ExtractedEntity, LogEvent
-from app.domain.enums import EvidenceType
+from app.domain.enums import DocumentStatus, EvidenceType
 from app.domain.governance import GovernanceFields
 
 
@@ -79,15 +79,18 @@ class HistoricalInvestigationRecord(GovernanceFields):
 
 
 class DocumentationRecord(GovernanceFields):
-    """A knowledge-base / playbook snippet the Knowledge Engine indexes.
+    """A knowledge-base document -- the Knowledge Management module's
+    unit of content (Sprint 3, Phase 3.2). Fully governed: real extracted
+    text, real lifecycle, real Component Registry links.
 
-    Sprint 3 Phase 3.1 note: only *metadata* (title/tags/source +
-    governance fields) is governed in a database table
-    (``documentation``) this phase -- ``content`` keeps coming from the
-    sample JSON file / whatever produced this record, per the explicit
-    Phase 3.1 scope ("the actual document storage mechanism can remain
-    unchanged for now"). ``content`` is empty when this record was
-    constructed from the metadata-only table rather than the JSON file.
+    History: Phase 3.1 stored *metadata only* here, deferring content
+    storage ("the actual document storage mechanism can remain unchanged
+    for now"). Phase 3.2 is that "later" -- ``content`` is now the real
+    extracted text (from the Evidence Ingestion Pipeline for uploads, or
+    backfilled from the original sample JSON for the seven pre-existing
+    sample documents, see ``seed_migration.py``), and this is the only
+    source the Knowledge Engine indexes from -- the JSON file is no
+    longer read at all past initial backfill.
     """
 
     id: str
@@ -95,6 +98,57 @@ class DocumentationRecord(GovernanceFields):
     content: str = ""
     tags: list[str] = Field(default_factory=list)
     source: str = "sample"
+    """Where this came from: 'sample' (seed data), 'upload' (an admin's
+    file upload), or later a connector name."""
+
+    # --- Classification (Phase 3.2 "Document Details") ---------------------
+    product: str | None = None
+    version: str | None = None
+    technology: str | None = None
+    related_components: list[str] = Field(default_factory=list)
+    """Component Registry names this document is linked to via a real
+    foreign-key association table (``documentation_components``) --
+    same pattern as KnownBugRecord/HistoricalInvestigationRecord.
+    Editable by an administrator during the Metadata step; not
+    auto-matched against uploaded content (that would be a form of
+    inference this phase deliberately doesn't add -- an admin picks the
+    component explicitly, same "no free text where a real relationship
+    exists" discipline, just human-driven instead of string-matched)."""
+
+    # --- Lifecycle -----------------------------------------------------
+    status: DocumentStatus = DocumentStatus.DRAFT
+    """Only PUBLISHED documents are indexed/searchable -- see
+    KnowledgeManagementEngine.publish_document()."""
+
+    # --- Upload provenance (empty for pre-existing sample documents) -------
+    original_filename: str | None = None
+    file_type: str | None = None
+    file_path: str | None = None
+    """Relative path under the configured upload directory where the
+    original uploaded bytes are kept (for provenance/audit -- not read
+    back by search, which only ever uses ``content``)."""
+
+
+class DocumentationListItem(GovernanceFields):
+    """Lightweight shape for the Knowledge Library's list/search view --
+    everything a list row needs, deliberately *without* ``content``.
+
+    Same reasoning as ``InvestigationListItem`` (Phase 1.5): a library
+    of documents never needs every row's full extracted text just to
+    render a table, and fetching it would be the exact unbounded-
+    hydration mistake that phase fixed for investigations. See Phase
+    3.2's explicit "avoid loading document content unless requested."
+    """
+
+    id: str
+    title: str
+    tags: list[str] = Field(default_factory=list)
+    source: str = "sample"
+    product: str | None = None
+    version: str | None = None
+    technology: str | None = None
+    related_components: list[str] = Field(default_factory=list)
+    status: DocumentStatus = DocumentStatus.DRAFT
 
 
 class KnownBugRecord(GovernanceFields):

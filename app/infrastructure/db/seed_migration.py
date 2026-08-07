@@ -1,22 +1,34 @@
 """One-time (idempotent) migration of static seed data into governed
 database tables -- Sprint 3, Phase 3.1 (Knowledge Foundation & Data
-Model Migration).
+Model Migration), extended in Phase 3.2 (Knowledge Management).
 
 Five sources move from JSON files / a Python constant into SQLite:
 
     component_profiles.json        -> component_profiles
     known_bugs.json                -> known_bugs
     historical_investigations.json -> historical_investigations
-    documentation.json             -> documentation (metadata only)
+    documentation.json             -> documentation
     QUERY_LIBRARY (code constant)  -> sql_templates
 
-Each ``migrate_*`` function only populates an *empty* table -- if a table
+Four of the five migrations only populate an *empty* table -- if a table
 already has rows, the function logs that it skipped and returns 0. That
 makes the whole thing safe to call on every app startup (same idiom
 already used by ``KnowledgeEngine.seed_from_directory``'s ``force``
 guard against re-seeding a non-empty ChromaDB collection): re-running
 never duplicates rows, and there is no separate "have we migrated"
 flag to keep in sync with reality.
+
+Documentation is the one exception, and deliberately so: Phase 3.1 only
+migrated *metadata* (content stayed on the JSON file), so the seven rows
+it created already exist with an empty ``content`` column in any
+database that ran that migration. Phase 3.2 needs that content -- so
+``migrate_documentation`` is idempotent *per row*, not per table: an
+existing row with empty content gets backfilled (content, product/
+version/technology left None, status set to PUBLISHED so these already-
+"live" sample documents don't silently disappear from search), a row
+that already has content (an administrator's real edit) is never
+touched, and a row that doesn't exist yet is created fresh. Re-running
+is still always safe.
 
 Relationship linking (KnownBug/SqlTemplate/HistoricalInvestigation ->
 Component) is deterministic, not fuzzy: every match is either an exact
@@ -36,6 +48,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from app.domain.enums import DocumentStatus
 from app.domain.evidence import DocumentationRecord, HistoricalInvestigationRecord, KnownBugRecord
 from app.domain.product_intelligence import ComponentProfile
 from app.domain.sql_studio import QUERY_LIBRARY, QueryTemplate
@@ -143,33 +156,53 @@ def migrate_historical_investigations(
     return imported
 
 
-def migrate_documentation_metadata(knowledge_repo: KnowledgeRepository, sample_knowledge_dir: Path) -> int:
-    """Metadata only -- ``content`` is intentionally left out of the
-    governed row, per Phase 3.1 scope. See ``DocumentationRecord``'s
-    docstring."""
-    if knowledge_repo.count_documentation_metadata() > 0:
-        logger.info("documentation already populated -- skipping migration")
-        return 0
+def migrate_documentation(
+    knowledge_repo: KnowledgeRepository, component_repo: ComponentProfileRepository, sample_knowledge_dir: Path
+) -> int:
+    """Idempotent per row, not per table -- see this module's docstring
+    for why documentation is the one exception. Returns the number of
+    rows created or backfilled this call (0 once every sample document
+    already has content, i.e. every subsequent startup)."""
     path = sample_knowledge_dir / "documentation.json"
     if not path.exists():
         logger.warning("Migration source not found: %s", path)
         return 0
 
+    component_names = [c.name for c in component_repo.list_all(active_only=False)]
     raw: list[dict[str, Any]] = json.loads(path.read_text())
-    imported = 0
+    changed = 0
     for item in raw:
-        record = DocumentationRecord(
-            id=item["id"],
-            title=item["title"],
-            tags=item.get("tags", []),
-            source=item.get("source", "sample"),
-            created_by=_MIGRATION_ACTOR,
-            updated_by=_MIGRATION_ACTOR,
-        )
-        knowledge_repo.save_documentation_metadata(record)
-        imported += 1
-    logger.info("Migrated %d documentation metadata row(s) from %s", imported, path.name)
-    return imported
+        existing = knowledge_repo.get_documentation(item["id"])
+        if existing is not None and existing.content:
+            continue  # real content already present -- never overwrite an admin's edit
+
+        content = item.get("content", "")
+        haystack = f"{item['title']}\n{content}"
+        related = _match_by_substring(haystack, component_names)
+
+        if existing is None:
+            record = DocumentationRecord(
+                id=item["id"],
+                title=item["title"],
+                content=content,
+                tags=item.get("tags", []),
+                source=item.get("source", "sample"),
+                related_components=related,
+                status=DocumentStatus.PUBLISHED,
+                created_by=_MIGRATION_ACTOR,
+                updated_by=_MIGRATION_ACTOR,
+            )
+        else:
+            # Row exists from Phase 3.1's metadata-only migration --
+            # backfill content/relationships, leave everything else
+            # (including any admin edits to title/tags) untouched.
+            record = existing.model_copy(
+                update={"content": content, "related_components": related, "updated_by": _MIGRATION_ACTOR}
+            )
+        knowledge_repo.save_documentation(record)
+        changed += 1
+    logger.info("Migrated/backfilled %d documentation row(s) from %s", changed, path.name)
+    return changed
 
 
 def migrate_sql_templates(sql_repo: SqlTemplateRepository, component_repo: ComponentProfileRepository) -> int:
@@ -209,8 +242,10 @@ def migrate_all(
 ) -> dict[str, int]:
     """Runs every migration in dependency order (components first --
     the other four link against them) and returns a per-table count of
-    rows actually imported this call (0 for any table that was already
-    populated). Safe to call on every startup."""
+    rows actually imported/changed this call -- 0 for any table that was
+    already fully populated, except ``documentation`` which reports a
+    per-row content backfill count (see ``migrate_documentation``).
+    Safe to call on every startup."""
     report = {
         "component_profiles": migrate_component_profiles(component_repo, sample_knowledge_dir),
     }
@@ -218,7 +253,7 @@ def migrate_all(
     report["historical_investigations"] = migrate_historical_investigations(
         knowledge_repo, component_repo, sample_knowledge_dir
     )
-    report["documentation"] = migrate_documentation_metadata(knowledge_repo, sample_knowledge_dir)
+    report["documentation"] = migrate_documentation(knowledge_repo, component_repo, sample_knowledge_dir)
     report["sql_templates"] = migrate_sql_templates(sql_repo, component_repo)
     logger.info("Knowledge foundation migration complete: %s", report)
     return report

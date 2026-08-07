@@ -132,6 +132,45 @@ def test_docx_parser_extracts_table_text():
     assert "CMD-99213" in parsed.text
 
 
+def test_pptx_parser_extracts_slide_and_notes_text():
+    """Sprint 3, Phase 3.2: Knowledge Management's PPTX support."""
+    from pptx import Presentation
+
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+    slide.shapes.title.text = "GLP/DCW Mismatch Triage"
+    slide.placeholders[1].text = "Verify firmware version first"
+    slide.notes_slide.notes_text_frame.text = "Remember to check GEI timing"
+    buf = io.BytesIO()
+    presentation.save(buf)
+
+    registry = FileTypeRegistry()
+    parsed = registry.parse("triage.pptx", buf.getvalue())[0]
+
+    assert parsed.kind == FileKind.PPTX
+    assert "GLP/DCW Mismatch Triage" in parsed.text
+    assert "Verify firmware version first" in parsed.text
+    assert "Remember to check GEI timing" in parsed.text
+    assert parsed.metadata["slide_count"] == 1
+    assert parsed.metadata["notes_slide_count"] == 1
+
+
+def test_pptx_parser_never_decoded_as_utf8_garbage():
+    """Same Problem-1 regression guard as the .docx test below, applied
+    to .pptx (also a zip of XML parts)."""
+    from pptx import Presentation
+
+    presentation = Presentation()
+    buf = io.BytesIO()
+    presentation.save(buf)
+
+    registry = FileTypeRegistry()
+    parsed = registry.parse("empty.pptx", buf.getvalue())[0]
+
+    assert parsed.kind == FileKind.PPTX
+    assert "PK\x03\x04" not in parsed.text
+
+
 def test_xlsx_parser_reports_sheet_names():
     registry = FileTypeRegistry()
     parsed = registry.parse("book.xlsx", _make_xlsx_bytes([["x"]]))[0]

@@ -19,20 +19,30 @@ import logging
 from collections import defaultdict
 from typing import Protocol
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import sessionmaker
 
-from app.domain.evidence import DocumentationRecord, HistoricalInvestigationRecord, KnownBugRecord
+from app.domain.evidence import DocumentationListItem, DocumentationRecord, HistoricalInvestigationRecord, KnownBugRecord
+from app.domain.knowledge_management import DocumentPage
 from app.infrastructure.db.models import (
     ComponentProfileModel,
     DocumentationModel,
     HistoricalInvestigationModel,
     KnownBugModel,
+    documentation_components,
     historical_investigation_components,
     known_bug_components,
 )
 
 logger = logging.getLogger(__name__)
+
+_DOCUMENTATION_SORT_COLUMNS = {
+    "title": DocumentationModel.title,
+    "status": DocumentationModel.status,
+    "created_at": DocumentationModel.created_at,
+    "updated_at": DocumentationModel.updated_at,
+}
 
 
 class KnowledgeRepository(Protocol):
@@ -63,13 +73,40 @@ class KnowledgeRepository(Protocol):
     def count_historical_investigations(self) -> int:
         ...
 
-    def save_documentation_metadata(self, record: DocumentationRecord) -> None:
+    def save_documentation(self, record: DocumentationRecord) -> None:
         ...
 
-    def list_documentation_metadata(self, *, active_only: bool = True) -> list[DocumentationRecord]:
+    def get_documentation(self, document_id: str) -> DocumentationRecord | None:
         ...
 
-    def count_documentation_metadata(self) -> int:
+    def list_all_documentation(
+        self, *, status: str | None = None, active_only: bool = True
+    ) -> list[DocumentationRecord]:
+        ...
+
+    def list_documentation_summaries(
+        self,
+        *,
+        status: str | None = None,
+        product: str | None = None,
+        technology: str | None = None,
+        component: str | None = None,
+        search: str | None = None,
+        sort_by: str = "updated_at",
+        sort_desc: bool = True,
+        page: int = 1,
+        page_size: int = 20,
+        active_only: bool = True,
+    ) -> DocumentPage:
+        ...
+
+    def count_documentation_by_status(self) -> dict[str, int]:
+        ...
+
+    def list_recently_added_documentation(self, limit: int = 5) -> list[DocumentationListItem]:
+        ...
+
+    def count_documentation(self) -> int:
         ...
 
 
@@ -177,34 +214,152 @@ class SqlAlchemyKnowledgeRepository:
         with self._session_factory() as session:
             return session.query(HistoricalInvestigationModel).count()
 
-    # --- Documentation metadata ---------------------------------------------
+    # --- Documentation (Sprint 3, Phase 3.2 -- Knowledge Management) -------
 
-    def save_documentation_metadata(self, record: DocumentationRecord) -> None:
+    def save_documentation(self, record: DocumentationRecord) -> None:
         with self._session_factory() as session:
             model = session.get(DocumentationModel, record.id)
             if model is None:
                 model = DocumentationModel(id=record.id)
                 session.add(model)
             model.title = record.title
+            model.content = record.content
             model.tags = record.tags
             model.source = record.source
+            model.product = record.product
+            model.version = record.version
+            model.technology = record.technology
+            model.status = record.status.value
+            model.original_filename = record.original_filename
+            model.file_type = record.file_type
+            model.file_path = record.file_path
             model.created_at = record.created_at
             model.updated_at = record.updated_at
             model.created_by = record.created_by
             model.updated_by = record.updated_by
             model.is_active = record.is_active
             session.commit()
-            logger.debug("Saved documentation metadata %s", record.id)
 
-    def list_documentation_metadata(self, *, active_only: bool = True) -> list[DocumentationRecord]:
+            self._set_component_links(
+                session, documentation_components, "documentation_id", record.id, record.related_components
+            )
+            logger.debug("Saved documentation %s (status=%s)", record.id, model.status)
+
+    def get_documentation(self, document_id: str) -> DocumentationRecord | None:
+        with self._session_factory() as session:
+            model = session.get(DocumentationModel, document_id)
+            if model is None:
+                return None
+            links = self._component_links(session, documentation_components, "documentation_id", [document_id])
+            return _documentation_to_domain(model, links.get(document_id, []))
+
+    def list_all_documentation(
+        self, *, status: str | None = None, active_only: bool = True
+    ) -> list[DocumentationRecord]:
+        """Full records, content included -- used by KnowledgeEngine to
+        seed ChromaDB (only ever called with ``status="published"``) and
+        by the migration's idempotent-per-row backfill. Never used to
+        serve the Library's list view -- see ``list_documentation_summaries``."""
         with self._session_factory() as session:
             query = session.query(DocumentationModel)
             if active_only:
                 query = query.filter(DocumentationModel.is_active.is_(True))
+            if status:
+                query = query.filter(DocumentationModel.status == status)
             models = query.order_by(DocumentationModel.title).all()
-            return [_documentation_to_domain(m) for m in models]
+            links = self._component_links(
+                session, documentation_components, "documentation_id", [m.id for m in models]
+            )
+            return [_documentation_to_domain(m, links.get(m.id, [])) for m in models]
 
-    def count_documentation_metadata(self) -> int:
+    def list_documentation_summaries(
+        self,
+        *,
+        status: str | None = None,
+        product: str | None = None,
+        technology: str | None = None,
+        component: str | None = None,
+        search: str | None = None,
+        sort_by: str = "updated_at",
+        sort_desc: bool = True,
+        page: int = 1,
+        page_size: int = 20,
+        active_only: bool = True,
+    ) -> DocumentPage:
+        """Backs the Knowledge Library: search/filter/sort/pagination,
+        with ``DocumentationModel.content`` deliberately never selected
+        -- Phase 3.2's explicit "avoid loading document content unless
+        requested." ``search`` matches document titles (a WHERE LIKE,
+        not semantic search -- semantic relevance search stays exactly
+        where it already lives, ``KnowledgeEngine.search_documentation``,
+        and only ever covers *published* documents; the Library has to
+        find drafts too, which were never indexed)."""
+        with self._session_factory() as session:
+            query = session.query(DocumentationModel)
+            if active_only:
+                query = query.filter(DocumentationModel.is_active.is_(True))
+            if status:
+                query = query.filter(DocumentationModel.status == status)
+            if product:
+                query = query.filter(DocumentationModel.product == product)
+            if technology:
+                query = query.filter(DocumentationModel.technology == technology)
+            if search:
+                query = query.filter(DocumentationModel.title.ilike(f"%{search}%"))
+            if component:
+                query = query.join(
+                    documentation_components, documentation_components.c.documentation_id == DocumentationModel.id
+                ).join(
+                    ComponentProfileModel, ComponentProfileModel.id == documentation_components.c.component_id
+                ).filter(ComponentProfileModel.name == component)
+
+            total_count = query.count()
+
+            sort_column = _DOCUMENTATION_SORT_COLUMNS.get(sort_by, DocumentationModel.updated_at)
+            query = query.order_by(sort_column.desc() if sort_desc else sort_column.asc())
+            query = query.offset(max(0, page - 1) * page_size).limit(page_size)
+
+            models = query.all()
+            links = self._component_links(
+                session, documentation_components, "documentation_id", [m.id for m in models]
+            )
+            items = [
+                DocumentationListItem(
+                    id=m.id,
+                    title=m.title,
+                    tags=m.tags,
+                    source=m.source,
+                    product=m.product,
+                    version=m.version,
+                    technology=m.technology,
+                    related_components=links.get(m.id, []),
+                    status=m.status,
+                    created_at=m.created_at,
+                    updated_at=m.updated_at,
+                    created_by=m.created_by,
+                    updated_by=m.updated_by,
+                    is_active=m.is_active,
+                )
+                for m in models
+            ]
+            return DocumentPage(items=items, total_count=total_count, page=page, page_size=page_size)
+
+    def count_documentation_by_status(self) -> dict[str, int]:
+        with self._session_factory() as session:
+            rows = (
+                session.query(DocumentationModel.status, func.count(DocumentationModel.id))
+                .filter(DocumentationModel.is_active.is_(True))
+                .group_by(DocumentationModel.status)
+                .all()
+            )
+            return {status: count for status, count in rows}
+
+    def list_recently_added_documentation(self, limit: int = 5) -> list[DocumentationListItem]:
+        return self.list_documentation_summaries(
+            sort_by="created_at", sort_desc=True, page=1, page_size=limit
+        ).items
+
+    def count_documentation(self) -> int:
         with self._session_factory() as session:
             return session.query(DocumentationModel).count()
 
@@ -291,13 +446,21 @@ def _historical_investigation_to_domain(
     )
 
 
-def _documentation_to_domain(model: DocumentationModel) -> DocumentationRecord:
+def _documentation_to_domain(model: DocumentationModel, related_components: list[str]) -> DocumentationRecord:
     return DocumentationRecord(
         id=model.id,
         title=model.title,
-        content="",  # metadata-only table, see DocumentationRecord's docstring
+        content=model.content,
         tags=model.tags,
         source=model.source,
+        product=model.product,
+        version=model.version,
+        technology=model.technology,
+        related_components=related_components,
+        status=model.status,
+        original_filename=model.original_filename,
+        file_type=model.file_type,
+        file_path=model.file_path,
         created_at=model.created_at,
         updated_at=model.updated_at,
         created_by=model.created_by,

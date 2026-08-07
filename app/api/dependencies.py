@@ -22,6 +22,7 @@ from app.engines.investigation.engine import InvestigationEngine
 from app.engines.knowledge.embedding_provider import EmbeddingProvider, SentenceTransformerEmbeddingProvider
 from app.engines.knowledge.engine import KnowledgeEngine
 from app.engines.knowledge.knowledge_store import ChromaKnowledgeStore, KnowledgeStore
+from app.engines.knowledge_management.engine import KnowledgeManagementEngine
 from app.engines.log_intelligence.engine import LogIntelligenceEngine
 from app.engines.log_intelligence.entity_extractor import EntityExtractor, RegexEntityExtractor
 from app.engines.log_intelligence.log_parser import GenericLogParser, LogParser
@@ -89,6 +90,18 @@ def _sql_library_engine() -> SqlLibraryEngine:
 
 
 @lru_cache
+def _knowledge_management_engine() -> KnowledgeManagementEngine:
+    settings = get_settings()
+    return KnowledgeManagementEngine(
+        _knowledge_repository(),
+        _component_profile_repository(),
+        _ingestion_engine(),
+        _knowledge_engine_singleton(),
+        settings.knowledge_upload_dir,
+    )
+
+
+@lru_cache
 def _entity_extractor() -> EntityExtractor:
     return RegexEntityExtractor()
 
@@ -150,6 +163,10 @@ def get_sql_library_engine() -> SqlLibraryEngine:
     return _sql_library_engine()
 
 
+def get_knowledge_management_engine() -> KnowledgeManagementEngine:
+    return _knowledge_management_engine()
+
+
 def run_knowledge_foundation_migration() -> dict[str, int]:
     """Idempotent JSON/constant -> governed-table migration (Sprint 3,
     Phase 3.1). Called once from the FastAPI lifespan, before Chroma
@@ -186,5 +203,6 @@ def reset_singletons() -> None:
         _knowledge_repository,
         _sql_template_repository,
         _sql_library_engine,
+        _knowledge_management_engine,
     ):
         fn.cache_clear()

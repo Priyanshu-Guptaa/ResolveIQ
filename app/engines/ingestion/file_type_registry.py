@@ -24,6 +24,7 @@ from app.engines.ingestion.parsers.docx_parser import DocxParser
 from app.engines.ingestion.parsers.evtx_parser import EvtxParser
 from app.engines.ingestion.parsers.image_ocr_parser import ImageOcrParser
 from app.engines.ingestion.parsers.pdf_parser import PdfParser
+from app.engines.ingestion.parsers.pptx_parser import PptxParser
 from app.engines.ingestion.parsers.text_parser import TextParser
 from app.engines.ingestion.parsers.xlsx_parser import XlsxParser
 
@@ -74,6 +75,7 @@ class FileTypeRegistry:
             TextParser(),
             DocxParser(),
             XlsxParser(),
+            PptxParser(),
             PdfParser(),
             ImageOcrParser(),
             EvtxParser(),

@@ -45,6 +45,9 @@ class KnowledgeStore(Protocol):
     def list_recent(self, collection: KnowledgeCollection, limit: int = 5) -> list[KnowledgeMatch]:
         ...
 
+    def delete(self, collection: KnowledgeCollection, record_id: str) -> None:
+        ...
+
 
 class ChromaKnowledgeStore:
     """ChromaDB-backed :class:`KnowledgeStore`.
@@ -122,6 +125,14 @@ class ChromaKnowledgeStore:
 
     def count(self, collection: KnowledgeCollection) -> int:
         return self._collection(collection).count()
+
+    def delete(self, collection: KnowledgeCollection, record_id: str) -> None:
+        """Removes one record from the index -- used when a document is
+        archived (Sprint 3, Phase 3.2), so it stops appearing in search
+        without needing to rebuild the whole collection. A no-op if the
+        id was never indexed (e.g. archiving a document straight from
+        Draft, which was never published)."""
+        self._collection(collection).delete(ids=[record_id])
 
     def list_recent(self, collection: KnowledgeCollection, limit: int = 5) -> list[KnowledgeMatch]:
         """Most recently imported records, newest first -- not a search,

@@ -20,6 +20,11 @@ from app.config import get_settings  # noqa: E402
 from app.engines.knowledge.embedding_provider import SentenceTransformerEmbeddingProvider  # noqa: E402
 from app.engines.knowledge.engine import KnowledgeEngine  # noqa: E402
 from app.engines.knowledge.knowledge_store import ChromaKnowledgeStore  # noqa: E402
+from app.infrastructure.db.component_repository import SqlAlchemyComponentProfileRepository  # noqa: E402
+from app.infrastructure.db.knowledge_repository import SqlAlchemyKnowledgeRepository  # noqa: E402
+from app.infrastructure.db.seed_migration import migrate_all  # noqa: E402
+from app.infrastructure.db.session import get_session_factory  # noqa: E402
+from app.infrastructure.db.sql_template_repository import SqlAlchemySqlTemplateRepository  # noqa: E402
 from app.logging_config import configure_logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -37,9 +42,23 @@ def main() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
 
+    session_factory = get_session_factory(settings.sqlite_url)
+    component_repo = SqlAlchemyComponentProfileRepository(session_factory)
+    knowledge_repo = SqlAlchemyKnowledgeRepository(session_factory)
+    sql_repo = SqlAlchemySqlTemplateRepository(session_factory)
+
+    # Sprint 3, Phase 3.1+: the governed tables are the source of truth
+    # ChromaDB gets seeded from -- make sure they're populated first.
+    migrate_all(
+        component_repo=component_repo,
+        knowledge_repo=knowledge_repo,
+        sql_repo=sql_repo,
+        sample_knowledge_dir=settings.sample_knowledge_dir,
+    )
+
     embedding_provider = SentenceTransformerEmbeddingProvider(settings.embedding_model_name)
     store = ChromaKnowledgeStore(settings.chroma_persist_dir, embedding_provider)
-    engine = KnowledgeEngine(store)
+    engine = KnowledgeEngine(store, knowledge_repo)
 
     counts = engine.seed_from_directory(settings.sample_knowledge_dir, force=args.force)
     logger.info("Done. Loaded: %s", counts)
