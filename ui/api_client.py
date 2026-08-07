@@ -39,9 +39,15 @@ def api_get(path: str, params: dict | None = None) -> dict | list | None:
         return None
 
 
-def api_post(path: str, json_body: dict | None = None, files=None) -> dict | list | None:
+def api_post(path: str, json_body: dict | None = None, files=None, *, timeout: int = 60) -> dict | list | None:
+    """``timeout`` defaults to 60s for ordinary JSON calls -- callers that
+    upload files (which synchronously run the Evidence Ingestion
+    Pipeline / Knowledge Management's parser server-side, potentially a
+    zip fanning into many files) should pass a longer one explicitly.
+    60s was found too short for a real 1.5MB zip upload -- see the two
+    ``files=`` call sites, which now pass 300s."""
     try:
-        response = requests.post(f"{API_BASE_URL}{path}", json=json_body, files=files, timeout=60)
+        response = requests.post(f"{API_BASE_URL}{path}", json=json_body, files=files, timeout=timeout)
         response.raise_for_status()
         return response.json()
     except requests.RequestException as exc:

@@ -125,7 +125,7 @@ with tab_upload:
     )
     if uploaded_files and st.button("Upload & Extract", type="primary"):
         files_payload = [("files", (f.name, f.getvalue())) for f in uploaded_files]
-        results = api_post("/admin/knowledge/documents/upload", files=files_payload)
+        results = api_post("/admin/knowledge/documents/upload", files=files_payload, timeout=300)
         if results is not None:
             st.success(f"Created {len(results)} draft document(s) -- review them below before publishing.")
             st.session_state["km_just_uploaded"] = [r["document"]["id"] for r in results]

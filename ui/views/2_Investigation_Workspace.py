@@ -140,7 +140,7 @@ with left:
     )
     if uploaded_files and st.button("Upload", key="workspace_upload_btn", use_container_width=True):
         files_payload = [("files", (f.name, f.getvalue())) for f in uploaded_files]
-        result = api_post(f"/investigations/{investigation_id}/evidence/logs", files=files_payload)
+        result = api_post(f"/investigations/{investigation_id}/evidence/logs", files=files_payload, timeout=300)
         if result is not None:
             st.success(f"Parsed {len(result)} item(s).")
             st.rerun()
