@@ -69,3 +69,38 @@ def test_add_missing_columns_backfills_the_configured_default_for_existing_rows(
 
         engine.dispose()
         get_engine.cache_clear()
+
+
+def test_add_missing_columns_creates_an_index_for_additively_migrated_indexed_columns():
+    """Found while adding evidence.content_hash (Investigation loading
+    redesign): ``ALTER TABLE ... ADD COLUMN`` never creates an index --
+    a column declared ``index=True`` only actually gets one on a
+    freshly ``create_all()``'d table, silently not on any database that
+    predates the column. Runs against the real ``evidence`` table with
+    ``content_hash`` stripped out, simulating a pre-existing database."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "test.db"
+        sqlite_url = f"sqlite:///{db_path.as_posix()}"
+
+        engine = get_engine(sqlite_url)
+        engine.dispose()
+        get_engine.cache_clear()
+
+        raw_conn = sqlite3.connect(str(db_path))
+        raw_conn.execute(
+            "CREATE TABLE evidence_old AS SELECT id, investigation_id, evidence_type, source, title, "
+            "raw_content, created_at, extracted_entities, log_events, evidence_metadata FROM evidence"
+        )
+        raw_conn.execute("DROP TABLE evidence")
+        raw_conn.execute("ALTER TABLE evidence_old RENAME TO evidence")
+        raw_conn.commit()
+        raw_conn.close()
+
+        engine = get_engine(sqlite_url)
+        with engine.connect() as conn:
+            indexes = conn.execute(text('PRAGMA index_list("evidence")')).fetchall()
+        index_names = {row[1] for row in indexes}
+        assert "idx_evidence_content_hash" in index_names
+
+        engine.dispose()
+        get_engine.cache_clear()

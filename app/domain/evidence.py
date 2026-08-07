@@ -48,6 +48,35 @@ class Evidence(BaseModel):
     extracted_entities: list[ExtractedEntity] = Field(default_factory=list)
     log_events: list[LogEvent] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    content_hash: str | None = None
+    """SHA-256 of ``raw_content``, set at write time -- the duplicate-
+    upload guard's lookup key (found necessary after a real retried
+    zip upload created 67 duplicate rows; see InvestigationEngine's
+    add_text_evidence/add_file_evidence). None for evidence with empty
+    content (an unsupported binary file, say) -- those are deliberately
+    never deduplicated, since an empty hash can't distinguish two
+    genuinely different textless files. None also for any row that
+    predates this field (an existing DB's evidence is never backfilled
+    with a fabricated hash -- it simply never matches as a duplicate,
+    which is the safe default)."""
+
+
+class EvidencePreview(BaseModel):
+    """On-demand content preview for one piece of evidence -- the shape
+    ``GET /investigations/{id}/evidence/{evidence_id}/preview`` returns.
+    Capped so a client can always ask "what does this look like" without
+    risking a multi-megabyte transfer; ``truncated``/``full_length`` tell
+    the caller whether there's more (fetch the full ``Evidence`` via the
+    sibling non-preview endpoint if genuinely needed)."""
+
+    id: str
+    evidence_type: EvidenceType
+    title: str
+    source: str
+    created_at: datetime
+    preview_text: str
+    truncated: bool
+    full_length: int
 
 
 class HistoricalInvestigationRecord(GovernanceFields):

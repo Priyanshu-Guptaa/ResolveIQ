@@ -10,13 +10,16 @@ Recommendation Engine then reads without needing anything re-supplied.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from app.domain.enums import EvidenceType, InvestigationStatus
-from app.domain.evidence import Evidence
+from app.domain.evidence import Evidence, EvidencePreview
 from app.domain.investigation import (
     ActivityItem,
     DashboardStats,
+    EvidenceSummary,
+    InvestigationDetailSummary,
     InvestigationListItem,
     InvestigationSession,
 )
@@ -26,11 +29,30 @@ from app.infrastructure.db.repository import InvestigationRepository
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_PREVIEW_CHARS = 2000
+
+
+def _hash_content(text: str) -> str | None:
+    """None for empty/whitespace-only content -- an empty hash can't
+    distinguish two genuinely different textless files (e.g. two
+    different unsupported binary uploads), so those are never
+    deduplicated; every distinct upload of empty-text content is kept."""
+    if not text or not text.strip():
+        return None
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
 
 class InvestigationNotFoundError(Exception):
     def __init__(self, investigation_id: str) -> None:
         super().__init__(f"Investigation {investigation_id!r} not found")
         self.investigation_id = investigation_id
+
+
+class EvidenceNotFoundError(Exception):
+    def __init__(self, investigation_id: str, evidence_id: str) -> None:
+        super().__init__(f"Evidence {evidence_id!r} not found on investigation {investigation_id!r}")
+        self.investigation_id = investigation_id
+        self.evidence_id = evidence_id
 
 
 class InvestigationEngine:
@@ -74,12 +96,25 @@ class InvestigationEngine:
         title: str = "",
     ) -> Evidence:
         self._ensure_exists(investigation_id)
+        content_hash = _hash_content(text)
+        if content_hash is not None:
+            existing_id = self._repository.find_duplicate_evidence(investigation_id, content_hash)
+            if existing_id is not None:
+                logger.info(
+                    "Duplicate text evidence detected for investigation %s -- reusing existing %s instead of "
+                    "creating a new row",
+                    investigation_id,
+                    existing_id,
+                )
+                return self._repository.get_evidence(existing_id)
+
         evidence = Evidence(
             investigation_id=investigation_id,
             evidence_type=evidence_type,
             source=source,
             title=title or evidence_type.value.replace("_", " ").title(),
             raw_content=text,
+            content_hash=content_hash,
         )
         self._log_intelligence.analyze_evidence(evidence)
         self._repository.add_evidence(investigation_id, evidence)
@@ -94,18 +129,43 @@ class InvestigationEngine:
 
         Returns a list because a .zip fans out into one Evidence item per
         archive entry; every other upload returns a single-item list.
+
+        Duplicate detection (Investigation loading redesign): found via a
+        real 1.5MB zip that got processed twice after its first upload's
+        client-side timeout led to a retry -- the server had actually
+        succeeded, so the retry created 67 byte-identical duplicate rows.
+        Each parsed file's content is hashed and checked against this
+        investigation's existing evidence before inserting; a match
+        reuses the existing row instead of creating a new one, so a
+        retried upload (or literally re-uploading the same file) is a
+        safe no-op, not a duplicate.
         """
         self._ensure_exists(investigation_id)
         parsed_files = self._ingestion.parse(filename, content)
 
         results: list[Evidence] = []
         for parsed in parsed_files:
+            content_hash = _hash_content(parsed.text)
+            if content_hash is not None:
+                existing_id = self._repository.find_duplicate_evidence(investigation_id, content_hash)
+                if existing_id is not None:
+                    logger.info(
+                        "Duplicate evidence detected ('%s') for investigation %s -- reusing existing %s instead "
+                        "of re-adding",
+                        parsed.filename,
+                        investigation_id,
+                        existing_id,
+                    )
+                    results.append(self._repository.get_evidence(existing_id))
+                    continue
+
             evidence = Evidence(
                 investigation_id=investigation_id,
                 evidence_type=EvidenceType.LOG_FILE,
                 source="upload",
                 title=parsed.filename,
                 raw_content=parsed.text,
+                content_hash=content_hash,
                 metadata={
                     "filename": parsed.filename,
                     "file_kind": parsed.kind.value,
@@ -128,10 +188,59 @@ class InvestigationEngine:
         return results
 
     def get_investigation(self, investigation_id: str) -> InvestigationSession:
+        """Full hydration -- every piece of evidence's raw_content,
+        extracted_entities, and log_events, all loaded at once. Reserved
+        for internal callers that genuinely need it (the Recommendation
+        Engine's merged_entities/context_text, most notably). Never call
+        this to serve a client response directly -- see
+        get_investigation_summary() for that (Investigation loading
+        redesign: a real investigation with 97 evidence items made this
+        method's result serialize to 151MB of JSON)."""
         investigation = self._repository.get(investigation_id)
         if investigation is None:
             raise InvestigationNotFoundError(investigation_id)
         return investigation
+
+    def get_investigation_summary(self, investigation_id: str) -> InvestigationDetailSummary:
+        """The lightweight external contract -- everything the Workspace
+        needs (Summary Card, counts, aggregated entity findings) with zero
+        embedded evidence content."""
+        summary = self._repository.get_summary(investigation_id)
+        if summary is None:
+            raise InvestigationNotFoundError(investigation_id)
+        return summary
+
+    def list_evidence(self, investigation_id: str) -> list[EvidenceSummary]:
+        """Backs the Explorer's evidence list -- metadata only, no
+        content. Opening an investigation must not load every uploaded
+        file's content; this is what makes that possible."""
+        self._ensure_exists(investigation_id)
+        return self._repository.list_evidence_summaries(investigation_id)
+
+    def get_evidence(self, investigation_id: str, evidence_id: str) -> Evidence:
+        """The on-demand full-content fetch for exactly one piece of
+        evidence -- the intended cost of "load content when requested,"
+        as opposed to get_investigation's "load everything, always."""
+        evidence = self._repository.get_evidence(evidence_id)
+        if evidence is None or evidence.investigation_id != investigation_id:
+            raise EvidenceNotFoundError(investigation_id, evidence_id)
+        return evidence
+
+    def get_evidence_preview(
+        self, investigation_id: str, evidence_id: str, max_chars: int = _DEFAULT_PREVIEW_CHARS
+    ) -> EvidencePreview:
+        evidence = self.get_evidence(investigation_id, evidence_id)
+        text = evidence.raw_content or ""
+        return EvidencePreview(
+            id=evidence.id,
+            evidence_type=evidence.evidence_type,
+            title=evidence.title,
+            source=evidence.source,
+            created_at=evidence.created_at,
+            preview_text=text[:max_chars],
+            truncated=len(text) > max_chars,
+            full_length=len(text),
+        )
 
     def list_investigations(self) -> list[InvestigationSession]:
         """Full hydration, evidence included. Only use this where evidence
@@ -174,11 +283,14 @@ class InvestigationEngine:
         version: str | None = None,
         technology: str | None = None,
         assigned_engineer: str | None = None,
-    ) -> InvestigationSession:
+    ) -> InvestigationDetailSummary:
         """Saves engineer-entered case metadata for the persistent Summary
         Card (Phase 2A). Only fields explicitly passed are updated --
         pass only what changed, existing values for other fields are
-        preserved (see the router for how partial updates are built)."""
+        preserved (see the router for how partial updates are built).
+        Returns the lightweight summary (Investigation loading redesign)
+        -- the Summary Card never needed full evidence hydration here
+        either."""
         self._ensure_exists(investigation_id)
         fields = {
             "customer": customer,
@@ -188,7 +300,7 @@ class InvestigationEngine:
             "assigned_engineer": assigned_engineer,
         }
         self._repository.update_details(investigation_id, **{k: v for k, v in fields.items() if v is not None})
-        return self.get_investigation(investigation_id)
+        return self.get_investigation_summary(investigation_id)
 
     def get_dashboard_stats(self) -> DashboardStats:
         # Lightweight summaries -- stats only need status/created_at/
@@ -210,5 +322,5 @@ class InvestigationEngine:
         )
 
     def _ensure_exists(self, investigation_id: str) -> None:
-        if self._repository.get(investigation_id) is None:
+        if not self._repository.exists(investigation_id):
             raise InvestigationNotFoundError(investigation_id)

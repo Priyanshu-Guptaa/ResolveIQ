@@ -165,3 +165,16 @@ def get_component_profiles_cached() -> list | None:
     Registry is a static JSON seed file in this phase -- it can't change
     without a deploy, which restarts the process and clears this cache."""
     return api_get("/product-intelligence/components")
+
+
+@st.cache_data(show_spinner=False)
+def get_evidence_preview_cached(investigation_id: str, evidence_id: str, max_chars: int = 2000) -> dict | None:
+    """No TTL (cached until the process restarts or is cleared) --
+    evidence is immutable once created, so a given (evidence_id,
+    max_chars) pair's preview never changes. Investigation loading
+    redesign: the Workspace's Overview/Notes tabs call this on every
+    Streamlit rerun (st.tabs executes every tab body every rerun,
+    regardless of which tab is visually active); without caching, an
+    unrelated click anywhere on the page would re-fetch every note's
+    preview needlessly."""
+    return api_get(f"/investigations/{investigation_id}/evidence/{evidence_id}/preview", params={"max_chars": max_chars})

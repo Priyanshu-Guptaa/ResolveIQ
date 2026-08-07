@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
 from app.domain.entities import ExtractedEntity
-from app.domain.enums import InvestigationStatus
+from app.domain.enums import EvidenceType, InvestigationStatus
 from app.domain.evidence import Evidence
 
 
@@ -90,6 +90,79 @@ class InvestigationSession(BaseModel):
     def add_evidence(self, evidence: Evidence) -> None:
         self.evidence.append(evidence)
         self.updated_at = _utcnow()
+
+
+class EvidenceSummary(BaseModel):
+    """Lightweight evidence shape for the Explorer list and
+    ``GET /investigations/{id}/evidence`` -- id/type/source/title/
+    timestamp/counts only, never ``raw_content``/``extracted_entities``/
+    ``log_events``. Found necessary after a real investigation's evidence
+    (97 items, one legitimately 15.7MB) made the old embedded-evidence
+    ``GET /investigations/{id}`` return 151MB of JSON. Content is fetched
+    separately and only on demand -- see ``EvidencePreview`` (capped) and
+    the full ``Evidence`` model (uncapped, single-item) for that."""
+
+    id: str
+    evidence_type: EvidenceType
+    source: str
+    title: str
+    created_at: datetime
+    file_kind: str | None = None
+    """From upload metadata (log/docx/xlsx/pdf/image/...) -- None for
+    evidence that was never a file upload (a manual note, the task
+    description)."""
+    content_length: int = 0
+    """Character count of raw_content, computed at the database level
+    (SQL LENGTH()) -- never by loading the content itself."""
+    entity_count: int = 0
+    log_event_count: int = 0
+
+
+class EntityTypeSummary(BaseModel):
+    """One row of the aggregated Findings view -- how many entities of
+    this type were found across all evidence, and a capped sample of
+    distinct values. Computed server-side once (in the lightweight
+    summary query) instead of the client re-aggregating full per-evidence
+    entity lists on every render."""
+
+    entity_type: str
+    count: int
+    sample_values: list[str] = Field(default_factory=list)
+
+
+class InvestigationDetailSummary(BaseModel):
+    """The ``GET /investigations/{id}`` response -- everything the
+    Workspace's Summary Card, evidence counts, and Findings tab need,
+    with zero embedded evidence content. This is to a single
+    investigation's detail view what ``InvestigationListItem`` already
+    was to the list view (same Phase 1.5 "list views never need evidence
+    content" reasoning, extended to the detail view once a real
+    investigation's evidence made that endpoint return 151MB of JSON).
+
+    Internal callers that genuinely need full evidence content (the
+    Recommendation Engine, most notably) keep using
+    ``InvestigationEngine.get_investigation`` (full hydration) directly
+    -- this model is specifically the external, lightweight contract."""
+
+    id: str
+    title: str
+    status: InvestigationStatus
+    created_at: datetime
+    updated_at: datetime
+    last_viewed_at: datetime | None = None
+    customer: str | None = None
+    product: str | None = None
+    version: str | None = None
+    technology: str | None = None
+    assigned_engineer: str | None = None
+    evidence_count: int = 0
+    evidence_count_by_type: dict[str, int] = Field(default_factory=dict)
+    entity_summary: list[EntityTypeSummary] = Field(default_factory=list)
+    last_activity_at: datetime | None = None
+    """Most recent evidence's created_at -- a cheap "is this investigation
+    still being actively worked" signal without fetching the full
+    Timeline (``GET /investigations/{id}/timeline``, unchanged, still the
+    source of truth for the actual chronological event list)."""
 
 
 class InvestigationListItem(BaseModel):

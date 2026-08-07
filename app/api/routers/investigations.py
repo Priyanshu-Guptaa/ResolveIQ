@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
 
 from app.api.dependencies import get_investigation_engine, get_recommendation_engine
 from app.api.schemas import (
@@ -15,10 +15,20 @@ from app.api.schemas import (
     InvestigationSummary,
     UpdateInvestigationDetailsRequest,
 )
-from app.domain.evidence import Evidence
-from app.domain.investigation import ActivityItem, InvestigationListItem, InvestigationSession
+from app.domain.evidence import Evidence, EvidencePreview
+from app.domain.investigation import (
+    ActivityItem,
+    EvidenceSummary,
+    InvestigationDetailSummary,
+    InvestigationListItem,
+    InvestigationSession,
+)
 from app.domain.recommendation import Recommendation
-from app.engines.investigation.engine import InvestigationEngine, InvestigationNotFoundError
+from app.engines.investigation.engine import (
+    EvidenceNotFoundError,
+    InvestigationEngine,
+    InvestigationNotFoundError,
+)
 from app.engines.recommendation.engine import RecommendationEngine
 
 logger = logging.getLogger(__name__)
@@ -27,6 +37,10 @@ router = APIRouter(prefix="/investigations", tags=["investigations"])
 
 
 def _not_found(exc: InvestigationNotFoundError) -> HTTPException:
+    return HTTPException(status_code=404, detail=str(exc))
+
+
+def _evidence_not_found(exc: EvidenceNotFoundError) -> HTTPException:
     return HTTPException(status_code=404, detail=str(exc))
 
 
@@ -48,20 +62,71 @@ def list_investigations(
     return [_to_summary(item) for item in engine.list_investigation_summaries()]
 
 
-@router.get("/{investigation_id}", response_model=InvestigationSession)
+@router.get("/{investigation_id}", response_model=InvestigationDetailSummary)
 def get_investigation(
     investigation_id: str,
     engine: InvestigationEngine = Depends(get_investigation_engine),
-) -> InvestigationSession:
+) -> InvestigationDetailSummary:
     """Fetching an investigation counts as "viewing" it -- backs the
     Dashboard's Recently Viewed panel. Called once when the Workspace page
-    loads, not on every poll, so it reflects real engineer attention."""
+    loads, not on every poll, so it reflects real engineer attention.
+
+    Lightweight by design (Investigation loading redesign): no evidence
+    content is embedded here -- a real investigation with 97 evidence
+    items (one legitimately 15.7MB) made the old full-hydration response
+    151MB of JSON. See GET .../evidence, .../evidence/{evidence_id}, and
+    .../evidence/{evidence_id}/preview for evidence content, loaded only
+    when actually requested."""
     try:
-        investigation = engine.get_investigation(investigation_id)
+        summary = engine.get_investigation_summary(investigation_id)
     except InvestigationNotFoundError as exc:
         raise _not_found(exc) from exc
     engine.mark_viewed(investigation_id)
-    return investigation
+    return summary
+
+
+@router.get("/{investigation_id}/evidence", response_model=list[EvidenceSummary])
+def list_evidence(
+    investigation_id: str,
+    engine: InvestigationEngine = Depends(get_investigation_engine),
+) -> list[EvidenceSummary]:
+    """Metadata-only evidence list -- backs the Explorer. No raw_content,
+    extracted_entities, or log_events; sizes/counts only."""
+    try:
+        return engine.list_evidence(investigation_id)
+    except InvestigationNotFoundError as exc:
+        raise _not_found(exc) from exc
+
+
+@router.get("/{investigation_id}/evidence/{evidence_id}", response_model=Evidence)
+def get_evidence(
+    investigation_id: str,
+    evidence_id: str,
+    engine: InvestigationEngine = Depends(get_investigation_engine),
+) -> Evidence:
+    """Full content for exactly one piece of evidence -- fetched only
+    when actually requested, never automatically for every item on an
+    investigation."""
+    try:
+        return engine.get_evidence(investigation_id, evidence_id)
+    except EvidenceNotFoundError as exc:
+        raise _evidence_not_found(exc) from exc
+
+
+@router.get("/{investigation_id}/evidence/{evidence_id}/preview", response_model=EvidencePreview)
+def get_evidence_preview(
+    investigation_id: str,
+    evidence_id: str,
+    max_chars: int = Query(default=2000, ge=100, le=20000),
+    engine: InvestigationEngine = Depends(get_investigation_engine),
+) -> EvidencePreview:
+    """Capped preview -- what the Overview/Notes tabs use to show "what
+    does this look like" without transferring a potentially multi-
+    megabyte file in full."""
+    try:
+        return engine.get_evidence_preview(investigation_id, evidence_id, max_chars)
+    except EvidenceNotFoundError as exc:
+        raise _evidence_not_found(exc) from exc
 
 
 def _to_summary(inv: InvestigationListItem) -> InvestigationSummary:
@@ -111,12 +176,12 @@ async def upload_logs(
     return results
 
 
-@router.patch("/{investigation_id}/details", response_model=InvestigationSession)
+@router.patch("/{investigation_id}/details", response_model=InvestigationDetailSummary)
 def update_investigation_details(
     investigation_id: str,
     request: UpdateInvestigationDetailsRequest,
     engine: InvestigationEngine = Depends(get_investigation_engine),
-) -> InvestigationSession:
+) -> InvestigationDetailSummary:
     """Saves the persistent Summary Card's engineer-entered fields
     (customer, product, version, technology, assigned engineer)."""
     try:

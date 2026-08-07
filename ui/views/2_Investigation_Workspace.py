@@ -21,6 +21,16 @@ explorer item can imply a center view). This implementation keeps them
 independent for clarity -- the left panel filters and displays its own
 evidence list in place; the center tabs are a separate, always-available
 structure. Documented here rather than silently deviating.
+
+Investigation loading redesign: opening an investigation no longer
+fetches every uploaded file's content. ``investigation`` (from
+``GET /investigations/{id}``) is metadata + counts + a pre-aggregated
+entity summary only; ``evidence_list`` (from the sibling ``/evidence``
+endpoint) is metadata-only per item; actual content is fetched only for
+the specific item a panel needs, on demand, via
+``get_evidence_preview_cached``. Found necessary after a real
+investigation's evidence (97 items, one legitimately 15.7MB) made the
+old embedded-evidence payload 151MB of JSON.
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ from api_client import (
     api_post,
     ensure_api_available,
     get_component_profiles_cached,
+    get_evidence_preview_cached,
     list_investigations_cached,
 )
 from components.component_profile import render_component_profile
@@ -71,6 +82,13 @@ investigation = api_get(f"/investigations/{investigation_id}")
 if investigation is None:
     st.stop()
 
+# Lightweight metadata-only list (Investigation loading redesign) -- id/
+# type/source/title/file_kind, never raw_content. Fetched once per
+# render and reused by the Explorer, Overview, and Notes panels below,
+# instead of each embedding a full evidence payload the way
+# `investigation["evidence"]` used to.
+evidence_list = api_get(f"/investigations/{investigation_id}/evidence") or []
+
 # Recommendation is fetched once (on demand, via the button in the
 # Recommendations tab) and reused by every panel that needs it -- the
 # Findings/right-rail panels never trigger their own recommendation call.
@@ -103,10 +121,12 @@ with left:
 
     st.divider()
     selected_nav = st.session_state[nav_key]
-    evidence_list = investigation["evidence"]
 
     def _file_kind(ev: dict) -> str:
-        return ev.get("metadata", {}).get("file_kind", "text" if ev["evidence_type"] != "manual_note" else "note")
+        # EvidenceSummary already computes file_kind server-side (from
+        # upload metadata) -- no per-item metadata dict to dig through
+        # here anymore.
+        return ev.get("file_kind") or ("note" if ev["evidence_type"] == "manual_note" else "text")
 
     if selected_nav == "Evidence":
         shown = evidence_list
@@ -153,10 +173,17 @@ with center:
 
     with tab_overview:
         st.markdown(f"**{investigation['title']}**")
-        st.caption(f"{len(investigation['evidence'])} evidence item(s) · created {investigation['created_at'][:16].replace('T', ' ')}")
-        task_desc = next((e for e in investigation["evidence"] if e["evidence_type"] == "task_description"), None)
+        st.caption(
+            f"{investigation['evidence_count']} evidence item(s) · created "
+            f"{investigation['created_at'][:16].replace('T', ' ')}"
+        )
+        task_desc = next((e for e in evidence_list if e["evidence_type"] == "task_description"), None)
         if task_desc:
-            st.text(task_desc["raw_content"][:1500])
+            # On-demand, cached preview -- not embedded in the main
+            # investigation payload (Investigation loading redesign).
+            preview = get_evidence_preview_cached(investigation_id, task_desc["id"], max_chars=1500)
+            if preview:
+                st.text(preview["preview_text"])
         st.divider()
         st.markdown("**Case details**")
 
@@ -169,20 +196,17 @@ with center:
         render_details_editor(investigation, on_save=_save_details)
 
     with tab_findings:
-        entity_counts: dict[str, int] = {}
-        all_entities: list[dict] = []
-        for ev in investigation["evidence"]:
-            for entity in ev.get("extracted_entities", []):
-                entity_counts[entity["entity_type"]] = entity_counts.get(entity["entity_type"], 0) + 1
-                all_entities.append(entity)
-        if not entity_counts:
+        # Pre-aggregated server-side (InvestigationDetailSummary.entity_summary)
+        # instead of the client re-scanning every evidence item's
+        # extracted_entities on every render.
+        entity_summary = investigation.get("entity_summary", [])
+        if not entity_summary:
             st.caption("No entities extracted yet -- upload evidence to populate this.")
         else:
             st.caption("Extracted entities across all evidence, most-frequent first:")
-            for entity_type, count in sorted(entity_counts.items(), key=lambda kv: -kv[1]):
-                values = sorted({e["value"] for e in all_entities if e["entity_type"] == entity_type})
-                st.markdown(f"**{entity_type}** ({count})")
-                st.caption(", ".join(values[:10]))
+            for item in entity_summary:
+                st.markdown(f"**{item['entity_type']}** ({item['count']})")
+                st.caption(", ".join(sorted(item["sample_values"])))
 
     with tab_recs:
         if st.button("🔍 Analyze / Refresh recommendation", type="primary", key="analyze_btn"):
@@ -220,16 +244,21 @@ with center:
                 st.checkbox(step, key=f"playbook_{investigation_id}_{i}")
 
     with tab_notes:
-        notes = [e for e in investigation["evidence"] if e["evidence_type"] == "manual_note"]
+        notes_meta = [e for e in evidence_list if e["evidence_type"] == "manual_note"]
         st.caption(
             "General notes. Categorized types (Customer Update, L2 Notes, L3 Escalation, "
             "RCA) arrive with Documentation Generators in a later phase."
         )
-        if not notes:
+        if not notes_meta:
             st.caption("No notes yet.")
-        for note in notes:
-            st.markdown(f"`{note['created_at'][:16].replace('T', ' ')}`")
-            st.text(note["raw_content"][:800])
+        for note_meta in notes_meta:
+            # On-demand, cached preview per note -- notes are typically
+            # short, but this still avoids embedding every note's content
+            # in the main investigation payload.
+            preview = get_evidence_preview_cached(investigation_id, note_meta["id"], max_chars=800)
+            st.markdown(f"`{note_meta['created_at'][:16].replace('T', ' ')}`")
+            if preview:
+                st.text(preview["preview_text"])
             st.divider()
 
         # A plain text_area + button (no form) keeps its typed value in

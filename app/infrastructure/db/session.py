@@ -75,6 +75,17 @@ def _add_missing_columns(engine: Engine) -> None:
                 conn.execute(
                     text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {ddl_type} {default_clause}'.strip())
                 )
+                if column.index:
+                    # ADD COLUMN never creates an index -- a gap found
+                    # while adding evidence.content_hash (Investigation
+                    # loading redesign): index=True on an additively-
+                    # migrated column was silently a no-op for any DB
+                    # that predates it, unlike a freshly create_all()'d
+                    # table, which gets the index correctly. IF NOT
+                    # EXISTS makes this safe to run every startup.
+                    index_name = f"idx_{table.name}_{column.name}"
+                    conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{index_name}" ON "{table.name}" ("{column.name}")'))
+                    logger.warning("Created index %s on %s.%s (additive column)", index_name, table.name, column.name)
 
 
 def _scalar_default_clause(column) -> str:

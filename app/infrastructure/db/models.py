@@ -68,6 +68,11 @@ class EvidenceModel(Base):
     log_events: Mapped[list] = mapped_column(JSON, default=list)
     evidence_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
 
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True, default=None)
+    """SHA-256 of raw_content -- the duplicate-upload guard's lookup key.
+    See Evidence.content_hash's docstring for why this is nullable and
+    never backfilled for pre-existing rows."""
+
     investigation: Mapped["InvestigationModel"] = relationship(back_populates="evidence")
 
 
