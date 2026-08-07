@@ -55,6 +55,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_INDEXED_TYPES = (
+    KnowledgeObjectType.DOCUMENT,
+    KnowledgeObjectType.KNOWN_BUG,
+    KnowledgeObjectType.HISTORICAL_INVESTIGATION,
+)
+"""The three object types the Knowledge Engine actually embeds for
+semantic search. Originally (Phase 3.4's first pass) only DOCUMENT was
+wired here, which meant a Known Bug or Historical Investigation created/
+edited/published through this framework silently never became
+searchable -- a real gap, not a deliberate scope decision. Fixed by
+generalizing the same indexing hook Phase 3.2 built for Documents to
+the other two indexed types, via the same per-record index_*/unindex_*
+methods on KnowledgeEngine (no new indexing logic, just dispatch)."""
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -104,6 +118,22 @@ class KnowledgeObjectService:
             raise KeyError(f"No adapter registered for {object_type.value}")
         return adapter
 
+    def _index(self, object_type: KnowledgeObjectType, instance: BaseModel) -> None:
+        if object_type == KnowledgeObjectType.DOCUMENT:
+            self._knowledge.index_documentation(instance)
+        elif object_type == KnowledgeObjectType.KNOWN_BUG:
+            self._knowledge.index_known_bug(instance)
+        elif object_type == KnowledgeObjectType.HISTORICAL_INVESTIGATION:
+            self._knowledge.index_historical_investigation(instance)
+
+    def _unindex(self, object_type: KnowledgeObjectType, object_id: str) -> None:
+        if object_type == KnowledgeObjectType.DOCUMENT:
+            self._knowledge.unindex_documentation(object_id)
+        elif object_type == KnowledgeObjectType.KNOWN_BUG:
+            self._knowledge.unindex_known_bug(object_id)
+        elif object_type == KnowledgeObjectType.HISTORICAL_INVESTIGATION:
+            self._knowledge.unindex_historical_investigation(object_id)
+
     # --- Read ------------------------------------------------------------
 
     def get(self, object_type: KnowledgeObjectType, object_id: str) -> BaseModel | None:
@@ -127,6 +157,8 @@ class KnowledgeObjectService:
         instance = adapter.model_cls(id=_new_id(), created_by=created_by, updated_by=created_by, **fields)
         adapter.save(instance)
         self._record_version(object_type, instance.id, instance, created_by, "created")
+        if object_type in _INDEXED_TYPES and self._should_index(object_type, instance):
+            self._index(object_type, instance)
         logger.info("Created %s %s", object_type.value, instance.id)
         return instance
 
@@ -140,8 +172,21 @@ class KnowledgeObjectService:
         updated = current.model_copy(update={**fields, "updated_by": updated_by, "updated_at": _utcnow()})
         adapter.save(updated)
         self._record_version(object_type, object_id, updated, updated_by, "edited")
-        self._reindex_if_published_document(object_type, updated)
+        if object_type in _INDEXED_TYPES and self._should_index(object_type, updated):
+            self._index(object_type, updated)
         return updated
+
+    def _should_index(self, object_type: KnowledgeObjectType, instance: BaseModel) -> bool:
+        """Documents are only searchable once Published (Phase 3.2's
+        original design: "starts as Draft, isn't searchable until you
+        publish it"). Known Bugs and Historical Investigations were never
+        status-gated for indexing even before Phase 3.4 added lifecycle
+        status to them (``_seed_known_bugs``/``_seed_historical_investigations``
+        indexed every row regardless) -- preserved here rather than
+        introducing a new gate those two types never had."""
+        if object_type == KnowledgeObjectType.DOCUMENT:
+            return instance.status == ObjectLifecycleStatus.PUBLISHED
+        return True
 
     # --- Lifecycle ---------------------------------------------------------
 
@@ -176,9 +221,14 @@ class KnowledgeObjectService:
 
         if object_type == KnowledgeObjectType.DOCUMENT:
             if new_status == ObjectLifecycleStatus.PUBLISHED:
-                self._knowledge.index_documentation(updated)
+                self._index(object_type, updated)
             elif was_published:
-                self._knowledge.unindex_documentation(object_id)
+                self._unindex(object_type, object_id)
+        elif object_type in _INDEXED_TYPES:
+            # Known Bug / Historical Investigation: never status-gated
+            # for search (see _should_index) -- just keep the indexed
+            # metadata (e.g. bug_status) current after any transition.
+            self._index(object_type, updated)
         return updated
 
     def delete(self, object_type: KnowledgeObjectType, object_id: str, *, deleted_by: str | None = None) -> None:
@@ -196,19 +246,36 @@ class KnowledgeObjectService:
             raise ObjectHasDependentsError(impact)
 
         self._record_version(object_type, object_id, current, deleted_by, "deleted")
-        if object_type == KnowledgeObjectType.DOCUMENT and current.status == ObjectLifecycleStatus.PUBLISHED:
-            self._knowledge.unindex_documentation(object_id)
+        if object_type in _INDEXED_TYPES and self._should_index(object_type, current):
+            self._unindex(object_type, object_id)
         adapter.delete(object_id)
         logger.info("Deleted %s %s", object_type.value, object_id)
-
-    def _reindex_if_published_document(self, object_type: KnowledgeObjectType, updated: BaseModel) -> None:
-        if object_type == KnowledgeObjectType.DOCUMENT and updated.status == ObjectLifecycleStatus.PUBLISHED:
-            self._knowledge.index_documentation(updated)
 
     # --- History -----------------------------------------------------------
 
     def get_history(self, object_type: KnowledgeObjectType, object_id: str) -> list[EntityVersion]:
         return self._versions.list_versions(object_type, object_id)
+
+    def reindex_existing(self, object_type: KnowledgeObjectType | None = None) -> dict[str, int]:
+        """Backfills the search index for rows that already exist in the
+        database but were never indexed -- the situation any bulk import
+        (or a DB restored from backup) leaves behind, since indexing only
+        happens as a side effect of create/edit/publish going forward.
+        Idempotent (upsert-by-id), safe to call anytime. Only touches the
+        three indexed types (see ``_INDEXED_TYPES``); other types are
+        silently skipped if explicitly requested."""
+        types = [object_type] if object_type else list(_INDEXED_TYPES)
+        counts: dict[str, int] = {}
+        for t in types:
+            if t not in _INDEXED_TYPES:
+                continue
+            n = 0
+            for instance in self._adapter(t).list_all():
+                if self._should_index(t, instance):
+                    self._index(t, instance)
+                    n += 1
+            counts[t.value] = n
+        return counts
 
     def _record_version(
         self, object_type: KnowledgeObjectType, object_id: str, instance: BaseModel, changed_by: str | None, summary: str

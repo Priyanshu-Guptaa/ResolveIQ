@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.dependencies import get_knowledge_object_service
 from app.api.schemas import KnowledgeObjectWriteRequest
@@ -37,6 +37,19 @@ def _not_found(exc: KnowledgeObjectNotFoundError) -> HTTPException:
 
 def _conflict(exc: ObjectHasDependentsError) -> HTTPException:
     return HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/reindex", response_model=dict)
+def reindex_existing(
+    object_type: KnowledgeObjectType | None = Query(default=None),
+    service: KnowledgeObjectService = Depends(get_knowledge_object_service),
+) -> dict:
+    """Backfills the search index for rows that already exist but were
+    never indexed -- needed after a bulk import (rows created via direct
+    repository access, or before this indexing hook existed) or after
+    restoring a database backup. Idempotent; safe to call anytime.
+    Omit ``object_type`` to reindex all three indexed types."""
+    return service.reindex_existing(object_type)
 
 
 @router.get("/{object_type}", response_model=list[KnowledgeObjectRef])

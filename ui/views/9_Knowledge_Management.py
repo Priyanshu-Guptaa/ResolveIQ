@@ -111,14 +111,14 @@ with tab_library:
 # === Upload (Upload -> Preview -> Extract -> Metadata -> Validate -> Publish) ===
 with tab_upload:
     st.markdown(
-        "Upload PDF, DOCX, PPTX, XLSX, TXT, or LOG files -- or a ZIP of any of those "
+        "Upload PDF, DOCX, PPTX, XLSX, TXT, LOG, JSON, CSV, or XML files -- or a ZIP of any of those "
         "(it fans out into one document per entry). Runs the same Evidence Ingestion Pipeline "
         "that parses investigation evidence; every document starts as **Draft** and isn't "
         "searchable until you publish it below."
     )
     uploaded_files = st.file_uploader(
         "Upload documents",
-        type=["pdf", "docx", "pptx", "xlsx", "txt", "log", "zip"],
+        type=["pdf", "docx", "pptx", "xlsx", "txt", "log", "json", "csv", "xml", "zip"],
         accept_multiple_files=True,
         key="km_uploader",
         label_visibility="collapsed",

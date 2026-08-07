@@ -74,25 +74,41 @@ class KnowledgeEngine:
         records = self._repository.list_historical_investigations()
         base_time = datetime.now(timezone.utc)
         for index, record in enumerate(records):
-            searchable_text = (
-                f"{record.title}\n{record.description}\nRoot cause: {record.root_cause}\n"
-                f"Resolution: {record.resolution}\nTags: {', '.join(record.tags)}"
-            )
-            self._store.upsert(
-                collection,
-                record.id,
-                searchable_text,
-                record.title,
-                metadata={
-                    "root_cause": record.root_cause,
-                    "resolution": record.resolution,
-                    "next_step": record.next_step,
-                    "tags": ", ".join(record.tags),
-                    "domain": record.domain,
-                    "imported_at": _seed_timestamp(base_time, index),
-                },
-            )
+            self.index_historical_investigation(record, imported_at=_seed_timestamp(base_time, index))
         return len(records)
+
+    # --- Single-record indexing (Sprint 3, Phase 3.4 -- Knowledge Object
+    # Framework's create/edit/publish/archive) -----------------------------
+    # Same "bulk seeding and one admin action are the same operation at
+    # different volume" reasoning Phase 3.2 established for
+    # index_documentation/unindex_documentation, extended here to the other
+    # two indexed collections so KnowledgeObjectService doesn't need (and
+    # doesn't get) a second, parallel indexing implementation for them.
+
+    def index_historical_investigation(
+        self, record: HistoricalInvestigationRecord, *, imported_at: str | None = None
+    ) -> None:
+        searchable_text = (
+            f"{record.title}\n{record.description}\nRoot cause: {record.root_cause}\n"
+            f"Resolution: {record.resolution}\nTags: {', '.join(record.tags)}"
+        )
+        self._store.upsert(
+            KnowledgeCollection.HISTORICAL_INVESTIGATIONS,
+            record.id,
+            searchable_text,
+            record.title,
+            metadata={
+                "root_cause": record.root_cause,
+                "resolution": record.resolution,
+                "next_step": record.next_step,
+                "tags": ", ".join(record.tags),
+                "domain": record.domain,
+                "imported_at": imported_at or datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    def unindex_historical_investigation(self, record_id: str) -> None:
+        self._store.delete(KnowledgeCollection.HISTORICAL_INVESTIGATIONS, record_id)
 
     # --- Plain listing (Phase 3.1 -- ready for Phase 3.3+'s admin UI) ------
 
@@ -158,24 +174,34 @@ class KnowledgeEngine:
         records = self._repository.list_known_bugs()
         base_time = datetime.now(timezone.utc)
         for index, record in enumerate(records):
-            searchable_text = (
-                f"{record.title}\n{record.description}\n"
-                f"Affected: {', '.join(record.affected_components)}\n"
-                f"Workaround: {record.workaround or 'none'}"
-            )
-            self._store.upsert(
-                collection,
-                record.id,
-                searchable_text,
-                record.title,
-                metadata={
-                    "status": record.status,
-                    "affected_components": ", ".join(record.affected_components),
-                    "workaround": record.workaround or "",
-                    "imported_at": _seed_timestamp(base_time, index),
-                },
-            )
+            self.index_known_bug(record, imported_at=_seed_timestamp(base_time, index))
         return len(records)
+
+    def index_known_bug(self, record: KnownBugRecord, *, imported_at: str | None = None) -> None:
+        searchable_text = (
+            f"{record.title}\n{record.description}\n"
+            f"Affected: {', '.join(record.affected_components)}\n"
+            f"Workaround: {record.workaround or 'none'}"
+        )
+        self._store.upsert(
+            KnowledgeCollection.KNOWN_BUGS,
+            record.id,
+            searchable_text,
+            record.title,
+            metadata={
+                # Sprint 3 Phase 3.4 renamed KnownBugRecord.status to
+                # bug_status (the bug's own open/fixed state) once the
+                # governance `status` field was added -- read the right
+                # one here, not the inherited lifecycle status.
+                "status": record.bug_status,
+                "affected_components": ", ".join(record.affected_components),
+                "workaround": record.workaround or "",
+                "imported_at": imported_at or datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    def unindex_known_bug(self, record_id: str) -> None:
+        self._store.delete(KnowledgeCollection.KNOWN_BUGS, record_id)
 
     # --- Search --------------------------------------------------------
 

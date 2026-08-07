@@ -241,6 +241,57 @@ def test_publishing_document_indexes_it_and_archiving_unindexes(setup):
     assert created.id in knowledge_store.deletes
 
 
+def test_create_known_bug_indexes_it_immediately(setup):
+    """Regression guard: Phase 3.4's first pass only wired indexing for
+    Documents -- a Known Bug created through the framework silently
+    never became searchable. Known Bugs are indexed unconditionally
+    (never status-gated, matching pre-3.4 bulk-seed behavior), unlike
+    Documents which wait for Publish."""
+    service, _ = setup
+    created = service.create(T.KNOWN_BUG, title="Indexable bug", description="d")
+    knowledge_store: _StubKnowledgeStore = service._knowledge._store  # type: ignore[attr-defined]
+    assert created.id in knowledge_store.upserts
+
+
+def test_create_historical_investigation_indexes_it_immediately(setup):
+    service, _ = setup
+    created = service.create(
+        T.HISTORICAL_INVESTIGATION,
+        title="Indexable investigation",
+        domain="general",
+        description="d",
+        root_cause="rc",
+        resolution="res",
+    )
+    knowledge_store: _StubKnowledgeStore = service._knowledge._store  # type: ignore[attr-defined]
+    assert created.id in knowledge_store.upserts
+
+
+def test_deleting_known_bug_unindexes_it(setup):
+    service, _ = setup
+    created = service.create(T.KNOWN_BUG, title="To delete", description="d")
+    knowledge_store: _StubKnowledgeStore = service._knowledge._store  # type: ignore[attr-defined]
+    service.delete(T.KNOWN_BUG, created.id)
+    assert created.id in knowledge_store.deletes
+
+
+def test_reindex_existing_backfills_rows_created_outside_the_framework(setup):
+    """The exact situation a bulk import (or this bug, before the fix)
+    leaves behind: rows that exist in the database but were never
+    indexed. reindex_existing() must find and index them."""
+    service, repos = setup
+    from app.domain.evidence import KnownBugRecord
+
+    bug = KnownBugRecord(id="bulk-imported-bug", title="Bulk bug", description="d")
+    repos["knowledge"].save_known_bug(bug)  # bypasses the service -- never indexed
+    knowledge_store: _StubKnowledgeStore = service._knowledge._store  # type: ignore[attr-defined]
+    assert bug.id not in knowledge_store.upserts
+
+    counts = service.reindex_existing(T.KNOWN_BUG)
+    assert counts["known_bug"] >= 1
+    assert bug.id in knowledge_store.upserts
+
+
 # --- Delete / Impact gate -----------------------------------------------------
 
 
