@@ -126,8 +126,16 @@ def migrate_known_bugs(
     imported = 0
     for item in raw:
         related = _match_by_normalized_key(item.get("affected_components", []), component_names)
+        # known_bugs.json's "status" key is the bug's own open/fixed
+        # state -- KnownBugRecord.bug_status since Phase 3.4, when
+        # GovernanceFields claimed "status" for the shared governance
+        # lifecycle instead. Map it explicitly rather than **item, which
+        # would otherwise hand "fixed-in-2.3.2" to the lifecycle field
+        # and fail Pydantic's enum validation.
+        fields = dict(item)
+        fields["bug_status"] = fields.pop("status", "open")
         record = KnownBugRecord(
-            **item, related_components=related, created_by=_MIGRATION_ACTOR, updated_by=_MIGRATION_ACTOR
+            **fields, related_components=related, created_by=_MIGRATION_ACTOR, updated_by=_MIGRATION_ACTOR
         )
         knowledge_repo.save_known_bug(record)
         imported += 1

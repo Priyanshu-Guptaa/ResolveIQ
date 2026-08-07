@@ -42,6 +42,17 @@ def _add_missing_columns(engine: Engine) -> None:
     pulling in Alembic for it now would be solving a problem the project
     doesn't have yet. This is the smallest safe fix: additive only (never
     drops or alters existing columns), and it runs once at startup.
+
+    Includes the column's configured scalar ``default`` (if any) in the
+    generated DDL as SQLite's own ``DEFAULT`` clause -- found and fixed
+    in Phase 3.4: without it, ``ALTER TABLE ... ADD COLUMN`` leaves every
+    *existing* row's new column NULL even when the ORM column declares
+    e.g. ``default="published"``, silently contradicting what every
+    caller of that field reasonably expects. New rows were never
+    affected (INSERT always went through the ORM, which applies Python-
+    side defaults correctly) -- only pre-existing rows backfilled by this
+    exact code path were ever wrong, which is exactly the path Phase
+    3.4's new ``status`` column on eight existing tables relies on.
     """
     inspector = inspect(engine)
     for table in Base.metadata.sorted_tables:
@@ -52,14 +63,38 @@ def _add_missing_columns(engine: Engine) -> None:
             if column.name in existing_columns:
                 continue
             ddl_type = column.type.compile(engine.dialect)
+            default_clause = _scalar_default_clause(column)
             logger.warning(
-                "Adding missing column %s.%s (%s) -- existing DB predates this field",
+                "Adding missing column %s.%s (%s)%s -- existing DB predates this field",
                 table.name,
                 column.name,
                 ddl_type,
+                f" {default_clause}" if default_clause else "",
             )
             with engine.begin() as conn:
-                conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {ddl_type}'))
+                conn.execute(
+                    text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {ddl_type} {default_clause}'.strip())
+                )
+
+
+def _scalar_default_clause(column) -> str:
+    """Renders a SQLAlchemy column's configured Python-side scalar
+    default as a SQLite ``DEFAULT ...`` clause, or ``""`` if the column
+    has no default (or a non-scalar one, e.g. a callable like
+    ``default_factory``-backed columns -- those can't be expressed as a
+    static SQL literal and are left NULL, same as before this fix)."""
+    default = column.default
+    if default is None or not getattr(default, "is_scalar", False):
+        return ""
+    value = default.arg
+    if isinstance(value, bool):
+        return f"DEFAULT {1 if value else 0}"
+    if isinstance(value, (int, float)):
+        return f"DEFAULT {value}"
+    if isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return f"DEFAULT '{escaped}'"
+    return ""
 
 
 def get_session_factory(sqlite_url: str) -> sessionmaker[Session]:

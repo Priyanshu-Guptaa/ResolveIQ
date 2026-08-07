@@ -171,15 +171,30 @@ class ComponentProfileModel(Base):
     created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
+    """Governance lifecycle (Phase 3.4) -- Draft/Published/Archived/...
+    See GovernanceFields.status."""
 
 
 class KnownBugModel(Base):
+    """``bug_status`` (Python attribute) deliberately keeps the existing
+    DB column name ``"status"`` -- that column already exists with real
+    bug-state data ("open", "fixed-in-2.3.2", ...) in any database that
+    ran the Phase 3.1 migration, and there is no reason to touch it.
+    The new Phase 3.4 governance lifecycle field is a genuinely
+    different concept that happens to share the name "status" at the
+    domain-model level (``GovernanceFields.status``) -- to avoid two
+    columns both named "status" in one table, it's mapped to a
+    distinctly-named DB column, ``lifecycle_status``. Every other
+    governed table in this file has no such pre-existing collision, so
+    their new status column is simply named ``status`` directly."""
+
     __tablename__ = "known_bugs"
 
     id: Mapped[str] = mapped_column(String(100), primary_key=True)
     title: Mapped[str] = mapped_column(String(500))
     description: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(50), default="open")
+    bug_status: Mapped[str] = mapped_column("status", String(50), default="open")
     affected_components: Mapped[list] = mapped_column(JSON, default=list)
     workaround: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
 
@@ -188,6 +203,7 @@ class KnownBugModel(Base):
     created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    lifecycle_status: Mapped[str] = mapped_column("lifecycle_status", String(20), default="published", index=True)
 
 
 class SqlTemplateModel(Base):
@@ -205,6 +221,7 @@ class SqlTemplateModel(Base):
     created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
 
 
 class HistoricalInvestigationModel(Base):
@@ -224,6 +241,7 @@ class HistoricalInvestigationModel(Base):
     created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
 
 
 class DocumentationModel(Base):
@@ -291,6 +309,7 @@ class PlaybookModel(Base):
     created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
 
 
 class ProductModel(Base):
@@ -304,6 +323,7 @@ class ProductModel(Base):
     created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
 
 
 class TechnologyModel(Base):
@@ -317,6 +337,7 @@ class TechnologyModel(Base):
     created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
 
 
 class VersionModel(Base):
@@ -331,6 +352,7 @@ class VersionModel(Base):
     created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
 
     __table_args__ = (Index("ix_versions_product_id", "product_id"),)
 
@@ -361,3 +383,26 @@ class KnowledgeRelationshipModel(Base):
         Index("ix_knowledge_relationships_from", "from_type", "from_id"),
         Index("ix_knowledge_relationships_to", "to_type", "to_id"),
     )
+
+
+class EntityVersionModel(Base):
+    """History (Sprint 3, Phase 3.4 -- Knowledge Object Framework). One
+    row per save of any governed object, across all nine types -- the
+    same generalization move as ``KnowledgeRelationshipModel`` in Phase
+    3.3 (one shared table instead of nine per-type history tables).
+    ``snapshot`` is the object's full ``model_dump(mode="json")`` at
+    save time -- generic across every Pydantic domain model, so this
+    table needed zero per-type schema knowledge to be added."""
+
+    __tablename__ = "entity_versions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    object_type: Mapped[str] = mapped_column(String(30))
+    object_id: Mapped[str] = mapped_column(String(100))
+    version_number: Mapped[int] = mapped_column()
+    snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    changed_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    change_summary: Mapped[str] = mapped_column(String(500), default="")
+
+    __table_args__ = (Index("ix_entity_versions_object", "object_type", "object_id"),)

@@ -86,22 +86,45 @@ class InvestigationStatus(str, Enum):
     CLOSED = "closed"
 
 
-class DocumentStatus(str, Enum):
-    """Lifecycle state of a governed :class:`~app.domain.evidence.DocumentationRecord`
-    (Sprint 3, Phase 3.2 -- Knowledge Management).
+class ObjectLifecycleStatus(str, Enum):
+    """Lifecycle state shared by every governed knowledge object (Sprint
+    3, Phase 3.4 -- Knowledge Object Framework).
+
+    Originated in Phase 3.2 as ``DocumentStatus`` (Documentation only);
+    Phase 3.4 generalizes it onto ``GovernanceFields`` itself, so every
+    governed entity (Component, Known Bug, SQL Template, Historical
+    Investigation, Playbook, Product, Technology, Version -- not just
+    Documentation) gets the same four/five-state lifecycle instead of
+    each inventing its own. ``UNDER_REVIEW`` and ``DEPRECATED`` are
+    defined now (cheap) but nothing transitions an object into either
+    yet -- RFC-003's full Draft -> Under Review -> Approved -> Published
+    -> Archived approval workflow is still a later phase; this is that
+    same "keep the design extensible" discipline, now with the
+    generalized shape "compatible with future approval workflows"
+    (Phase 3.4's own wording) actually requires.
 
     Only ``PUBLISHED`` documents are indexed/searchable by the Knowledge
-    Engine. ``UNDER_REVIEW`` is defined now (cheap) but nothing transitions
-    a document into it yet -- RFC-003's full Draft -> Under Review ->
-    Approved -> Published -> Archived approval workflow is a later phase;
-    this is the "initially support Draft/Published/Archived, keep the
-    design extensible" version of it.
+    Engine -- unchanged from Phase 3.2, and true for Documentation only;
+    the other eight object types have no search index of their own to
+    gate (they're relationship-graph nodes, not full-text search
+    targets), so their status only governs the Knowledge Object
+    Framework's own visibility/lifecycle UI, not a second index.
     """
 
     DRAFT = "draft"
     UNDER_REVIEW = "under_review"
     PUBLISHED = "published"
     ARCHIVED = "archived"
+    DEPRECATED = "deprecated"
+
+
+DocumentStatus = ObjectLifecycleStatus
+"""Backward-compatible alias -- Phase 3.2's ``DocumentStatus`` is the
+exact same enum as Phase 3.4's ``ObjectLifecycleStatus``, just named
+before its scope generalized. Existing imports of ``DocumentStatus``
+(``evidence.py``, ``seed_migration.py``, the Knowledge Management
+engine/router) keep working unchanged; new code should prefer
+``ObjectLifecycleStatus``, the name that now actually describes it."""
 
 
 class KnowledgeCollection(str, Enum):

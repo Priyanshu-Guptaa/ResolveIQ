@@ -161,7 +161,16 @@ class KnownBugRecord(GovernanceFields):
     id: str
     title: str
     description: str
-    status: str = "open"
+    bug_status: str = "open"
+    """The bug's own state -- 'open', 'fixed-in-2.3.2', etc. Renamed
+    from ``status`` in Phase 3.4: ``GovernanceFields`` now defines
+    ``status`` for the *governance* lifecycle (Draft/Published/Archived/
+    ...) shared by every knowledge object, and this field meant
+    something entirely different (was it "open" was silently shadowing
+    the mixin's field before this rename -- Phase 3.4 found this
+    collision while generalizing lifecycle status onto every entity).
+    ``known_bugs.json``'s "status" key still maps here; only the Python
+    attribute name changed, see seed_migration.py."""
     affected_components: list[str] = Field(default_factory=list)
     """Original free-text component/service names, preserved exactly as
     authored -- unchanged by the Sprint 3 migration."""

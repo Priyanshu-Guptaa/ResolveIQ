@@ -14,19 +14,9 @@ import streamlit as st
 from api_client import api_delete, api_get, api_post, ensure_api_available
 
 from components.object_picker import render_object_picker
+from components.object_types import TYPE_LABELS as _TYPE_LABELS
 from theme import inject_theme
 
-_TYPE_LABELS = {
-    "component": "Component",
-    "document": "Document",
-    "known_bug": "Known Bug",
-    "sql_template": "SQL Template",
-    "historical_investigation": "Historical Investigation",
-    "playbook": "Playbook",
-    "product": "Product",
-    "technology": "Technology",
-    "version": "Version",
-}
 RELATIONSHIP_TYPES = ["related_to", "documents", "fixes", "requires", "uses", "applies_to"]
 
 inject_theme()

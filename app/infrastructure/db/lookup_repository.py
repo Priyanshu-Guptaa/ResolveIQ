@@ -32,6 +32,9 @@ class LookupRepository(Protocol):
     def list_products(self, *, active_only: bool = True) -> list[Product]:
         ...
 
+    def delete_product(self, product_id: str) -> None:
+        ...
+
     def save_technology(self, technology: Technology) -> None:
         ...
 
@@ -44,6 +47,9 @@ class LookupRepository(Protocol):
     def list_technologies(self, *, active_only: bool = True) -> list[Technology]:
         ...
 
+    def delete_technology(self, technology_id: str) -> None:
+        ...
+
     def save_version(self, version: Version) -> None:
         ...
 
@@ -54,6 +60,9 @@ class LookupRepository(Protocol):
         ...
 
     def list_versions(self, *, active_only: bool = True) -> list[Version]:
+        ...
+
+    def delete_version(self, version_id: str) -> None:
         ...
 
 
@@ -75,6 +84,7 @@ class SqlAlchemyLookupRepository:
             model.created_by = product.created_by
             model.updated_by = product.updated_by
             model.is_active = product.is_active
+            model.status = product.status.value
             session.commit()
 
     def get_product(self, product_id: str) -> Product | None:
@@ -94,6 +104,13 @@ class SqlAlchemyLookupRepository:
                 query = query.filter(ProductModel.is_active.is_(True))
             return [Product(**_row_to_kwargs(m)) for m in query.order_by(ProductModel.name).all()]
 
+    def delete_product(self, product_id: str) -> None:
+        with self._session_factory() as session:
+            model = session.get(ProductModel, product_id)
+            if model is not None:
+                session.delete(model)
+                session.commit()
+
     # --- Technologies ----------------------------------------------------
 
     def save_technology(self, technology: Technology) -> None:
@@ -108,6 +125,7 @@ class SqlAlchemyLookupRepository:
             model.created_by = technology.created_by
             model.updated_by = technology.updated_by
             model.is_active = technology.is_active
+            model.status = technology.status.value
             session.commit()
 
     def get_technology(self, technology_id: str) -> Technology | None:
@@ -127,6 +145,13 @@ class SqlAlchemyLookupRepository:
                 query = query.filter(TechnologyModel.is_active.is_(True))
             return [Technology(**_row_to_kwargs(m)) for m in query.order_by(TechnologyModel.name).all()]
 
+    def delete_technology(self, technology_id: str) -> None:
+        with self._session_factory() as session:
+            model = session.get(TechnologyModel, technology_id)
+            if model is not None:
+                session.delete(model)
+                session.commit()
+
     # --- Versions ----------------------------------------------------------
 
     def save_version(self, version: Version) -> None:
@@ -142,6 +167,7 @@ class SqlAlchemyLookupRepository:
             model.created_by = version.created_by
             model.updated_by = version.updated_by
             model.is_active = version.is_active
+            model.status = version.status.value
             session.commit()
 
     def get_version(self, version_id: str) -> Version | None:
@@ -161,6 +187,13 @@ class SqlAlchemyLookupRepository:
                 query = query.filter(VersionModel.is_active.is_(True))
             return [_version_to_domain(m) for m in query.order_by(VersionModel.name).all()]
 
+    def delete_version(self, version_id: str) -> None:
+        with self._session_factory() as session:
+            model = session.get(VersionModel, version_id)
+            if model is not None:
+                session.delete(model)
+                session.commit()
+
 
 def _row_to_kwargs(model) -> dict:
     return {
@@ -171,6 +204,7 @@ def _row_to_kwargs(model) -> dict:
         "created_by": model.created_by,
         "updated_by": model.updated_by,
         "is_active": model.is_active,
+        "status": model.status,
     }
 
 

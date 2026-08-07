@@ -10,18 +10,7 @@ from __future__ import annotations
 import streamlit as st
 from api_client import api_get
 
-_TYPE_LABELS = {
-    "component": "Component",
-    "document": "Document",
-    "known_bug": "Known Bug",
-    "sql_template": "SQL Template",
-    "historical_investigation": "Historical Investigation",
-    "playbook": "Playbook",
-    "product": "Product",
-    "technology": "Technology",
-    "version": "Version",
-}
-OBJECT_TYPES = list(_TYPE_LABELS.keys())
+from components.object_types import OBJECT_TYPES, TYPE_LABELS as _TYPE_LABELS
 
 
 def render_object_picker(*, key: str, label: str = "Object", default_type: str | None = None) -> tuple[str, str, str] | None:

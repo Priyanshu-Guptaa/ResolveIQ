@@ -62,6 +62,9 @@ class ComponentProfileRepository(Protocol):
     def count(self) -> int:
         ...
 
+    def delete(self, component_id: str) -> None:
+        ...
+
 
 class SqlAlchemyComponentProfileRepository:
     """SQLite-backed implementation."""
@@ -85,6 +88,7 @@ class SqlAlchemyComponentProfileRepository:
             model.created_by = profile.created_by
             model.updated_by = profile.updated_by
             model.is_active = profile.is_active
+            model.status = profile.status.value
             session.commit()
             logger.debug("Saved component profile %s (%s)", profile.id, profile.name)
 
@@ -109,6 +113,16 @@ class SqlAlchemyComponentProfileRepository:
         with self._session_factory() as session:
             return session.query(ComponentProfileModel).count()
 
+    def delete(self, component_id: str) -> None:
+        """Hard delete -- Sprint 3, Phase 3.4's Knowledge Object
+        Framework only calls this after confirming (via Impact
+        Analysis) that nothing depends on this component."""
+        with self._session_factory() as session:
+            model = session.get(ComponentProfileModel, component_id)
+            if model is not None:
+                session.delete(model)
+                session.commit()
+
 
 def _to_domain(model: ComponentProfileModel) -> ComponentProfile:
     kwargs = {field: getattr(model, field) for field in _LIST_FIELDS}
@@ -122,5 +136,6 @@ def _to_domain(model: ComponentProfileModel) -> ComponentProfile:
         created_by=model.created_by,
         updated_by=model.updated_by,
         is_active=model.is_active,
+        status=model.status,
         **kwargs,
     )

@@ -34,6 +34,9 @@ class SqlTemplateRepository(Protocol):
     def count(self) -> int:
         ...
 
+    def delete(self, template_id: str) -> None:
+        ...
+
 
 class SqlAlchemySqlTemplateRepository:
     def __init__(self, session_factory: sessionmaker[OrmSession]) -> None:
@@ -55,6 +58,7 @@ class SqlAlchemySqlTemplateRepository:
             model.created_by = template.created_by
             model.updated_by = template.updated_by
             model.is_active = template.is_active
+            model.status = template.status.value
             session.commit()
 
             session.execute(
@@ -97,6 +101,14 @@ class SqlAlchemySqlTemplateRepository:
         with self._session_factory() as session:
             return session.query(SqlTemplateModel).count()
 
+    def delete(self, template_id: str) -> None:
+        with self._session_factory() as session:
+            model = session.get(SqlTemplateModel, template_id)
+            if model is not None:
+                session.execute(sql_template_components.delete().where(sql_template_components.c.sql_template_id == template_id))
+                session.delete(model)
+                session.commit()
+
     def _links(self, session: OrmSession, template_ids: list[str]) -> dict[str, list[str]]:
         if not template_ids:
             return {}
@@ -126,4 +138,5 @@ def _to_domain(model: SqlTemplateModel, related_components: list[str]) -> QueryT
         created_by=model.created_by,
         updated_by=model.updated_by,
         is_active=model.is_active,
+        status=model.status,
     )

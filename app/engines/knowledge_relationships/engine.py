@@ -33,6 +33,7 @@ from app.domain.knowledge_relationships import (
 )
 from app.domain.lookup_entities import Product, Technology, Version
 from app.domain.playbook import Playbook
+from app.engines.knowledge_object_framework.adapters import build_adapters
 
 if TYPE_CHECKING:
     from app.infrastructure.db.component_repository import ComponentProfileRepository
@@ -90,46 +91,21 @@ class KnowledgeRelationshipEngine:
         self._sql = sql_repo
         self._playbooks = playbook_repo
         self._lookups = lookup_repo
+        # Phase 3.4: the per-type if/elif dispatch this engine used to
+        # own directly is now the shared adapter registry -- see
+        # app/engines/knowledge_object_framework/adapters.py's module
+        # docstring. Behavior-preserving: same inputs/outputs as before,
+        # this engine's own Phase 3.3 tests are unchanged by the move.
+        self._adapters = build_adapters(component_repo, knowledge_repo, sql_repo, playbook_repo, lookup_repo)
 
-    # --- Object resolution (dispatch to each type's own repository) --------
+    # --- Object resolution (dispatch via the shared adapter registry) ------
 
     def get_object(self, object_type: KnowledgeObjectType, object_id: str) -> KnowledgeObjectRef | None:
-        if object_type == KnowledgeObjectType.COMPONENT:
-            obj = self._components.get(object_id)
-            return KnowledgeObjectRef(type=object_type, id=obj.id, title=obj.name, subtitle=obj.product) if obj else None
-        if object_type == KnowledgeObjectType.DOCUMENT:
-            obj = self._knowledge.get_documentation(object_id)
-            return (
-                KnowledgeObjectRef(type=object_type, id=obj.id, title=obj.title, subtitle=_status_value(obj.status))
-                if obj
-                else None
-            )
-        if object_type == KnowledgeObjectType.KNOWN_BUG:
-            obj = self._knowledge.get_known_bug(object_id)
-            return KnowledgeObjectRef(type=object_type, id=obj.id, title=obj.title, subtitle=obj.status) if obj else None
-        if object_type == KnowledgeObjectType.HISTORICAL_INVESTIGATION:
-            obj = self._knowledge.get_historical_investigation(object_id)
-            return KnowledgeObjectRef(type=object_type, id=obj.id, title=obj.title, subtitle=obj.domain) if obj else None
-        if object_type == KnowledgeObjectType.SQL_TEMPLATE:
-            obj = self._sql.get(object_id)
-            return KnowledgeObjectRef(type=object_type, id=obj.id, title=obj.title, subtitle=obj.category) if obj else None
-        if object_type == KnowledgeObjectType.PLAYBOOK:
-            obj = self._playbooks.get(object_id)
-            return (
-                KnowledgeObjectRef(type=object_type, id=obj.id, title=obj.title, subtitle=obj.product or "")
-                if obj
-                else None
-            )
-        if object_type == KnowledgeObjectType.PRODUCT:
-            obj = self._lookups.get_product(object_id)
-            return KnowledgeObjectRef(type=object_type, id=obj.id, title=obj.name) if obj else None
-        if object_type == KnowledgeObjectType.TECHNOLOGY:
-            obj = self._lookups.get_technology(object_id)
-            return KnowledgeObjectRef(type=object_type, id=obj.id, title=obj.name) if obj else None
-        if object_type == KnowledgeObjectType.VERSION:
-            obj = self._lookups.get_version(object_id)
-            return KnowledgeObjectRef(type=object_type, id=obj.id, title=obj.name) if obj else None
-        return None
+        adapter = self._adapters.get(object_type)
+        if adapter is None:
+            return None
+        obj = adapter.get(object_id)
+        return adapter.to_ref(obj) if obj is not None else None
 
     def _resolve_or_placeholder(self, object_type: KnowledgeObjectType, object_id: str) -> KnowledgeObjectRef:
         """Never silently drops a broken link -- a relationship whose
@@ -146,46 +122,10 @@ class KnowledgeRelationshipEngine:
         Python-side filtering (see search_objects) is simpler and
         sufficient, the same reasoning already applied to Chroma's
         list_recent()."""
-        if object_type == KnowledgeObjectType.COMPONENT:
-            return [
-                KnowledgeObjectRef(type=object_type, id=c.id, title=c.name, subtitle=c.product)
-                for c in self._components.list_all()
-            ]
-        if object_type == KnowledgeObjectType.DOCUMENT:
-            page = self._knowledge.list_documentation_summaries(page_size=1000)
-            return [
-                KnowledgeObjectRef(type=object_type, id=d.id, title=d.title, subtitle=_status_value(d.status))
-                for d in page.items
-            ]
-        if object_type == KnowledgeObjectType.KNOWN_BUG:
-            return [
-                KnowledgeObjectRef(type=object_type, id=b.id, title=b.title, subtitle=b.status)
-                for b in self._knowledge.list_known_bugs()
-            ]
-        if object_type == KnowledgeObjectType.HISTORICAL_INVESTIGATION:
-            return [
-                KnowledgeObjectRef(type=object_type, id=h.id, title=h.title, subtitle=h.domain)
-                for h in self._knowledge.list_historical_investigations()
-            ]
-        if object_type == KnowledgeObjectType.SQL_TEMPLATE:
-            return [
-                KnowledgeObjectRef(type=object_type, id=t.id, title=t.title, subtitle=t.category)
-                for t in self._sql.list_all()
-            ]
-        if object_type == KnowledgeObjectType.PLAYBOOK:
-            return [
-                KnowledgeObjectRef(type=object_type, id=p.id, title=p.title, subtitle=p.product or "")
-                for p in self._playbooks.list_all()
-            ]
-        if object_type == KnowledgeObjectType.PRODUCT:
-            return [KnowledgeObjectRef(type=object_type, id=p.id, title=p.name) for p in self._lookups.list_products()]
-        if object_type == KnowledgeObjectType.TECHNOLOGY:
-            return [
-                KnowledgeObjectRef(type=object_type, id=t.id, title=t.name) for t in self._lookups.list_technologies()
-            ]
-        if object_type == KnowledgeObjectType.VERSION:
-            return [KnowledgeObjectRef(type=object_type, id=v.id, title=v.name) for v in self._lookups.list_versions()]
-        return []
+        adapter = self._adapters.get(object_type)
+        if adapter is None:
+            return []
+        return [adapter.to_ref(obj) for obj in adapter.list_all()]
 
     def search_objects(
         self, query: str, *, object_type: KnowledgeObjectType | None = None, limit: int = 50
@@ -331,7 +271,11 @@ class KnowledgeRelationshipEngine:
             component_name = center.title
             for bug in self._knowledge.list_known_bugs():
                 if component_name in bug.related_components:
-                    _add(KnowledgeObjectRef(type=KnowledgeObjectType.KNOWN_BUG, id=bug.id, title=bug.title, subtitle=bug.status))
+                    _add(
+                        KnowledgeObjectRef(
+                            type=KnowledgeObjectType.KNOWN_BUG, id=bug.id, title=bug.title, subtitle=bug.bug_status
+                        )
+                    )
             for template in self._sql.list_all():
                 if component_name in template.related_components:
                     _add(

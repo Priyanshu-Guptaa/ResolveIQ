@@ -61,6 +61,9 @@ class KnowledgeRepository(Protocol):
     def count_known_bugs(self) -> int:
         ...
 
+    def delete_known_bug(self, bug_id: str) -> None:
+        ...
+
     def save_historical_investigation(self, record: HistoricalInvestigationRecord) -> None:
         ...
 
@@ -71,6 +74,9 @@ class KnowledgeRepository(Protocol):
         ...
 
     def count_historical_investigations(self) -> int:
+        ...
+
+    def delete_historical_investigation(self, record_id: str) -> None:
         ...
 
     def save_documentation(self, record: DocumentationRecord) -> None:
@@ -109,6 +115,9 @@ class KnowledgeRepository(Protocol):
     def count_documentation(self) -> int:
         ...
 
+    def delete_documentation(self, document_id: str) -> None:
+        ...
+
 
 class SqlAlchemyKnowledgeRepository:
     def __init__(self, session_factory: sessionmaker[OrmSession]) -> None:
@@ -124,7 +133,7 @@ class SqlAlchemyKnowledgeRepository:
                 session.add(model)
             model.title = record.title
             model.description = record.description
-            model.status = record.status
+            model.bug_status = record.bug_status
             model.affected_components = record.affected_components
             model.workaround = record.workaround
             model.created_at = record.created_at
@@ -132,6 +141,7 @@ class SqlAlchemyKnowledgeRepository:
             model.created_by = record.created_by
             model.updated_by = record.updated_by
             model.is_active = record.is_active
+            model.lifecycle_status = record.status.value
             session.commit()
 
             self._set_component_links(session, known_bug_components, "known_bug_id", record.id, record.related_components)
@@ -158,6 +168,14 @@ class SqlAlchemyKnowledgeRepository:
         with self._session_factory() as session:
             return session.query(KnownBugModel).count()
 
+    def delete_known_bug(self, bug_id: str) -> None:
+        with self._session_factory() as session:
+            model = session.get(KnownBugModel, bug_id)
+            if model is not None:
+                session.execute(known_bug_components.delete().where(known_bug_components.c.known_bug_id == bug_id))
+                session.delete(model)
+                session.commit()
+
     # --- Historical investigations ------------------------------------------
 
     def save_historical_investigation(self, record: HistoricalInvestigationRecord) -> None:
@@ -178,6 +196,7 @@ class SqlAlchemyKnowledgeRepository:
             model.created_by = record.created_by
             model.updated_by = record.updated_by
             model.is_active = record.is_active
+            model.status = record.status.value
             session.commit()
 
             self._set_component_links(
@@ -213,6 +232,18 @@ class SqlAlchemyKnowledgeRepository:
     def count_historical_investigations(self) -> int:
         with self._session_factory() as session:
             return session.query(HistoricalInvestigationModel).count()
+
+    def delete_historical_investigation(self, record_id: str) -> None:
+        with self._session_factory() as session:
+            model = session.get(HistoricalInvestigationModel, record_id)
+            if model is not None:
+                session.execute(
+                    historical_investigation_components.delete().where(
+                        historical_investigation_components.c.historical_investigation_id == record_id
+                    )
+                )
+                session.delete(model)
+                session.commit()
 
     # --- Documentation (Sprint 3, Phase 3.2 -- Knowledge Management) -------
 
@@ -363,6 +394,19 @@ class SqlAlchemyKnowledgeRepository:
         with self._session_factory() as session:
             return session.query(DocumentationModel).count()
 
+    def delete_documentation(self, document_id: str) -> None:
+        """Removes the database row only -- the Knowledge Object
+        Framework service unindexes it from ChromaDB first (this
+        repository has no knowledge of the search index) and leaves the
+        uploaded original file on disk (harmless orphan, not cleaned up
+        this phase -- see the Phase 3.4 report's technical debt)."""
+        with self._session_factory() as session:
+            model = session.get(DocumentationModel, document_id)
+            if model is not None:
+                session.execute(documentation_components.delete().where(documentation_components.c.documentation_id == document_id))
+                session.delete(model)
+                session.commit()
+
     # --- Shared association-table helpers -----------------------------------
 
     def _set_component_links(self, session: OrmSession, table, owner_column: str, owner_id: str, component_names: list[str]) -> None:
@@ -413,7 +457,7 @@ def _known_bug_to_domain(model: KnownBugModel, related_components: list[str]) ->
         id=model.id,
         title=model.title,
         description=model.description,
-        status=model.status,
+        bug_status=model.bug_status,
         affected_components=model.affected_components,
         workaround=model.workaround,
         related_components=related_components,
@@ -422,6 +466,7 @@ def _known_bug_to_domain(model: KnownBugModel, related_components: list[str]) ->
         created_by=model.created_by,
         updated_by=model.updated_by,
         is_active=model.is_active,
+        status=model.lifecycle_status,
     )
 
 
@@ -443,6 +488,7 @@ def _historical_investigation_to_domain(
         created_by=model.created_by,
         updated_by=model.updated_by,
         is_active=model.is_active,
+        status=model.status,
     )
 
 

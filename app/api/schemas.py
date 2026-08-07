@@ -9,6 +9,8 @@ are different concerns from day one.
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from app.domain.investigation import ActivityItem, DashboardStats
@@ -86,6 +88,19 @@ class CreateVersionRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     product_id: str | None = None
     created_by: str | None = None
+
+
+class KnowledgeObjectWriteRequest(BaseModel):
+    """Knowledge Object Framework (Sprint 3, Phase 3.4) -- ``fields``
+    is intentionally an open bag of keys rather than a per-type schema:
+    ``KnowledgeObjectService.create``/``edit_metadata`` hand it straight
+    to the target type's own Pydantic model, which is what actually
+    validates it. Keeping request validation generic here is what lets
+    one router endpoint serve all nine object types without knowing
+    any of their individual shapes."""
+
+    fields: dict[str, Any] = Field(default_factory=dict)
+    actor: str | None = None
 
 
 class InvestigationSummary(BaseModel):

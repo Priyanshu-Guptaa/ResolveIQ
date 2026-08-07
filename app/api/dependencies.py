@@ -23,6 +23,8 @@ from app.engines.knowledge.embedding_provider import EmbeddingProvider, Sentence
 from app.engines.knowledge.engine import KnowledgeEngine
 from app.engines.knowledge.knowledge_store import ChromaKnowledgeStore, KnowledgeStore
 from app.engines.knowledge_management.engine import KnowledgeManagementEngine
+from app.engines.knowledge_object_framework.adapters import KnowledgeObjectAdapter, build_adapters
+from app.engines.knowledge_object_framework.service import KnowledgeObjectService
 from app.engines.knowledge_relationships.engine import KnowledgeRelationshipEngine
 from app.engines.log_intelligence.engine import LogIntelligenceEngine
 from app.engines.log_intelligence.entity_extractor import EntityExtractor, RegexEntityExtractor
@@ -40,6 +42,8 @@ from app.infrastructure.db.repository import InvestigationRepository, SqlAlchemy
 from app.infrastructure.db.seed_migration import migrate_all
 from app.infrastructure.db.session import get_session_factory
 from app.infrastructure.db.sql_template_repository import SqlAlchemySqlTemplateRepository, SqlTemplateRepository
+from app.infrastructure.db.version_repository import SqlAlchemyVersionRepository, VersionRepository
+from app.domain.knowledge_relationships import KnowledgeObjectType
 
 
 @lru_cache
@@ -136,6 +140,36 @@ def _knowledge_relationship_engine() -> KnowledgeRelationshipEngine:
 
 
 @lru_cache
+def _version_repository() -> VersionRepository:
+    return SqlAlchemyVersionRepository(_db_session_factory())
+
+
+@lru_cache
+def _knowledge_object_adapters() -> dict[KnowledgeObjectType, KnowledgeObjectAdapter]:
+    """One shared adapter registry (Sprint 3, Phase 3.4) -- built once
+    and reused by both ``KnowledgeRelationshipEngine`` (Phase 3.3) and
+    ``KnowledgeObjectService`` (this phase), so the id->repository
+    dispatch exists exactly once in the whole app."""
+    return build_adapters(
+        _component_profile_repository(),
+        _knowledge_repository(),
+        _sql_template_repository(),
+        _playbook_repository(),
+        _lookup_repository(),
+    )
+
+
+@lru_cache
+def _knowledge_object_service() -> KnowledgeObjectService:
+    return KnowledgeObjectService(
+        _knowledge_object_adapters(),
+        _knowledge_relationship_engine(),
+        _version_repository(),
+        _knowledge_engine_singleton(),
+    )
+
+
+@lru_cache
 def _entity_extractor() -> EntityExtractor:
     return RegexEntityExtractor()
 
@@ -205,6 +239,10 @@ def get_knowledge_relationship_engine() -> KnowledgeRelationshipEngine:
     return _knowledge_relationship_engine()
 
 
+def get_knowledge_object_service() -> KnowledgeObjectService:
+    return _knowledge_object_service()
+
+
 def run_knowledge_foundation_migration() -> dict[str, int]:
     """Idempotent JSON/constant -> governed-table migration (Sprint 3,
     Phase 3.1, extended in Phase 3.3 with Product/Technology lookup
@@ -248,5 +286,8 @@ def reset_singletons() -> None:
         _lookup_repository,
         _relationship_repository,
         _knowledge_relationship_engine,
+        _version_repository,
+        _knowledge_object_adapters,
+        _knowledge_object_service,
     ):
         fn.cache_clear()

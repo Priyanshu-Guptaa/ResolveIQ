@@ -30,6 +30,9 @@ class PlaybookRepository(Protocol):
     def count(self) -> int:
         ...
 
+    def delete(self, playbook_id: str) -> None:
+        ...
+
 
 class SqlAlchemyPlaybookRepository:
     def __init__(self, session_factory: sessionmaker[OrmSession]) -> None:
@@ -50,6 +53,7 @@ class SqlAlchemyPlaybookRepository:
             model.created_by = playbook.created_by
             model.updated_by = playbook.updated_by
             model.is_active = playbook.is_active
+            model.status = playbook.status.value
             session.commit()
             logger.debug("Saved playbook %s", playbook.id)
 
@@ -69,6 +73,13 @@ class SqlAlchemyPlaybookRepository:
         with self._session_factory() as session:
             return session.query(PlaybookModel).count()
 
+    def delete(self, playbook_id: str) -> None:
+        with self._session_factory() as session:
+            model = session.get(PlaybookModel, playbook_id)
+            if model is not None:
+                session.delete(model)
+                session.commit()
+
 
 def _to_domain(model: PlaybookModel) -> Playbook:
     return Playbook(
@@ -82,4 +93,5 @@ def _to_domain(model: PlaybookModel) -> Playbook:
         created_by=model.created_by,
         updated_by=model.updated_by,
         is_active=model.is_active,
+        status=model.status,
     )

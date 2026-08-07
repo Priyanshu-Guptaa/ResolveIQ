@@ -38,6 +38,7 @@ navigation = st.navigation(
         "Administer": [
             st.Page("views/9_Knowledge_Management.py", title="Knowledge Management", icon="🗂️"),
             st.Page("views/10_Relationship_Manager.py", title="Relationship Manager", icon="🕸️"),
+            st.Page("views/11_Knowledge_Objects.py", title="Knowledge Objects", icon="🗃️"),
         ],
     }
 )

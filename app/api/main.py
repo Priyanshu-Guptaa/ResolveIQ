@@ -23,6 +23,7 @@ from app.api.routers import (
     sql_studio,
 )
 from app.api.routers.admin import knowledge_management as admin_knowledge_management
+from app.api.routers.admin import knowledge_objects as admin_knowledge_objects
 from app.api.routers.admin import knowledge_relationships as admin_knowledge_relationships
 from app.config import get_settings
 from app.logging_config import configure_logging
@@ -64,3 +65,4 @@ app.include_router(sql_studio.router)
 app.include_router(product_intelligence.router)
 app.include_router(admin_knowledge_management.router)
 app.include_router(admin_knowledge_relationships.router)
+app.include_router(admin_knowledge_objects.router)
