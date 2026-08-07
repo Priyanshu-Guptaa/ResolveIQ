@@ -30,6 +30,11 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_MAX_CONTEXT_CHARS = 50_000
+"""Cap for InvestigationSession.context_text -- see that property's
+docstring."""
+
+
 class InvestigationSession(BaseModel):
     """A single investigation an engineer is working, and everything known
     about it so far.
@@ -78,13 +83,36 @@ class InvestigationSession(BaseModel):
 
     @property
     def context_text(self) -> str:
-        """Flattened text representation of the whole investigation so far,
-        used as the query for semantic search against historical knowledge.
+        """Flattened text representation of the whole investigation so
+        far, used as the query for semantic search against historical
+        knowledge.
+
+        Capped at ``_MAX_CONTEXT_CHARS`` -- found necessary on a real
+        investigation whose evidence (97 items, several multi-MB log
+        files) produced a 40MB context_text, which made embedding it
+        (the sentence-transformer model must tokenize the whole string
+        before its own ~256-token window truncates it anyway) slow
+        enough to reliably time out the Recommendation Engine's client.
+        The model's effective window is a few hundred tokens (roughly
+        1-2KB of text) -- 50,000 characters is already generous
+        headroom, not a tight squeeze. Evidence contributes in creation
+        order (title, then oldest evidence first) and the cap is
+        enforced while accumulating, not by slicing an already-built
+        40MB string -- so a still-relevant early piece of context (the
+        original task description, say) is never crowded out by
+        whichever evidence happened to be uploaded last, and the huge
+        string is never actually built in memory in the first place.
         """
         parts: list[str] = [self.title]
+        remaining = _MAX_CONTEXT_CHARS - len(self.title)
         for item in self.evidence:
-            if item.raw_content:
-                parts.append(item.raw_content)
+            if remaining <= 0:
+                break
+            if not item.raw_content:
+                continue
+            chunk = item.raw_content[:remaining]
+            parts.append(chunk)
+            remaining -= len(chunk)
         return "\n".join(parts)
 
     def add_evidence(self, evidence: Evidence) -> None:
