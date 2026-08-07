@@ -45,16 +45,21 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.domain.enums import DocumentStatus
 from app.domain.evidence import DocumentationRecord, HistoricalInvestigationRecord, KnownBugRecord
+from app.domain.lookup_entities import Product, Technology
 from app.domain.product_intelligence import ComponentProfile
 from app.domain.sql_studio import QUERY_LIBRARY, QueryTemplate
 from app.infrastructure.db.component_repository import ComponentProfileRepository
 from app.infrastructure.db.knowledge_repository import KnowledgeRepository
 from app.infrastructure.db.sql_template_repository import SqlTemplateRepository
+
+if TYPE_CHECKING:
+    from app.infrastructure.db.lookup_repository import LookupRepository
 
 logger = logging.getLogger(__name__)
 
@@ -233,11 +238,55 @@ def migrate_sql_templates(sql_repo: SqlTemplateRepository, component_repo: Compo
     return imported
 
 
+def migrate_lookup_entities(
+    lookup_repo: LookupRepository,
+    component_repo: ComponentProfileRepository,
+    knowledge_repo: KnowledgeRepository,
+) -> int:
+    """Sprint 3, Phase 3.3: seeds Product/Technology from the distinct
+    values already sitting in existing free-text columns (component
+    profiles' ``product``, documents' ``product``/``technology``), so
+    the Relationship Editor's picker starts with a real vocabulary
+    instead of an empty one. Idempotent per *name*, not per table --
+    re-running only creates rows for names that don't exist yet, so it
+    never fights an administrator who's already curated these lists
+    (Product/Technology Management is a later Administration module;
+    this migration only bootstraps a starting point)."""
+    existing_products = {p.name for p in lookup_repo.list_products(active_only=False)}
+    existing_technologies = {t.name for t in lookup_repo.list_technologies(active_only=False)}
+
+    candidate_products: set[str] = set()
+    candidate_technologies: set[str] = set()
+
+    for component in component_repo.list_all(active_only=False):
+        if component.product:
+            candidate_products.add(component.product)
+    for document in knowledge_repo.list_all_documentation(active_only=False):
+        if document.product:
+            candidate_products.add(document.product)
+        if document.technology:
+            candidate_technologies.add(document.technology)
+
+    created = 0
+    for name in sorted(candidate_products - existing_products):
+        lookup_repo.save_product(Product(id=str(uuid.uuid4()), name=name, created_by=_MIGRATION_ACTOR, updated_by=_MIGRATION_ACTOR))
+        created += 1
+    for name in sorted(candidate_technologies - existing_technologies):
+        lookup_repo.save_technology(
+            Technology(id=str(uuid.uuid4()), name=name, created_by=_MIGRATION_ACTOR, updated_by=_MIGRATION_ACTOR)
+        )
+        created += 1
+
+    logger.info("Seeded %d product/technology lookup row(s) from existing data", created)
+    return created
+
+
 def migrate_all(
     *,
     component_repo: ComponentProfileRepository,
     knowledge_repo: KnowledgeRepository,
     sql_repo: SqlTemplateRepository,
+    lookup_repo: "LookupRepository | None" = None,
     sample_knowledge_dir: Path,
 ) -> dict[str, int]:
     """Runs every migration in dependency order (components first --
@@ -245,7 +294,9 @@ def migrate_all(
     rows actually imported/changed this call -- 0 for any table that was
     already fully populated, except ``documentation`` which reports a
     per-row content backfill count (see ``migrate_documentation``).
-    Safe to call on every startup."""
+    Safe to call on every startup. ``lookup_repo`` is optional so
+    existing callers/tests that don't need Phase 3.3's Product/
+    Technology seeding keep working unchanged."""
     report = {
         "component_profiles": migrate_component_profiles(component_repo, sample_knowledge_dir),
     }
@@ -255,5 +306,7 @@ def migrate_all(
     )
     report["documentation"] = migrate_documentation(knowledge_repo, component_repo, sample_knowledge_dir)
     report["sql_templates"] = migrate_sql_templates(sql_repo, component_repo)
+    if lookup_repo is not None:
+        report["lookup_entities"] = migrate_lookup_entities(lookup_repo, component_repo, knowledge_repo)
     logger.info("Knowledge foundation migration complete: %s", report)
     return report

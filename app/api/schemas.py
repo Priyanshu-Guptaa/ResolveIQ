@@ -12,6 +12,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from app.domain.investigation import ActivityItem, DashboardStats
+from app.domain.knowledge_relationships import KnowledgeObjectType, RelationshipType
 from app.domain.recommendation import KnowledgeMatch
 from app.domain.sql_studio import QueryTemplate
 
@@ -50,6 +51,41 @@ class UpdateDocumentMetadataRequest(BaseModel):
     version: str | None = None
     technology: str | None = None
     related_components: list[str] | None = None
+
+
+class CreateRelationshipRequest(BaseModel):
+    """Knowledge Relationship Manager (Sprint 3, Phase 3.3) -- both ends
+    are always a real (type, id) pair from a searchable picker, never
+    free text; the engine independently re-verifies both actually exist
+    before writing the edge."""
+
+    from_type: KnowledgeObjectType
+    from_id: str
+    to_type: KnowledgeObjectType
+    to_id: str
+    relationship_type: RelationshipType = RelationshipType.RELATED_TO
+    created_by: str | None = None
+
+
+class CreatePlaybookRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+    product: str | None = None
+    description: str = ""
+    steps: list[str] = Field(default_factory=list)
+    created_by: str | None = None
+
+
+class CreateLookupEntityRequest(BaseModel):
+    """Shared by Product and Technology -- both are just a name."""
+
+    name: str = Field(min_length=1, max_length=200)
+    created_by: str | None = None
+
+
+class CreateVersionRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    product_id: str | None = None
+    created_by: str | None = None
 
 
 class InvestigationSummary(BaseModel):

@@ -65,6 +65,22 @@ def api_patch(path: str, json_body: dict | None = None) -> dict | list | None:
         return None
 
 
+def api_delete(path: str) -> bool:
+    """Returns True on success -- most DELETE endpoints (e.g. removing a
+    relationship, Sprint 3 Phase 3.3) return 204 with no body, so there's
+    nothing to hand back the way api_get/api_post/api_patch do."""
+    try:
+        response = requests.delete(f"{API_BASE_URL}{path}", timeout=30)
+        response.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        detail = ""
+        if getattr(exc, "response", None) is not None:
+            detail = f" -- {exc.response.text}"
+        st.error(f"API request failed: DELETE {path} -- {exc}{detail}")
+        return False
+
+
 def api_available() -> bool:
     """Cheap liveness check -- pages use this to show one clear banner
     instead of a wall of individual request errors when the API is down."""

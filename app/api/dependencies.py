@@ -23,6 +23,7 @@ from app.engines.knowledge.embedding_provider import EmbeddingProvider, Sentence
 from app.engines.knowledge.engine import KnowledgeEngine
 from app.engines.knowledge.knowledge_store import ChromaKnowledgeStore, KnowledgeStore
 from app.engines.knowledge_management.engine import KnowledgeManagementEngine
+from app.engines.knowledge_relationships.engine import KnowledgeRelationshipEngine
 from app.engines.log_intelligence.engine import LogIntelligenceEngine
 from app.engines.log_intelligence.entity_extractor import EntityExtractor, RegexEntityExtractor
 from app.engines.log_intelligence.log_parser import GenericLogParser, LogParser
@@ -32,6 +33,9 @@ from app.engines.recommendation.engine import RecommendationEngine
 from app.engines.sql_library.engine import SqlLibraryEngine
 from app.infrastructure.db.component_repository import ComponentProfileRepository, SqlAlchemyComponentProfileRepository
 from app.infrastructure.db.knowledge_repository import KnowledgeRepository, SqlAlchemyKnowledgeRepository
+from app.infrastructure.db.lookup_repository import LookupRepository, SqlAlchemyLookupRepository
+from app.infrastructure.db.playbook_repository import PlaybookRepository, SqlAlchemyPlaybookRepository
+from app.infrastructure.db.relationship_repository import RelationshipRepository, SqlAlchemyRelationshipRepository
 from app.infrastructure.db.repository import InvestigationRepository, SqlAlchemyInvestigationRepository
 from app.infrastructure.db.seed_migration import migrate_all
 from app.infrastructure.db.session import get_session_factory
@@ -101,6 +105,36 @@ def _knowledge_management_engine() -> KnowledgeManagementEngine:
     )
 
 
+# --- Knowledge Relationship Manager (Sprint 3, Phase 3.3) -------------------
+
+
+@lru_cache
+def _playbook_repository() -> PlaybookRepository:
+    return SqlAlchemyPlaybookRepository(_db_session_factory())
+
+
+@lru_cache
+def _lookup_repository() -> LookupRepository:
+    return SqlAlchemyLookupRepository(_db_session_factory())
+
+
+@lru_cache
+def _relationship_repository() -> RelationshipRepository:
+    return SqlAlchemyRelationshipRepository(_db_session_factory())
+
+
+@lru_cache
+def _knowledge_relationship_engine() -> KnowledgeRelationshipEngine:
+    return KnowledgeRelationshipEngine(
+        _relationship_repository(),
+        _component_profile_repository(),
+        _knowledge_repository(),
+        _sql_template_repository(),
+        _playbook_repository(),
+        _lookup_repository(),
+    )
+
+
 @lru_cache
 def _entity_extractor() -> EntityExtractor:
     return RegexEntityExtractor()
@@ -167,9 +201,14 @@ def get_knowledge_management_engine() -> KnowledgeManagementEngine:
     return _knowledge_management_engine()
 
 
+def get_knowledge_relationship_engine() -> KnowledgeRelationshipEngine:
+    return _knowledge_relationship_engine()
+
+
 def run_knowledge_foundation_migration() -> dict[str, int]:
     """Idempotent JSON/constant -> governed-table migration (Sprint 3,
-    Phase 3.1). Called once from the FastAPI lifespan, before Chroma
+    Phase 3.1, extended in Phase 3.3 with Product/Technology lookup
+    seeding). Called once from the FastAPI lifespan, before Chroma
     seeding -- see ``app/api/main.py``. Safe to call on every startup;
     re-running never duplicates rows (see ``seed_migration.migrate_all``).
     """
@@ -178,6 +217,7 @@ def run_knowledge_foundation_migration() -> dict[str, int]:
         component_repo=_component_profile_repository(),
         knowledge_repo=_knowledge_repository(),
         sql_repo=_sql_template_repository(),
+        lookup_repo=_lookup_repository(),
         sample_knowledge_dir=settings.sample_knowledge_dir,
     )
 
@@ -204,5 +244,9 @@ def reset_singletons() -> None:
         _sql_template_repository,
         _sql_library_engine,
         _knowledge_management_engine,
+        _playbook_repository,
+        _lookup_repository,
+        _relationship_repository,
+        _knowledge_relationship_engine,
     ):
         fn.cache_clear()

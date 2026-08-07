@@ -259,3 +259,105 @@ class DocumentationModel(Base):
     created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+# =============================================================================
+# Knowledge Relationship Manager (Sprint 3, Phase 3.3).
+#
+# PlaybookModel/ProductModel/TechnologyModel/VersionModel give three
+# previously-free-text-only concepts (and one previously-embedded-only
+# concept, Playbook) real identity, so they can be nodes in the
+# relationship graph below. KnowledgeRelationshipModel is one generic
+# edge table -- the generalization of Phase 3.1's four hardcoded
+# "X -> Component" association tables (still present above, untouched)
+# to "any of nine types -> any of nine types," since a hand-written
+# table per pair would multiply combinatorially. See
+# app/domain/knowledge_relationships.py's module docstring for the full
+# reasoning.
+# =============================================================================
+
+
+class PlaybookModel(Base):
+    __tablename__ = "playbooks"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    title: Mapped[str] = mapped_column(String(500))
+    product: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    description: Mapped[str] = mapped_column(Text, default="")
+    steps: Mapped[list] = mapped_column(JSON, default=list)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class ProductModel(Base):
+    __tablename__ = "products"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class TechnologyModel(Base):
+    __tablename__ = "technologies"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class VersionModel(Base):
+    __tablename__ = "versions"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    product_id: Mapped[str | None] = mapped_column(ForeignKey("products.id"), nullable=True, default=None)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+    __table_args__ = (Index("ix_versions_product_id", "product_id"),)
+
+
+class KnowledgeRelationshipModel(Base):
+    """One row = one edge. ``from_type``/``to_type`` hold a
+    ``KnowledgeObjectType`` value (plain string, not a DB-level FK --
+    the referenced id can live in any of nine different tables, which a
+    real foreign key can't span). Existence of both ends is enforced in
+    the engine at write time (``KnowledgeRelationshipEngine.
+    add_relationship`` -- "no orphan relationships"), and re-checked by
+    ``validate_relationships`` as an integrity report, the same
+    application-level-not-DB-level-constraint approach already used for
+    ComponentProfile's self-referential related_components (Phase 3.1)."""
+
+    __tablename__ = "knowledge_relationships"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    from_type: Mapped[str] = mapped_column(String(30))
+    from_id: Mapped[str] = mapped_column(String(100))
+    to_type: Mapped[str] = mapped_column(String(30))
+    to_id: Mapped[str] = mapped_column(String(100))
+    relationship_type: Mapped[str] = mapped_column(String(30), default="related_to")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+
+    __table_args__ = (
+        Index("ix_knowledge_relationships_from", "from_type", "from_id"),
+        Index("ix_knowledge_relationships_to", "to_type", "to_id"),
+    )
