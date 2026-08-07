@@ -9,6 +9,33 @@
       "Dispatches validated commands to the mesh network via collectors"
     ],
     "related_components": ["CommandPayloadProcessorHost", "MsgProcCmdRspHost", "Scheduler"],
+    "dependencies": ["Scheduler", "MeterDeviceRegistry"],
+    "consumes": ["Scheduler.CommandQueue (queued commands)", "MeterDeviceRegistry.DCW (device configuration data)"],
+    "produces": ["CommandPayloadProcessorHost.PayloadRequest", "CommandLog (row per submitted command)"],
+    "related_services": ["MeterDeviceRegistry", "Collector Gateway Service"],
+    "related_queues": ["cmd.scheduler.outbound", "cmd.processor.inbound"],
+    "database_tables": ["CommandLog", "MeterDeviceRegistry"],
+    "configuration": ["CommandProcessorHost.MaxConcurrentCommands", "CommandProcessorHost.DcwValidationMode"],
+    "events": ["CommandValidated", "CommandRejected"],
+    "message_flows": [
+      "Scheduler -> CommandProcessorHost: submits a queued command for validation",
+      "CommandProcessorHost -> MeterDeviceRegistry: looks up the meter's current DCW",
+      "CommandProcessorHost -> CommandPayloadProcessorHost: forwards the validated command for payload build"
+    ],
+    "data_flows": [
+      "MeterDeviceRegistry.DCW -> CommandProcessorHost (read, per command validated)",
+      "CommandProcessorHost -> CommandLog (write, one row per submitted command)"
+    ],
+    "version_differences": [
+      {
+        "version": "9.1",
+        "change": "DCW validation happened inside CommandPayloadProcessorHost, after payload encoding had already started"
+      },
+      {
+        "version": "9.2",
+        "change": "DCW validation moved upstream into CommandProcessorHost, before payload build -- a stale DCW now rejects the command earlier instead of producing a bad payload"
+      }
+    ],
     "typical_failures": [
       "Firmware/DCW mismatch after upgrade without GEI",
       "Command payload built against a stale DCW version",
@@ -22,7 +49,8 @@
       "Verify firmware/DCW version",
       "Check GEI sent after firmware upgrade",
       "Compare GLP payload against expected DCW"
-    ]
+    ],
+    "historical_investigations": []
   },
   {
     "id": "command-payload-processor-host",
@@ -33,6 +61,28 @@
       "Encodes command parameters according to the meter's DCW"
     ],
     "related_components": ["CommandProcessorHost", "MsgProcCmdRspHost"],
+    "dependencies": ["CommandProcessorHost"],
+    "consumes": ["CommandProcessorHost.PayloadRequest"],
+    "produces": ["Collector Gateway Service.OutboundPayload", "CommandPayload (row per built payload)"],
+    "related_services": ["Collector Gateway Service"],
+    "related_queues": ["cmd.payload.inbound", "cmd.payload.outbound"],
+    "database_tables": ["CommandPayload"],
+    "configuration": ["CommandPayloadProcessorHost.EncodingProfile"],
+    "events": ["PayloadBuilt", "PayloadEncodingFailed"],
+    "message_flows": [
+      "CommandProcessorHost -> CommandPayloadProcessorHost: sends the validated command to encode",
+      "CommandPayloadProcessorHost -> Collector Gateway Service: dispatches the encoded binary payload toward the mesh"
+    ],
+    "data_flows": [
+      "CommandProcessorHost -> CommandPayloadProcessorHost (read, validated command + DCW reference)",
+      "CommandPayloadProcessorHost -> CommandPayload (write, one row per built payload)"
+    ],
+    "version_differences": [
+      {
+        "version": "9.2",
+        "change": "No longer re-validates DCW itself -- trusts CommandProcessorHost's upstream validation and encodes directly"
+      }
+    ],
     "typical_failures": [
       "Payload encoding mismatch when DCW version is stale",
       "Unsupported command type for the meter's firmware"
@@ -41,7 +91,8 @@
     "common_sql": ["SELECT * FROM CommandPayload WHERE CommandLogId = :command_log_id"],
     "known_bugs": [],
     "documentation_links": ["Playbook: GLP/DCW mismatch triage"],
-    "playbooks": ["Review CommandPayloadProcessorHost log for encoding errors"]
+    "playbooks": ["Review CommandPayloadProcessorHost log for encoding errors"],
+    "historical_investigations": []
   },
   {
     "id": "msg-proc-cmd-rsp-host",
@@ -53,6 +104,24 @@
       "Flags mismatched or unexpected response types"
     ],
     "related_components": ["CommandProcessorHost", "Scheduler"],
+    "dependencies": ["Collector Gateway Service"],
+    "consumes": ["Collector Gateway Service.InboundResponse"],
+    "produces": ["CommandResponse (row per correlated response)", "Scheduler.CommandCompleted"],
+    "related_services": ["Collector Gateway Service"],
+    "related_queues": ["cmd.response.inbound"],
+    "database_tables": ["CommandResponse", "CommandLog"],
+    "configuration": ["MsgProcCmdRspHost.ResponseTimeoutSeconds"],
+    "events": ["ResponseCorrelated", "ResponseMismatch", "ResponseTimeout"],
+    "message_flows": [
+      "Collector Gateway Service -> MsgProcCmdRspHost: forwards a meter's raw response",
+      "MsgProcCmdRspHost -> CommandLog: correlates the response back to the originating CommandLogId",
+      "MsgProcCmdRspHost -> Scheduler: reports command completion or failure"
+    ],
+    "data_flows": [
+      "Collector Gateway Service -> MsgProcCmdRspHost (read, raw meter response)",
+      "MsgProcCmdRspHost -> CommandResponse (write, one row per parsed response)"
+    ],
+    "version_differences": [],
     "typical_failures": [
       "Response type mismatch (e.g. a Ping response returned instead of GLP)",
       "Response timeout not correlated back to the command log",
@@ -65,7 +134,8 @@
     "playbooks": [
       "Compare expected vs actual response type",
       "Review CommandLogId correlation across CommandProcessorHost and MsgProcCmdRspHost"
-    ]
+    ],
+    "historical_investigations": []
   },
   {
     "id": "scheduler",
@@ -77,6 +147,23 @@
       "Retries failed commands per policy"
     ],
     "related_components": ["CommandProcessorHost", "GapRecon"],
+    "dependencies": ["CommandProcessorHost"],
+    "consumes": ["ScheduledJob (due jobs)", "MsgProcCmdRspHost.CommandCompleted"],
+    "produces": ["CommandProcessorHost.CommandQueue"],
+    "related_services": [],
+    "related_queues": ["cmd.scheduler.outbound"],
+    "database_tables": ["ScheduledJob"],
+    "configuration": ["Scheduler.MaxRetryAttempts", "Scheduler.RetryBackoffSeconds"],
+    "events": ["JobScheduled", "JobRetried", "JobFailed"],
+    "message_flows": [
+      "Scheduler -> CommandProcessorHost: submits due commands from the schedule",
+      "MsgProcCmdRspHost -> Scheduler: reports completion so retries/follow-on jobs can be evaluated"
+    ],
+    "data_flows": [
+      "ScheduledJob -> Scheduler (read, polled on each scheduling cycle)",
+      "Scheduler -> ScheduledJob (write, status/retry-count updates)"
+    ],
+    "version_differences": [],
     "typical_failures": [
       "Job backlog due to downstream CommandProcessorHost slowdown",
       "Retry storm after a mass timeout event",
@@ -89,7 +176,8 @@
     "playbooks": [
       "Check for job backlog in the Scheduler queue",
       "Verify the retry policy hasn't triggered a retry storm"
-    ]
+    ],
+    "historical_investigations": []
   },
   {
     "id": "gap-recon",
@@ -101,6 +189,23 @@
       "Reports unresolved gaps for engineer review"
     ],
     "related_components": ["Scheduler", "NMS"],
+    "dependencies": ["Scheduler"],
+    "consumes": ["Meter interval-read data (via NMS/collector feed)"],
+    "produces": ["Scheduler.BackfillCommand"],
+    "related_services": ["NMS"],
+    "related_queues": [],
+    "database_tables": ["DataGap"],
+    "configuration": ["GapRecon.GapThresholdIntervals"],
+    "events": ["GapDetected", "GapResolved", "GapEscalated"],
+    "message_flows": [
+      "GapRecon -> Scheduler: requests a backfill command for a detected gap",
+      "NMS -> GapRecon: signals when a collector/segment comes back online, triggering re-check of open gaps"
+    ],
+    "data_flows": [
+      "Meter interval-read data -> GapRecon (read, gap detection sweep)",
+      "GapRecon -> DataGap (write, one row per detected gap)"
+    ],
+    "version_differences": [],
     "typical_failures": [
       "Gap detection false positives after a collector outage",
       "Backfill commands not submitted due to Scheduler backlog",
@@ -113,6 +218,9 @@
     "playbooks": [
       "Check the DataGap table for unresolved gaps",
       "Confirm backfill commands were submitted to the Scheduler"
+    ],
+    "historical_investigations": [
+      "Meter communication timeout for a batch of endpoints on collector COLL-14 -- relevant when gap volume correlates with an NMS alarm on the same collector/segment"
     ]
   },
   {
@@ -125,6 +233,23 @@
       "Raises alarms for network-level failures (collector down, mesh segment unreachable)"
     ],
     "related_components": ["GapRecon", "Collectors"],
+    "dependencies": [],
+    "consumes": ["Collector health telemetry", "Mesh router status feed"],
+    "produces": ["NetworkAlarm", "GapRecon.CollectorStatusSignal"],
+    "related_services": ["Collectors"],
+    "related_queues": [],
+    "database_tables": ["NetworkAlarm"],
+    "configuration": ["NMS.PollingIntervalSeconds", "NMS.AlarmSuppressionWindow"],
+    "events": ["AlarmRaised", "AlarmCleared"],
+    "message_flows": [
+      "Collectors -> NMS: report connectivity and RF signal telemetry",
+      "NMS -> GapRecon: signals collector/segment recovery so open gaps can be re-evaluated"
+    ],
+    "data_flows": [
+      "Collector health telemetry -> NMS (read, continuous polling)",
+      "NMS -> NetworkAlarm (write, one row per raised/cleared alarm)"
+    ],
+    "version_differences": [],
     "typical_failures": [
       "False alarms during firmware rollout windows",
       "Alarm storm after a mesh router firmware regression",
@@ -137,6 +262,9 @@
     "playbooks": [
       "Check NMS for active alarms on the affected collector/segment",
       "Confirm mesh router firmware version"
+    ],
+    "historical_investigations": [
+      "Meter communication timeout for a batch of endpoints on collector COLL-14 -- mesh router firmware regression caused NMS alarms plus downstream GapRecon gap growth"
     ]
   }
 ]

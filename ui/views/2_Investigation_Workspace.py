@@ -264,7 +264,7 @@ with right:
         else:
             for m in recommendation["similar_investigations"][:5]:
                 st.markdown(f"**{m['title'][:40]}** _({m['score']:.0%})_")
-            st.caption("Detailed match reasoning (component/firmware/version) arrives with Product Intelligence -- Phase 2B.")
+            st.caption("Detailed match reasoning (component/firmware/version) arrives with Recommendation Engine V2 -- Phase 2C.")
 
     with st.expander("🧩 Product Intelligence", expanded=False):
         components = get_component_profiles_cached() or []
@@ -272,10 +272,25 @@ with right:
             st.caption("No component profiles loaded.")
         else:
             names = [c["name"] for c in components]
-            selected_name = st.selectbox("Component", names, key=f"pi_component_{investigation_id}")
+            component_key = f"pi_component_{investigation_id}"
+            # A related-component click sets this *pending* key instead of
+            # component_key directly -- Streamlit forbids writing to a
+            # widget's session_state key after that widget has already
+            # been instantiated in the same run, and by the time we know
+            # what was clicked (inside render_component_profile, below)
+            # the selectbox has already been created. Applying the
+            # pending value here, before the selectbox exists, and then
+            # clearing it, is the standard workaround.
+            pending_key = f"pi_component_pending_{investigation_id}"
+            if pending_key in st.session_state:
+                st.session_state[component_key] = st.session_state.pop(pending_key)
+            selected_name = st.selectbox("Component", names, key=component_key)
             selected_profile = next(c for c in components if c["name"] == selected_name)
-            render_component_profile(selected_profile)
-            st.caption("Version differences and automatic evidence matching arrive with Recommendation Engine V2 -- Phase 2C.")
+            navigate_to = render_component_profile(selected_profile, known_component_names=set(names))
+            if navigate_to and navigate_to != selected_name:
+                st.session_state[pending_key] = navigate_to
+                st.rerun()
+            st.caption("Automatic evidence-to-component matching arrives with Recommendation Engine V2 -- Phase 2C.")
 
     with st.expander("🐞 Known Bugs", expanded=False):
         if not recommendation or not recommendation["known_bugs"]:
