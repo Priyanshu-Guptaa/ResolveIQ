@@ -29,13 +29,24 @@ from app.domain.entities import ExtractedEntity
 from app.domain.enums import EntityType, EvidenceType
 from app.domain.investigation import InvestigationSession
 from app.domain.knowledge_relationships import KnowledgeObjectType, RelationshipType
-from app.domain.recommendation import KnowledgeMatch, Recommendation, RecommendedLogCollectionItem, RootCauseHypothesis
+from app.domain.recommendation import (
+    InvestigationStage,
+    InvestigationStrategy,
+    KnowledgeMatch,
+    MatchedComponent,
+    Recommendation,
+    RecommendedLogCollectionItem,
+    RequiredEvidenceItem,
+    RootCauseHypothesis,
+    SuggestedSqlItem,
+)
 from app.engines.knowledge.engine import KnowledgeEngine
 
 if TYPE_CHECKING:
     from app.domain.evidence import Evidence
     from app.domain.log_intelligence_kb import LogCollectionScenario, LogSourceApplication
     from app.engines.knowledge_relationships.engine import KnowledgeRelationshipEngine
+    from app.engines.sql_library.engine import SqlLibraryEngine
     from app.infrastructure.db.component_repository import ComponentProfileRepository
     from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository
 
@@ -240,12 +251,14 @@ class RecommendationEngine:
         log_knowledge_repo: "LogKnowledgeRepository | None" = None,
         component_repo: "ComponentProfileRepository | None" = None,
         relationship_engine: "KnowledgeRelationshipEngine | None" = None,
+        sql_library: "SqlLibraryEngine | None" = None,
     ) -> None:
         self._knowledge = knowledge_engine
         self._settings = settings
         self._log_knowledge = log_knowledge_repo
         self._components = component_repo
         self._relationships = relationship_engine
+        self._sql_library = sql_library
 
     def generate(self, investigation: InvestigationSession) -> Recommendation:
         query_text = investigation.context_text
@@ -263,6 +276,20 @@ class RecommendationEngine:
 
         root_causes = self._build_root_causes(similar_investigations, entities)
         overall_confidence = root_causes[0].confidence if root_causes else 0.0
+        recommended_logs = self._recommend_logs(investigation)
+        next_action, next_action_rationale = self._next_action(investigation, similar_investigations, entities)
+
+        strategy = self._build_strategy(
+            investigation=investigation,
+            entities=entities,
+            root_causes=root_causes,
+            similar_investigations=similar_investigations,
+            known_bugs=known_bugs,
+            relevant_docs=relevant_docs,
+            recommended_logs=recommended_logs,
+            next_action=next_action,
+            next_action_rationale=next_action_rationale,
+        )
 
         return Recommendation(
             investigation_id=investigation.id,
@@ -272,9 +299,10 @@ class RecommendationEngine:
             relevant_documentation=relevant_docs,
             known_bugs=known_bugs,
             suggested_logs=self._suggest_logs(investigation, entities),
-            recommended_logs=self._recommend_logs(investigation),
+            recommended_logs=recommended_logs,
             suggested_sql=self._suggest_sql(entities),
-            next_best_step=self._next_best_step(investigation, similar_investigations, entities),
+            next_best_step=next_action,
+            strategy=strategy,
         )
 
     # --- Root causes -----------------------------------------------------
@@ -323,42 +351,58 @@ class RecommendationEngine:
 
     # --- Next best step ----------------------------------------------------
 
-    def _next_best_step(
+    def _next_action(
         self,
         investigation: InvestigationSession,
         similar_investigations: list[KnowledgeMatch],
         entities: list[ExtractedEntity],
-    ) -> str:
+    ) -> tuple[str, str]:
+        """Returns (action, rationale). ``action`` is unchanged from the
+        pre-Strategy behavior and is what populates the legacy
+        ``next_best_step`` field verbatim; ``rationale`` is new --
+        surfaced only in ``InvestigationStrategy.next_action_rationale``
+        -- a one-line "why this action" explanation for whichever branch
+        produced it, built from the same signal, never re-derived
+        independently (that would risk the two drifting apart)."""
         has_logs = any(e.evidence_type.value == "log_file" for e in investigation.evidence)
 
         if not investigation.evidence:
-            return "Paste the task description (or upload logs) to begin analysis."
+            return (
+                "Paste the task description (or upload logs) to begin analysis.",
+                "No evidence has been added to this investigation yet.",
+            )
 
         if not has_logs:
             return (
                 "No logs uploaded yet. Upload application/system logs from around the time of "
                 "the issue -- entity correlation (thread IDs, correlation IDs, exceptions) "
-                "significantly improves recommendation confidence."
+                "significantly improves recommendation confidence.",
+                "A task description is present, but no log file evidence has been uploaded yet.",
             )
 
         if similar_investigations and similar_investigations[0].score >= self._settings.min_similarity_for_root_cause:
             top = similar_investigations[0]
+            rationale = f"Based on historical investigation '{top.title}' ({top.score:.0%} similarity)."
             next_step = top.metadata.get("next_step")
             if next_step:
-                return _snippet(next_step)
+                return _snippet(next_step), rationale
             resolution = top.metadata.get("resolution")
             if resolution:
-                return f"Based on similar past investigation '{top.title}', try: {_snippet(resolution)}"
+                return f"Based on similar past investigation '{top.title}', try: {_snippet(resolution)}", rationale
 
         entity_by_type = {e.entity_type: e for e in entities}
         for heuristic in _ENTITY_HEURISTICS:
             entity = entity_by_type.get(heuristic.entity_type)
             if entity is not None and heuristic.next_step_template:
-                return heuristic.next_step_template.format(value=entity.value)
+                return (
+                    heuristic.next_step_template.format(value=entity.value),
+                    f"Investigation evidence contains a {heuristic.entity_type.value} ('{entity.value}').",
+                )
 
         return (
             "No strong historical match or recognizable entity pattern yet. Add more specific "
-            "evidence (exact error messages, IDs, timestamps) or broaden the log upload window."
+            "evidence (exact error messages, IDs, timestamps) or broaden the log upload window.",
+            "Neither a confident historical match nor a recognizable entity pattern has been found yet.",
         )
 
     # --- Suggestions -----------------------------------------------------
@@ -489,3 +533,222 @@ class RecommendationEngine:
             if entity is not None and heuristic.suggested_sql:
                 suggestions.append(heuristic.suggested_sql.format(value=entity.value))
         return suggestions
+
+    # --- Investigation Strategy (Recommendation Engine V2) -----------------
+    #
+    # Everything below orchestrates the fields already computed above
+    # (root_causes, similar_investigations, known_bugs, relevant_docs,
+    # recommended_logs, next_action) into one explainable, ordered plan.
+    # The only genuinely new matching logic is component matching
+    # (_match_component) -- it reuses the exact same deterministic
+    # keyword-matching helper Log Intelligence already uses. Nothing
+    # here calls an LLM or introduces embeddings beyond what
+    # KnowledgeEngine already provides for the three semantic-search
+    # fields.
+
+    def _build_strategy(
+        self,
+        *,
+        investigation: InvestigationSession,
+        entities: list[ExtractedEntity],
+        root_causes: list[RootCauseHypothesis],
+        similar_investigations: list[KnowledgeMatch],
+        known_bugs: list[KnowledgeMatch],
+        relevant_docs: list[KnowledgeMatch],
+        recommended_logs: list[RecommendedLogCollectionItem],
+        next_action: str,
+        next_action_rationale: str,
+    ) -> InvestigationStrategy:
+        matched_component = self._match_component(investigation, entities)
+        required_evidence = self._required_evidence(investigation, recommended_logs, entities)
+        missing_evidence = [item for item in required_evidence if not item.satisfied]
+        stage, stage_rationale = self._current_stage(investigation, missing_evidence, root_causes)
+        progress, progress_summary = self._progress(stage, required_evidence, missing_evidence)
+
+        return InvestigationStrategy(
+            current_stage=stage,
+            stage_rationale=stage_rationale,
+            progress=progress,
+            progress_summary=progress_summary,
+            recommended_next_action=next_action,
+            next_action_rationale=next_action_rationale,
+            required_evidence=required_evidence,
+            missing_evidence=missing_evidence,
+            ordered_log_collection=recommended_logs,
+            suggested_sql=self._suggested_sql_items(matched_component, entities),
+            matched_component=matched_component,
+            historical_investigations=similar_investigations,
+            known_bugs=known_bugs,
+            documentation=relevant_docs,
+            decision_checkpoint=self._decision_checkpoint(root_causes),
+        )
+
+    def _match_component(
+        self, investigation: InvestigationSession, entities: list[ExtractedEntity]
+    ) -> MatchedComponent | None:
+        """Deterministic name/keyword matching against the *complete*
+        live Component Registry -- the same word-boundary matching
+        Log Intelligence already uses for technology/scenario_type, now
+        applied to component names. An extracted SERVICE_NAME/HOST_NAME
+        entity that exactly equals a component's name is the strongest
+        possible signal (1.0, real extracted data, not a guess); a
+        keyword match against the investigation's own text is the
+        fallback. Ties keep the first-encountered (registry order)
+        component, consistent with every other tie-break in this file."""
+        if self._components is None:
+            return None
+        components = self._components.list_all()
+        if not components:
+            return None
+        context = investigation.context_text
+        entity_values = {
+            e.value.strip().lower()
+            for e in entities
+            if e.entity_type in (EntityType.SERVICE_NAME, EntityType.HOST_NAME)
+        }
+
+        best: MatchedComponent | None = None
+        for component in components:
+            name = component.name.strip()
+            if not name:
+                continue
+            if name.lower() in entity_values:
+                score = _FULL_MATCH_SCORE
+                reason = (
+                    f'Matched because an extracted service/host name in the investigation\'s evidence '
+                    f'exactly equals the component "{component.name}".'
+                )
+            else:
+                score = _keyword_match_score(name, context)
+                if score >= _FULL_MATCH_SCORE:
+                    reason = f'Matched because the investigation text mentions "{component.name}" by name.'
+                elif score > 0:
+                    reason = f'Weakly matched: the investigation text mentions a keyword related to "{component.name}".'
+                else:
+                    continue
+            if best is None or score > best.confidence:
+                best = MatchedComponent(
+                    component_id=component.id, component_name=component.name, confidence=score, match_reason=reason
+                )
+        return best
+
+    def _required_evidence(
+        self,
+        investigation: InvestigationSession,
+        recommended_logs: list[RecommendedLogCollectionItem],
+        entities: list[ExtractedEntity],
+    ) -> list[RequiredEvidenceItem]:
+        """Deduplicated at the component level (not per-file) from the
+        ordered log collection -- a checklist view. Full detail
+        (repository path, filenames, explanation) stays exclusively in
+        ``ordered_log_collection``; this only points back to it via
+        ``related_log_source_id`` so nothing is copied twice."""
+        items: list[RequiredEvidenceItem] = []
+        seen_components: set[str] = set()
+        for log_item in recommended_logs:
+            if log_item.component_name in seen_components:
+                continue
+            seen_components.add(log_item.component_name)
+            items.append(
+                RequiredEvidenceItem(
+                    description=f"{log_item.component_name} logs ({log_item.scenario_technology} / {log_item.scenario_type})",
+                    satisfied=log_item.already_collected,
+                    source="log_intelligence",
+                    related_log_source_id=log_item.log_source_id,
+                )
+            )
+
+        has_logs = any(e.evidence_type == EvidenceType.LOG_FILE for e in investigation.evidence)
+        for suggestion in self._suggest_logs(investigation, entities):
+            items.append(RequiredEvidenceItem(description=suggestion, satisfied=has_logs, source="entity_heuristic"))
+        return items
+
+    def _current_stage(
+        self,
+        investigation: InvestigationSession,
+        missing_evidence: list[RequiredEvidenceItem],
+        root_causes: list[RootCauseHypothesis],
+    ) -> tuple[InvestigationStage, str]:
+        if not investigation.evidence:
+            return InvestigationStage.TRIAGE, "No evidence has been added to this investigation yet."
+        if missing_evidence:
+            return (
+                InvestigationStage.EVIDENCE_COLLECTION,
+                f"{len(missing_evidence)} required evidence item(s) still need to be collected.",
+            )
+        if root_causes and root_causes[0].confidence >= self._settings.min_similarity_for_root_cause:
+            return (
+                InvestigationStage.ROOT_CAUSE_IDENTIFIED,
+                f"A candidate root cause matched at {root_causes[0].confidence:.0%} confidence.",
+            )
+        return (
+            InvestigationStage.ANALYSIS,
+            "Required evidence is in hand; no root cause has matched with enough confidence yet.",
+        )
+
+    def _progress(
+        self,
+        stage: InvestigationStage,
+        required_evidence: list[RequiredEvidenceItem],
+        missing_evidence: list[RequiredEvidenceItem],
+    ) -> tuple[float, str]:
+        if stage == InvestigationStage.TRIAGE:
+            return 0.0, "Investigation just started -- no evidence yet."
+        if stage == InvestigationStage.ROOT_CAUSE_IDENTIFIED:
+            return 1.0, "A root cause has been matched -- confirm it to close out the investigation."
+        if stage == InvestigationStage.EVIDENCE_COLLECTION:
+            collected = len(required_evidence) - len(missing_evidence)
+            ratio = collected / len(required_evidence) if required_evidence else 0.0
+            # Evidence collection is the first half of the journey to a
+            # root cause; reaching ANALYSIS (all required evidence in
+            # hand) is itself worth crossing the halfway point below.
+            return ratio * 0.5, f"{collected} of {len(required_evidence)} required evidence item(s) collected."
+        return 0.5, "All currently-known required evidence has been collected; analyzing for a root-cause match."
+
+    def _suggested_sql_items(
+        self, matched_component: MatchedComponent | None, entities: list[ExtractedEntity]
+    ) -> list[SuggestedSqlItem]:
+        """Real, governed SQL Library ``QueryTemplate`` records take
+        priority -- matched via ``related_components``, a field that
+        already exists and is already populated by migration, no new
+        matching logic invented. Falls back to the existing
+        entity-heuristic snippets only when no component matched or no
+        template links to it, so a suggestion is still available for
+        the (also pre-existing) fallback path."""
+        items: list[SuggestedSqlItem] = []
+        if matched_component is not None and self._sql_library is not None:
+            for template in self._sql_library.list_templates():
+                if matched_component.component_name in template.related_components:
+                    items.append(
+                        SuggestedSqlItem(
+                            title=template.title,
+                            sql_text=template.sql_text,
+                            explanation=template.explanation,
+                            source="sql_library",
+                            template_id=template.id,
+                        )
+                    )
+        if items:
+            return items
+        return [
+            SuggestedSqlItem(title="Suggested query", sql_text=sql_text, source="entity_heuristic")
+            for sql_text in self._suggest_sql(entities)
+        ]
+
+    @staticmethod
+    def _decision_checkpoint(root_causes: list[RootCauseHypothesis]) -> str | None:
+        """The specific thing to verify next -- built entirely from how
+        many root-cause candidates exist; never a generic prompt."""
+        if len(root_causes) >= 2:
+            a, b = root_causes[0], root_causes[1]
+            return (
+                f'Two plausible causes match this investigation: "{a.description[:80]}" ({a.confidence:.0%}) '
+                f'vs "{b.description[:80]}" ({b.confidence:.0%}). Use the recommended logs/SQL above to '
+                f"determine which one applies."
+            )
+        if len(root_causes) == 1:
+            return (
+                f'Confirm "{root_causes[0].description[:80]}" using the recommended logs/SQL above before '
+                f"considering this investigation resolved."
+            )
+        return None

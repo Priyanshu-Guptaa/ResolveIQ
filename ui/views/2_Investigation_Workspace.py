@@ -47,7 +47,8 @@ from api_client import (
 )
 from components.component_profile import render_component_profile
 from components.investigation_picker import render_investigation_picker
-from components.recommended_log_collection import flatten_for_checklist, render_recommended_log_collection
+from components.investigation_strategy import render_investigation_strategy
+from components.recommended_log_collection import flatten_for_checklist
 from components.summary_card import render_details_editor, render_summary_card
 from context import get_active_investigation_id, set_active_investigation_id
 from theme import inject_theme
@@ -215,21 +216,19 @@ with center:
             st.rerun()
 
         if not recommendation:
-            st.info("Click Analyze to generate a recommendation from the evidence gathered so far.")
+            st.info("Click Analyze to generate an investigation strategy from the evidence gathered so far.")
         else:
-            st.markdown(f"### ➡️ Next best step\n{recommendation['next_best_step']}")
-            st.progress(
-                recommendation["overall_confidence"],
-                text=f"Overall confidence: {recommendation['overall_confidence']:.0%}",
-            )
-            if recommendation["root_causes"]:
-                st.markdown("#### Likely root causes")
-                for rc in recommendation["root_causes"]:
-                    st.markdown(f"- **{rc['description']}** _(confidence {rc['confidence']:.0%})_")
-                    st.caption(rc["rationale"])
-
-            navigate_to_component = render_recommended_log_collection(
-                recommendation.get("recommended_logs", []), investigation_id=investigation_id
+            # Investigation Strategy (Recommendation Engine V2) is the
+            # primary recommendation experience -- one guided,
+            # explainable hierarchy synthesized from every knowledge
+            # module, not independent panels. The legacy flat fields
+            # (root_causes, similar_investigations, known_bugs,
+            # suggested_sql, recommended_logs, ...) still exist on the
+            # API response for backward compatibility; the Strategy
+            # reuses them by reference rather than duplicating them, and
+            # this is now the only place the UI presents them.
+            navigate_to_component = render_investigation_strategy(
+                recommendation["strategy"], investigation_id=investigation_id
             )
             if navigate_to_component:
                 st.session_state[f"pi_component_pending_{investigation_id}"] = navigate_to_component
@@ -289,6 +288,14 @@ with center:
                 st.rerun()
 
 # === RIGHT: collapsible assist rail =========================================
+#
+# Historical Matches / Known Bugs / Suggested SQL / Related Documentation
+# used to live here as independent panels, duplicating exactly what the
+# Investigation Strategy (Recommendations tab, above) now presents in
+# context with the rest of the guided hierarchy. Removed rather than
+# kept alongside it -- per the approved design, the UI should guide
+# engineers through the Strategy, not present parallel recommendation
+# surfaces showing the same data twice.
 with right:
     st.markdown('<div class="riq-panel-title">Assist</div>', unsafe_allow_html=True)
 
@@ -300,57 +307,32 @@ with right:
         if st.button("Open full AI Assistant →", key="open_ai_assistant"):
             st.switch_page("views/7_AI_Assistant.py")
 
-    with st.expander("📊 Historical Matches", expanded=True):
-        if not recommendation or not recommendation["similar_investigations"]:
-            st.caption("Run Analyze to see similar past investigations.")
-        else:
-            for m in recommendation["similar_investigations"][:5]:
-                st.markdown(f"**{m['title'][:40]}** _({m['score']:.0%})_")
-            st.caption("Detailed match reasoning (component/firmware/version) arrives with Recommendation Engine V2 -- Phase 2C.")
-
-    with st.expander("🧩 Product Intelligence", expanded=False):
+    with st.expander("🧩 Product Intelligence", expanded=bool(recommendation and recommendation["strategy"]["matched_component"])):
         components = get_component_profiles_cached() or []
         if not components:
             st.caption("No component profiles loaded.")
         else:
             names = [c["name"] for c in components]
             component_key = f"pi_component_{investigation_id}"
-            # A related-component click sets this *pending* key instead of
-            # component_key directly -- Streamlit forbids writing to a
-            # widget's session_state key after that widget has already
-            # been instantiated in the same run, and by the time we know
-            # what was clicked (inside render_component_profile, below)
-            # the selectbox has already been created. Applying the
+            # A related-component click (here or from the Strategy's own
+            # "View in Product Intelligence" action) sets this *pending*
+            # key instead of component_key directly -- Streamlit forbids
+            # writing to a widget's session_state key after that widget
+            # has already been instantiated in the same run. Applying the
             # pending value here, before the selectbox exists, and then
             # clearing it, is the standard workaround.
             pending_key = f"pi_component_pending_{investigation_id}"
             if pending_key in st.session_state:
                 st.session_state[component_key] = st.session_state.pop(pending_key)
+            elif component_key not in st.session_state and recommendation and recommendation["strategy"]["matched_component"]:
+                # First render after Analyze: default straight to the
+                # Strategy's own matched component instead of whichever
+                # name sorts first, so this panel already agrees with
+                # the Strategy without an extra click.
+                st.session_state[component_key] = recommendation["strategy"]["matched_component"]["component_name"]
             selected_name = st.selectbox("Component", names, key=component_key)
             selected_profile = next(c for c in components if c["name"] == selected_name)
             navigate_to = render_component_profile(selected_profile, known_component_names=set(names))
             if navigate_to and navigate_to != selected_name:
                 st.session_state[pending_key] = navigate_to
                 st.rerun()
-            st.caption("Automatic evidence-to-component matching arrives with Recommendation Engine V2 -- Phase 2C.")
-
-    with st.expander("🐞 Known Bugs", expanded=False):
-        if not recommendation or not recommendation["known_bugs"]:
-            st.caption("Run Analyze to check for known bugs.")
-        else:
-            for b in recommendation["known_bugs"][:5]:
-                st.markdown(f"**{b['title'][:40]}**")
-
-    with st.expander("🗄 Suggested SQL", expanded=False):
-        if not recommendation or not recommendation["suggested_sql"]:
-            st.caption("Run Analyze to see suggested queries.")
-        else:
-            for sql in recommendation["suggested_sql"]:
-                st.code(sql, language="sql")
-
-    with st.expander("📚 Related Documentation", expanded=False):
-        if not recommendation or not recommendation["relevant_documentation"]:
-            st.caption("Run Analyze to see related documentation.")
-        else:
-            for d in recommendation["relevant_documentation"][:5]:
-                st.markdown(f"**{d['title'][:40]}**")

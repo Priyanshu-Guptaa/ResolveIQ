@@ -516,3 +516,292 @@ def test_linked_component_none_when_no_relationship_engine_provided():
     recommendation = engine.generate(investigation)
 
     assert recommendation.recommended_logs[0].linked_component_id is None
+
+
+# --- Investigation Strategy (Recommendation Engine V2) ----------------------
+
+
+class FakeComponentRepo:
+    def __init__(self, components: list) -> None:
+        self._components = components
+
+    def list_all(self, *, active_only: bool = True):
+        return self._components
+
+
+class FakeSqlLibrary:
+    def __init__(self, templates: list) -> None:
+        self._templates = templates
+
+    def list_templates(self):
+        return self._templates
+
+
+def _make_component(id_, name, product="Command Center"):
+    from app.domain.product_intelligence import ComponentProfile
+
+    return ComponentProfile(id=id_, name=name, product=product)
+
+
+def _make_query_template(id_, title, related_components, sql_text="SELECT 1;", explanation="test"):
+    from app.domain.sql_studio import QueryTemplate
+
+    return QueryTemplate(
+        id=id_, title=title, category="test", sql_text=sql_text, explanation=explanation,
+        related_components=related_components,
+    )
+
+
+def test_strategy_is_always_populated_even_for_empty_investigation():
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    recommendation = engine.generate(InvestigationSession(title="Empty investigation"))
+
+    assert recommendation.strategy is not None
+    assert recommendation.strategy.current_stage.value == "triage"
+    assert recommendation.strategy.progress == 0.0
+
+
+def test_strategy_stage_is_evidence_collection_when_logs_missing():
+    from app.domain.log_intelligence_kb import LogCollectionScenario, LogCollectionStep, LogRepositoryLocation, LogSourceApplication
+
+    scenario = LogCollectionScenario(
+        id="sc-1", product="Command Center", technology="RF Mesh", scenario_type="General",
+        steps=[LogCollectionStep(log_source_id="src-a", component_name="A", priority=1, explanation="x")],
+        source_wiki_page="Test",
+    )
+    source = LogSourceApplication(
+        id="src-a", name="A", location=LogRepositoryLocation(platform="linux", root_path="/var/log", filename_patterns=["a.log"]),
+        product="Command Center",
+    )
+    log_repo = FakeLogKnowledgeRepo([scenario], [source])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_evidence("RF Mesh issue here")
+    recommendation = engine.generate(investigation)
+
+    assert recommendation.strategy.current_stage.value == "evidence_collection"
+    assert len(recommendation.strategy.missing_evidence) >= 1
+    assert 0.0 <= recommendation.strategy.progress < 0.5
+
+
+def test_strategy_stage_is_root_cause_identified_on_strong_historical_match():
+    match = KnowledgeMatch(
+        collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS, record_id="hist-1", title="Past issue", snippet="...",
+        score=0.9, metadata={"root_cause": "Known firmware bug."},
+    )
+    store = FakeKnowledgeStore({KnowledgeCollection.HISTORICAL_INVESTIGATIONS: [match]})
+    engine = RecommendationEngine(KnowledgeEngine(store), Settings())
+
+    investigation = _investigation_with_evidence("Something broke")
+    recommendation = engine.generate(investigation)
+
+    assert recommendation.strategy.current_stage.value == "root_cause_identified"
+    assert recommendation.strategy.progress == 1.0
+
+
+def test_strategy_reuses_same_objects_as_legacy_fields_not_copies():
+    match = KnowledgeMatch(
+        collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS, record_id="hist-1", title="Past issue", snippet="...",
+        score=0.9, metadata={"root_cause": "Known firmware bug."},
+    )
+    store = FakeKnowledgeStore({KnowledgeCollection.HISTORICAL_INVESTIGATIONS: [match]})
+    engine = RecommendationEngine(KnowledgeEngine(store), Settings())
+
+    investigation = _investigation_with_evidence("Something broke")
+    recommendation = engine.generate(investigation)
+
+    # Pydantic wraps each list field in a fresh list on construction, but
+    # reuses already-valid sub-model instances without revalidating them --
+    # so item-level identity is the correct "not recomputed" check.
+    assert recommendation.strategy.historical_investigations[0] is recommendation.similar_investigations[0]
+    assert recommendation.strategy.recommended_next_action == recommendation.next_best_step
+
+
+def test_decision_checkpoint_none_with_no_root_cause_candidates():
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    investigation = _investigation_with_evidence("Nothing recognizable here")
+    recommendation = engine.generate(investigation)
+    assert recommendation.strategy.decision_checkpoint is None
+
+
+def test_decision_checkpoint_confirms_single_candidate():
+    match = KnowledgeMatch(
+        collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS, record_id="hist-1", title="Past issue", snippet="...",
+        score=0.9, metadata={"root_cause": "Known firmware bug."},
+    )
+    store = FakeKnowledgeStore({KnowledgeCollection.HISTORICAL_INVESTIGATIONS: [match]})
+    engine = RecommendationEngine(KnowledgeEngine(store), Settings())
+
+    investigation = _investigation_with_evidence("Something broke")
+    recommendation = engine.generate(investigation)
+
+    assert recommendation.strategy.decision_checkpoint is not None
+    assert "Confirm" in recommendation.strategy.decision_checkpoint
+
+
+def test_decision_checkpoint_distinguishes_two_candidates():
+    match1 = KnowledgeMatch(
+        collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS, record_id="hist-1", title="Issue A", snippet="...",
+        score=0.9, metadata={"root_cause": "Cause A."},
+    )
+    match2 = KnowledgeMatch(
+        collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS, record_id="hist-2", title="Issue B", snippet="...",
+        score=0.85, metadata={"root_cause": "Cause B."},
+    )
+    store = FakeKnowledgeStore({KnowledgeCollection.HISTORICAL_INVESTIGATIONS: [match1, match2]})
+    engine = RecommendationEngine(KnowledgeEngine(store), Settings())
+
+    investigation = _investigation_with_evidence("Something broke")
+    recommendation = engine.generate(investigation)
+
+    assert "Two plausible causes" in recommendation.strategy.decision_checkpoint
+    assert "Cause A" in recommendation.strategy.decision_checkpoint
+    assert "Cause B" in recommendation.strategy.decision_checkpoint
+
+
+# --- Component matching -------------------------------------------------
+
+
+def test_component_matched_by_exact_name_in_text():
+    components = [_make_component("comp-1", "CommandProcessorHost")]
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), component_repo=FakeComponentRepo(components)
+    )
+    investigation = _investigation_with_evidence("CommandProcessorHost is timing out on every request")
+    recommendation = engine.generate(investigation)
+
+    matched = recommendation.strategy.matched_component
+    assert matched is not None
+    assert matched.component_id == "comp-1"
+    assert matched.confidence == 1.0
+
+
+def test_component_matched_by_exact_entity_value():
+    components = [_make_component("comp-1", "order-service")]
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), component_repo=FakeComponentRepo(components)
+    )
+    # RegexEntityExtractor picks up "order-service" as a SERVICE_NAME entity from this text.
+    investigation = _investigation_with_evidence("Error in service=order-service during checkout")
+    recommendation = engine.generate(investigation)
+
+    matched = recommendation.strategy.matched_component
+    if matched is not None:
+        assert matched.component_name == "order-service"
+        assert matched.confidence == 1.0
+
+
+def test_no_component_match_when_nothing_relevant_mentioned():
+    components = [_make_component("comp-1", "CommandProcessorHost")]
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), component_repo=FakeComponentRepo(components)
+    )
+    investigation = _investigation_with_evidence("Totally unrelated text about weather")
+    recommendation = engine.generate(investigation)
+    assert recommendation.strategy.matched_component is None
+
+
+def test_no_component_match_when_no_component_repo_provided():
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    investigation = _investigation_with_evidence("CommandProcessorHost is broken")
+    recommendation = engine.generate(investigation)
+    assert recommendation.strategy.matched_component is None
+
+
+# --- SQL Library integration ----------------------------------------------
+
+
+def test_suggested_sql_prefers_component_linked_query_template():
+    components = [_make_component("comp-1", "CommandProcessorHost")]
+    templates = [
+        _make_query_template("qt-1", "Command log lookup", related_components=["CommandProcessorHost"]),
+        _make_query_template("qt-2", "Unrelated template", related_components=["SomeOtherComponent"]),
+    ]
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(),
+        component_repo=FakeComponentRepo(components), sql_library=FakeSqlLibrary(templates),
+    )
+    investigation = _investigation_with_evidence("CommandProcessorHost command is failing")
+    recommendation = engine.generate(investigation)
+
+    sql_items = recommendation.strategy.suggested_sql
+    assert len(sql_items) == 1
+    assert sql_items[0].source == "sql_library"
+    assert sql_items[0].template_id == "qt-1"
+
+
+def test_suggested_sql_falls_back_to_entity_heuristic_without_component_match():
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    investigation = _investigation_with_evidence("Blocking detected, spid=61 is head blocker")
+    recommendation = engine.generate(investigation)
+
+    sql_items = recommendation.strategy.suggested_sql
+    assert len(sql_items) >= 1
+    assert all(item.source == "entity_heuristic" for item in sql_items)
+
+
+def test_suggested_sql_empty_when_component_matches_but_no_template_linked():
+    components = [_make_component("comp-1", "CommandProcessorHost")]
+    templates = [_make_query_template("qt-1", "Unrelated", related_components=["SomeOtherComponent"])]
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(),
+        component_repo=FakeComponentRepo(components), sql_library=FakeSqlLibrary(templates),
+    )
+    investigation = _investigation_with_evidence("CommandProcessorHost issue, no other clues")
+    recommendation = engine.generate(investigation)
+
+    # No component-linked template and no entity-heuristic signal either.
+    assert recommendation.strategy.suggested_sql == []
+
+
+# --- Required / missing evidence --------------------------------------------
+
+
+def test_required_evidence_deduplicates_by_component_across_scenarios():
+    from app.domain.log_intelligence_kb import LogCollectionScenario, LogCollectionStep, LogRepositoryLocation, LogSourceApplication
+
+    scenario_a = LogCollectionScenario(
+        id="sc-1", product="Command Center", technology="RF Mesh", scenario_type="General",
+        steps=[LogCollectionStep(log_source_id="src-a", component_name="A", priority=1, explanation="x")],
+        source_wiki_page="Test",
+    )
+    scenario_b = LogCollectionScenario(
+        id="sc-2", product="Command Center", technology="RF Mesh IP", scenario_type="General",
+        steps=[LogCollectionStep(log_source_id="src-a", component_name="A", priority=1, explanation="y")],
+        source_wiki_page="Test",
+    )
+    source = LogSourceApplication(
+        id="src-a", name="A", location=LogRepositoryLocation(platform="linux", root_path="/var/log", filename_patterns=["a.log"]),
+        product="Command Center",
+    )
+    log_repo = FakeLogKnowledgeRepo([scenario_a, scenario_b], [source])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_evidence("RF Mesh issue")
+    recommendation = engine.generate(investigation)
+
+    component_a_items = [i for i in recommendation.strategy.required_evidence if i.description.startswith("A logs")]
+    assert len(component_a_items) == 1
+
+
+def test_missing_evidence_is_subset_of_required_evidence_where_unsatisfied():
+    from app.domain.log_intelligence_kb import LogCollectionScenario, LogCollectionStep, LogRepositoryLocation, LogSourceApplication
+
+    scenario = LogCollectionScenario(
+        id="sc-1", product="Command Center", technology="RF Mesh", scenario_type="General",
+        steps=[LogCollectionStep(log_source_id="src-a", component_name="A", priority=1, explanation="x")],
+        source_wiki_page="Test",
+    )
+    source = LogSourceApplication(
+        id="src-a", name="A", location=LogRepositoryLocation(platform="linux", root_path="/var/log", filename_patterns=["a.log"]),
+        product="Command Center",
+    )
+    log_repo = FakeLogKnowledgeRepo([scenario], [source])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_log_evidence("RF Mesh issue", log_filenames=["A_log.log"])
+    recommendation = engine.generate(investigation)
+
+    for item in recommendation.strategy.missing_evidence:
+        assert item.satisfied is False
+    assert all(item in recommendation.strategy.required_evidence for item in recommendation.strategy.missing_evidence)

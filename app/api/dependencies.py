@@ -246,6 +246,7 @@ def get_recommendation_engine() -> RecommendationEngine:
         _log_knowledge_repository(),
         _component_profile_repository(),
         _knowledge_relationship_engine(),
+        _sql_library_engine(),
     )
 
 
