@@ -47,6 +47,7 @@ from api_client import (
 )
 from components.component_profile import render_component_profile
 from components.investigation_picker import render_investigation_picker
+from components.recommended_log_collection import flatten_for_checklist, render_recommended_log_collection
 from components.summary_card import render_details_editor, render_summary_card
 from context import get_active_investigation_id, set_active_investigation_id
 from theme import inject_theme
@@ -227,6 +228,8 @@ with center:
                     st.markdown(f"- **{rc['description']}** _(confidence {rc['confidence']:.0%})_")
                     st.caption(rc["rationale"])
 
+            render_recommended_log_collection(recommendation.get("recommended_logs", []))
+
     with tab_playbook:
         st.caption(
             "Derived from the current recommendation's suggested logs/SQL -- a dedicated "
@@ -236,7 +239,12 @@ with center:
         if not recommendation:
             st.info("Run Analyze in the Recommendations tab first.")
         else:
-            steps = list(recommendation.get("suggested_logs", []))
+            recommended_logs = recommendation.get("recommended_logs", [])
+            # The structured Log Intelligence guidance supersedes the
+            # generic entity-based suggestions when a scenario matched;
+            # suggested_logs remains the fallback otherwise (Log
+            # Intelligence has no matching wiki-derived scenario yet).
+            steps = flatten_for_checklist(recommended_logs) if recommended_logs else list(recommendation.get("suggested_logs", []))
             steps += [f"Run: {sql.splitlines()[0][:60]}" for sql in recommendation.get("suggested_sql", [])]
             if not steps:
                 st.caption("No suggested steps for this evidence yet.")

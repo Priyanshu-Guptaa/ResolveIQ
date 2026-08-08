@@ -23,7 +23,7 @@ import streamlit as st
 from api_client import api_get, api_post, ensure_api_available
 
 from components.knowledge_editor import render_knowledge_editor
-from components.object_types import OBJECT_TYPES, TYPE_LABELS
+from components.object_types import MANUAL_CREATE_UNSUPPORTED, OBJECT_TYPES, TYPE_LABELS
 from theme import inject_theme
 
 inject_theme()
@@ -31,7 +31,7 @@ st.title("🗃️ Knowledge Objects")
 st.caption(
     "Administration · Create, edit, and manage the lifecycle of any governed knowledge object through one "
     "reusable framework -- Components, Documents, Known Bugs, SQL Templates, Historical Investigations, "
-    "Playbooks, Products, Technologies, and Versions."
+    "Playbooks, Products, Technologies, Versions, and the Log Intelligence Knowledge Base."
 )
 ensure_api_available()
 
@@ -39,7 +39,12 @@ col_type, col_new = st.columns([3, 1])
 object_type = col_type.selectbox("Object type", OBJECT_TYPES, format_func=lambda t: TYPE_LABELS[t], key="ko_type")
 show_create = col_new.toggle("➕ New", key="ko_show_create")
 
-if show_create:
+if show_create and object_type in MANUAL_CREATE_UNSUPPORTED:
+    st.info(
+        f"{TYPE_LABELS[object_type]} records are created by importing a wiki page -- see **Log Wiki Import** "
+        "in the sidebar. This page is for browsing, editing, and managing their lifecycle once they exist."
+    )
+elif show_create:
     with st.form(key=f"ko_create_{object_type}"):
         st.markdown(f"##### New {TYPE_LABELS[object_type]}")
         title_field = "name" if object_type in ("product", "technology", "version") else "title"

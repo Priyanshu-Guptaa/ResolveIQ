@@ -38,6 +38,7 @@ from app.engines.knowledge_object_framework.adapters import build_adapters
 if TYPE_CHECKING:
     from app.infrastructure.db.component_repository import ComponentProfileRepository
     from app.infrastructure.db.knowledge_repository import KnowledgeRepository
+    from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository
     from app.infrastructure.db.lookup_repository import LookupRepository
     from app.infrastructure.db.playbook_repository import PlaybookRepository
     from app.infrastructure.db.relationship_repository import RelationshipRepository
@@ -84,6 +85,7 @@ class KnowledgeRelationshipEngine:
         sql_repo: "SqlTemplateRepository",
         playbook_repo: "PlaybookRepository",
         lookup_repo: "LookupRepository",
+        log_knowledge_repo: "LogKnowledgeRepository | None" = None,
     ) -> None:
         self._relationships = relationship_repo
         self._components = component_repo
@@ -96,7 +98,12 @@ class KnowledgeRelationshipEngine:
         # app/engines/knowledge_object_framework/adapters.py's module
         # docstring. Behavior-preserving: same inputs/outputs as before,
         # this engine's own Phase 3.3 tests are unchanged by the move.
-        self._adapters = build_adapters(component_repo, knowledge_repo, sql_repo, playbook_repo, lookup_repo)
+        # log_knowledge_repo (Log Intelligence follow-up) is optional and
+        # additive: LogSourceApplication/LogCollectionScenario only join
+        # the resolvable object types when it's supplied.
+        self._adapters = build_adapters(
+            component_repo, knowledge_repo, sql_repo, playbook_repo, lookup_repo, log_knowledge_repo
+        )
 
     # --- Object resolution (dispatch via the shared adapter registry) ------
 

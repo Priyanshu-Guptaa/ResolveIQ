@@ -411,3 +411,70 @@ class EntityVersionModel(Base):
     change_summary: Mapped[str] = mapped_column(String(500), default="")
 
     __table_args__ = (Index("ix_entity_versions_object", "object_type", "object_id"),)
+
+
+class LogSourceApplicationModel(Base):
+    """Log Intelligence (Sprint 3 follow-up) -- one log-producing
+    component/service extracted from operational wiki content. See
+    app/domain/log_intelligence_kb.py's module docstring for why this
+    is deliberately separate from ComponentProfile."""
+
+    __tablename__ = "log_source_applications"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    name: Mapped[str] = mapped_column(String(300), index=True)
+
+    # LogRepositoryLocation, flattened -- structured per explicit
+    # instruction, not one opaque path string.
+    location_platform: Mapped[str] = mapped_column(String(20), default="unknown")
+    location_root_path: Mapped[str] = mapped_column(String(1000), default="")
+    location_subdirectory: Mapped[str | None] = mapped_column(String(300), nullable=True, default=None)
+    location_filename_patterns: Mapped[list] = mapped_column(JSON, default=list)
+    location_raw_paths: Mapped[list] = mapped_column(JSON, default=list)
+
+    technology: Mapped[list] = mapped_column(JSON, default=list)
+    product: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    purpose: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    log_level_support: Mapped[list] = mapped_column(JSON, default=list)
+    typical_issues: Mapped[list] = mapped_column(JSON, default=list)
+    common_errors: Mapped[list] = mapped_column(JSON, default=list)
+    related_sql: Mapped[list] = mapped_column(JSON, default=list)
+    related_documentation: Mapped[list] = mapped_column(JSON, default=list)
+    related_known_bugs: Mapped[list] = mapped_column(JSON, default=list)
+    related_playbooks: Mapped[list] = mapped_column(JSON, default=list)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    source_wiki_pages: Mapped[list] = mapped_column(JSON, default=list)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
+
+
+class LogCollectionScenarioModel(Base):
+    """Log Intelligence (Sprint 3 follow-up) -- the primary
+    recommendation object: an ordered set of logs to collect for one
+    product + technology + operation."""
+
+    __tablename__ = "log_collection_scenarios"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    product: Mapped[str] = mapped_column(String(200), index=True)
+    technology: Mapped[str] = mapped_column(String(200), index=True)
+    version: Mapped[str | None] = mapped_column(String(100), nullable=True, default=None)
+    scenario_type: Mapped[str] = mapped_column(String(200))
+    region: Mapped[str | None] = mapped_column(String(50), nullable=True, default=None)
+    steps: Mapped[list] = mapped_column(JSON, default=list)
+    """Serialized list[LogCollectionStep] -- id/component_name/priority/
+    explanation per entry."""
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    source_wiki_page: Mapped[str] = mapped_column(String(500), default="")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)

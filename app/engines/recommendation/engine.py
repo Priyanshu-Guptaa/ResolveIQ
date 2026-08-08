@@ -20,16 +20,39 @@ additive Sprint 2+ enhancement on top of this same output shape.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from app.config import Settings
 from app.domain.entities import ExtractedEntity
 from app.domain.enums import EntityType
 from app.domain.investigation import InvestigationSession
-from app.domain.recommendation import KnowledgeMatch, Recommendation, RootCauseHypothesis
+from app.domain.recommendation import KnowledgeMatch, Recommendation, RecommendedLogCollectionItem, RootCauseHypothesis
 from app.engines.knowledge.engine import KnowledgeEngine
 
+if TYPE_CHECKING:
+    from app.domain.log_intelligence_kb import LogCollectionScenario
+    from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository
+
 logger = logging.getLogger(__name__)
+
+_PRIORITY_CRITICAL = "Critical"
+_PRIORITY_RECOMMENDED = "Recommended"
+_PRIORITY_OPTIONAL = "Optional"
+
+_FULL_MATCH_SCORE = 1.0
+_PARTIAL_MATCH_SCORE = 0.5
+_MIN_TECHNOLOGY_WORD_LEN = 4
+"""Below this, a single word from a technology name (e.g. "IP") is too
+generic to treat as a meaningful partial-match signal on its own."""
+
+_MAX_MATCHED_SCENARIOS = 3
+_MAX_RECOMMENDED_LOG_ITEMS = 20
+"""Caps applied the same way ``top_k``/snippet caps are used elsewhere
+in this engine -- a matched scenario can have a long step list; this
+keeps the "Recommended Log Collection" section scannable rather than
+dumping every matched technology's full log inventory."""
 
 _MAX_SNIPPET_CHARS = 600
 """Cap for any historical-match text (resolution, root_cause) surfaced
@@ -116,9 +139,15 @@ _ENTITY_HEURISTICS: list[_EntityHeuristic] = [
 
 
 class RecommendationEngine:
-    def __init__(self, knowledge_engine: KnowledgeEngine, settings: Settings) -> None:
+    def __init__(
+        self,
+        knowledge_engine: KnowledgeEngine,
+        settings: Settings,
+        log_knowledge_repo: "LogKnowledgeRepository | None" = None,
+    ) -> None:
         self._knowledge = knowledge_engine
         self._settings = settings
+        self._log_knowledge = log_knowledge_repo
 
     def generate(self, investigation: InvestigationSession) -> Recommendation:
         query_text = investigation.context_text
@@ -145,6 +174,7 @@ class RecommendationEngine:
             relevant_documentation=relevant_docs,
             known_bugs=known_bugs,
             suggested_logs=self._suggest_logs(investigation, entities),
+            recommended_logs=self._recommend_logs(investigation),
             suggested_sql=self._suggest_sql(entities),
             next_best_step=self._next_best_step(investigation, similar_investigations, entities),
         )
@@ -251,6 +281,82 @@ class RecommendationEngine:
             suggestions.append("Downstream/upstream service logs filtered by the same correlation ID")
 
         return suggestions[:5]
+
+    # --- Log Intelligence: recommended log collection ---------------------
+
+    def _recommend_logs(self, investigation: InvestigationSession) -> list[RecommendedLogCollectionItem]:
+        """Consumes ``LogCollectionScenario`` records immediately (per
+        explicit design refinement -- this does not wait for a future
+        Recommendation Engine V2). Matching is deterministic keyword
+        matching between the investigation's own text and each
+        scenario's ``technology`` -- no embeddings, no LLM reasoning,
+        consistent with every other rule in this engine."""
+        if self._log_knowledge is None:
+            return []
+        context = investigation.context_text
+        if not context.strip():
+            return []
+
+        scored = [
+            (self._technology_match_score(scenario.technology, context), scenario)
+            for scenario in self._log_knowledge.list_scenarios()
+        ]
+        matched = sorted((pair for pair in scored if pair[0] > 0), key=lambda pair: pair[0], reverse=True)
+
+        items: list[RecommendedLogCollectionItem] = []
+        best_full_match_claimed = False
+        for score, scenario in matched[:_MAX_MATCHED_SCENARIOS]:
+            if score >= _FULL_MATCH_SCORE and not best_full_match_claimed:
+                label = _PRIORITY_CRITICAL
+                best_full_match_claimed = True
+            elif score >= _FULL_MATCH_SCORE:
+                label = _PRIORITY_RECOMMENDED
+            else:
+                label = _PRIORITY_OPTIONAL
+            items.extend(self._scenario_items(scenario, label))
+            if len(items) >= _MAX_RECOMMENDED_LOG_ITEMS:
+                break
+        return items[:_MAX_RECOMMENDED_LOG_ITEMS]
+
+    def _scenario_items(self, scenario: "LogCollectionScenario", label: str) -> list[RecommendedLogCollectionItem]:
+        items: list[RecommendedLogCollectionItem] = []
+        for step in sorted(scenario.steps, key=lambda s: s.priority):
+            source = self._log_knowledge.get_log_source(step.log_source_id) if self._log_knowledge else None
+            items.append(
+                RecommendedLogCollectionItem(
+                    priority_label=label,
+                    order=step.priority,
+                    component_name=step.component_name,
+                    scenario_technology=scenario.technology,
+                    scenario_type=scenario.scenario_type,
+                    scenario_region=scenario.region,
+                    explanation=step.explanation,
+                    repository_platform=source.location.platform if source else "unknown",
+                    repository_root_path=source.location.root_path if source else "",
+                    repository_subdirectory=source.location.subdirectory if source else None,
+                    filename_patterns=list(source.location.filename_patterns) if source else [],
+                    log_source_id=step.log_source_id,
+                    scenario_id=scenario.id,
+                )
+            )
+        return items
+
+    @staticmethod
+    def _technology_match_score(technology: str, context: str) -> float:
+        """1.0 for the full technology name appearing verbatim
+        (word-boundary-safe) in the investigation text; 0.5 if only a
+        significant individual word from a multi-word technology name
+        appears (e.g. investigation mentions "Mesh" but not the full
+        "RF Mesh" phrase); 0.0 otherwise."""
+        tech = technology.strip()
+        if not tech:
+            return 0.0
+        if re.search(rf"\b{re.escape(tech)}\b", context, re.IGNORECASE):
+            return _FULL_MATCH_SCORE
+        words = [w for w in re.findall(r"[A-Za-z]+", tech) if len(w) >= _MIN_TECHNOLOGY_WORD_LEN]
+        if any(re.search(rf"\b{re.escape(w)}\b", context, re.IGNORECASE) for w in words):
+            return _PARTIAL_MATCH_SCORE
+        return 0.0
 
     def _suggest_sql(self, entities: list[ExtractedEntity]) -> list[str]:
         entity_by_type = {e.entity_type: e for e in entities}

@@ -205,3 +205,124 @@ def test_sql_session_entity_yields_suggested_sql():
     recommendation = engine.generate(investigation)
 
     assert any("61" in sql for sql in recommendation.suggested_sql)
+
+
+# --- Log Intelligence: recommended log collection ---------------------------
+
+
+class FakeLogKnowledgeRepo:
+    """Structurally satisfies the LogKnowledgeRepository Protocol's
+    read side with canned scenarios/sources -- no DB needed for these
+    pure matching/labeling tests."""
+
+    def __init__(self, scenarios, sources) -> None:
+        self._scenarios = scenarios
+        self._sources = {s.id: s for s in sources}
+
+    def list_scenarios(self, *, active_only: bool = True):
+        return self._scenarios
+
+    def get_log_source(self, source_id: str):
+        return self._sources.get(source_id)
+
+
+def _make_scenario(id_, technology, scenario_type, steps):
+    from app.domain.log_intelligence_kb import LogCollectionScenario
+
+    return LogCollectionScenario(
+        id=id_, product="Command Center", technology=technology, scenario_type=scenario_type,
+        steps=steps, source_wiki_page="Test Page",
+    )
+
+
+def _make_step(log_source_id, component_name, priority):
+    from app.domain.log_intelligence_kb import LogCollectionStep
+
+    return LogCollectionStep(
+        log_source_id=log_source_id, component_name=component_name, priority=priority,
+        explanation=f"Produced by {component_name} -- step {priority}.",
+    )
+
+
+def _make_source(id_, name):
+    from app.domain.log_intelligence_kb import LogRepositoryLocation, LogSourceApplication
+
+    return LogSourceApplication(
+        id=id_, name=name,
+        location=LogRepositoryLocation(platform="linux", root_path="/var/log/landisgyr", filename_patterns=[f"{name}.log"]),
+        product="Command Center",
+    )
+
+
+def test_full_technology_name_match_yields_critical_ordered_items():
+    scenario = _make_scenario(
+        "sc-1", "RF Mesh", "Command Request (Outbound)",
+        [_make_step("src-nms", "NMS", 2), _make_step("src-cp", "CommandProcessor", 1)],
+    )
+    sources = [_make_source("src-nms", "NMS"), _make_source("src-cp", "CommandProcessor")]
+    log_repo = FakeLogKnowledgeRepo([scenario], sources)
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_evidence("Command failed during RF Mesh outbound delivery")
+    recommendation = engine.generate(investigation)
+
+    assert len(recommendation.recommended_logs) == 2
+    assert all(item.priority_label == "Critical" for item in recommendation.recommended_logs)
+    # Wiki collection order preserved regardless of the steps list's own order.
+    assert [item.order for item in recommendation.recommended_logs] == [1, 2]
+    assert recommendation.recommended_logs[0].component_name == "CommandProcessor"
+    assert recommendation.recommended_logs[0].repository_root_path == "/var/log/landisgyr"
+
+
+def test_unrelated_technology_is_not_recommended():
+    scenario = _make_scenario("sc-1", "Kafka broker", "General", [_make_step("src-k", "Broker", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-k", "Broker")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_evidence("Command failed during RF Mesh outbound delivery")
+    recommendation = engine.generate(investigation)
+
+    assert recommendation.recommended_logs == []
+
+
+def test_partial_keyword_match_yields_optional_label():
+    scenario = _make_scenario("sc-1", "RF Mesh IP", "General", [_make_step("src-x", "X", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-x", "X")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    # Mentions "Mesh" but not the full "RF Mesh IP" phrase.
+    investigation = _investigation_with_evidence("Mesh device unreachable after firmware update")
+    recommendation = engine.generate(investigation)
+
+    assert len(recommendation.recommended_logs) == 1
+    assert recommendation.recommended_logs[0].priority_label == "Optional"
+
+
+def test_best_match_is_critical_others_are_recommended():
+    outbound = _make_scenario("sc-1", "RF Mesh", "Command Request (Outbound)", [_make_step("src-a", "A", 1)])
+    response = _make_scenario("sc-2", "RF Mesh", "Command Response", [_make_step("src-b", "B", 1)])
+    log_repo = FakeLogKnowledgeRepo([outbound, response], [_make_source("src-a", "A"), _make_source("src-b", "B")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_evidence("RF Mesh command timed out with no response")
+    recommendation = engine.generate(investigation)
+
+    labels = {item.scenario_type: item.priority_label for item in recommendation.recommended_logs}
+    assert "Critical" in labels.values()
+    assert "Recommended" in labels.values()
+
+
+def test_no_log_knowledge_repo_yields_no_recommended_logs():
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    investigation = _investigation_with_evidence("RF Mesh command timed out")
+    recommendation = engine.generate(investigation)
+    assert recommendation.recommended_logs == []
+
+
+def test_empty_investigation_yields_no_recommended_logs():
+    scenario = _make_scenario("sc-1", "RF Mesh", "General", [_make_step("src-x", "X", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-x", "X")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    recommendation = engine.generate(InvestigationSession(title="Empty investigation"))
+    assert recommendation.recommended_logs == []

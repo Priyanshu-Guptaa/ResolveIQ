@@ -39,6 +39,16 @@ class KnowledgeObjectType(str, Enum):
     TECHNOLOGY = "technology"
     PRODUCT = "product"
     VERSION = "version"
+    LOG_SOURCE_APPLICATION = "log_source_application"
+    """A log-producing component/service extracted from operational
+    wiki content (Log Intelligence). Deliberately separate from
+    COMPONENT (the curated Product Intelligence Architecture Explorer)
+    -- linked to it via IMPLEMENTS_LOGGING_FOR where a deterministic
+    name match exists, never merged."""
+    LOG_COLLECTION_SCENARIO = "log_collection_scenario"
+    """An ordered set of logs to collect for one technology + operation
+    (e.g. "RF Mesh, Command Request (Outbound)") -- the primary object
+    the Recommendation Engine's log-collection guidance is built from."""
 
 
 class RelationshipType(str, Enum):
@@ -52,6 +62,12 @@ class RelationshipType(str, Enum):
     REQUIRES = "requires"
     USES = "uses"
     APPLIES_TO = "applies_to"
+    IMPLEMENTS_LOGGING_FOR = "implements_logging_for"
+    """LogSourceApplication -> Component: this log-producing service
+    (from wiki-derived Log Intelligence knowledge) is how the given
+    Component's activity gets logged. Additive only, created at import
+    time via deterministic name matching against the full live
+    Component Registry -- never merges the two entities."""
 
 
 class KnowledgeObjectRef(BaseModel):

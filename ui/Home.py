@@ -40,6 +40,7 @@ navigation = st.navigation(
             st.Page("views/10_Relationship_Manager.py", title="Relationship Manager", icon="🕸️"),
             st.Page("views/11_Knowledge_Objects.py", title="Knowledge Objects", icon="🗃️"),
             st.Page("views/12_Task_Import.py", title="Task Import", icon="📥"),
+            st.Page("views/13_Log_Wiki_Import.py", title="Log Wiki Import", icon="📚"),
         ],
     }
 )

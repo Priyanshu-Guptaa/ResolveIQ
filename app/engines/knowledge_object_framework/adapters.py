@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from app.domain.evidence import DocumentationRecord, HistoricalInvestigationRecord, KnownBugRecord
 from app.domain.knowledge_relationships import KnowledgeObjectRef, KnowledgeObjectType
+from app.domain.log_intelligence_kb import LogCollectionScenario, LogSourceApplication
 from app.domain.lookup_entities import Product, Technology, Version
 from app.domain.playbook import Playbook
 from app.domain.product_intelligence import ComponentProfile
@@ -38,6 +39,7 @@ from app.domain.sql_studio import QueryTemplate
 if TYPE_CHECKING:
     from app.infrastructure.db.component_repository import ComponentProfileRepository
     from app.infrastructure.db.knowledge_repository import KnowledgeRepository
+    from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository
     from app.infrastructure.db.lookup_repository import LookupRepository
     from app.infrastructure.db.playbook_repository import PlaybookRepository
     from app.infrastructure.db.sql_template_repository import SqlTemplateRepository
@@ -71,9 +73,10 @@ def build_adapters(
     sql_repo: "SqlTemplateRepository",
     playbook_repo: "PlaybookRepository",
     lookup_repo: "LookupRepository",
+    log_knowledge_repo: "LogKnowledgeRepository | None" = None,
 ) -> dict[KnowledgeObjectType, KnowledgeObjectAdapter]:
     T = KnowledgeObjectType
-    return {
+    adapters: dict[KnowledgeObjectType, KnowledgeObjectAdapter] = {
         T.COMPONENT: KnowledgeObjectAdapter(
             get=component_repo.get,
             list_all=component_repo.list_all,
@@ -149,3 +152,30 @@ def build_adapters(
             model_cls=Version,
         ),
     }
+
+    if log_knowledge_repo is not None:
+        adapters[T.LOG_SOURCE_APPLICATION] = KnowledgeObjectAdapter(
+            get=log_knowledge_repo.get_log_source,
+            list_all=log_knowledge_repo.list_log_sources,
+            save=log_knowledge_repo.save_log_source,
+            delete=log_knowledge_repo.delete_log_source,
+            to_ref=lambda o: KnowledgeObjectRef(
+                type=T.LOG_SOURCE_APPLICATION, id=o.id, title=o.name, subtitle=", ".join(o.technology)
+            ),
+            model_cls=LogSourceApplication,
+        )
+        adapters[T.LOG_COLLECTION_SCENARIO] = KnowledgeObjectAdapter(
+            get=log_knowledge_repo.get_scenario,
+            list_all=log_knowledge_repo.list_scenarios,
+            save=log_knowledge_repo.save_scenario,
+            delete=log_knowledge_repo.delete_scenario,
+            to_ref=lambda o: KnowledgeObjectRef(
+                type=T.LOG_COLLECTION_SCENARIO,
+                id=o.id,
+                title=f"{o.technology} / {o.scenario_type}",
+                subtitle=o.product,
+            ),
+            model_cls=LogCollectionScenario,
+        )
+
+    return adapters

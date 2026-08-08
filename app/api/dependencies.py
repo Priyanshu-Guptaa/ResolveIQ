@@ -29,6 +29,7 @@ from app.engines.knowledge_relationships.engine import KnowledgeRelationshipEngi
 from app.engines.log_intelligence.engine import LogIntelligenceEngine
 from app.engines.log_intelligence.entity_extractor import EntityExtractor, RegexEntityExtractor
 from app.engines.log_intelligence.log_parser import GenericLogParser, LogParser
+from app.engines.log_knowledge.importer import LogWikiImporter
 from app.engines.product_intelligence.component_registry import ComponentRegistry
 from app.engines.product_intelligence.engine import ProductIntelligenceEngine
 from app.engines.recommendation.engine import RecommendationEngine
@@ -36,6 +37,7 @@ from app.engines.sql_library.engine import SqlLibraryEngine
 from app.engines.task_import.importer import TaskImporter
 from app.infrastructure.db.component_repository import ComponentProfileRepository, SqlAlchemyComponentProfileRepository
 from app.infrastructure.db.knowledge_repository import KnowledgeRepository, SqlAlchemyKnowledgeRepository
+from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository, SqlAlchemyLogKnowledgeRepository
 from app.infrastructure.db.lookup_repository import LookupRepository, SqlAlchemyLookupRepository
 from app.infrastructure.db.playbook_repository import PlaybookRepository, SqlAlchemyPlaybookRepository
 from app.infrastructure.db.relationship_repository import RelationshipRepository, SqlAlchemyRelationshipRepository
@@ -129,6 +131,11 @@ def _relationship_repository() -> RelationshipRepository:
 
 
 @lru_cache
+def _log_knowledge_repository() -> LogKnowledgeRepository:
+    return SqlAlchemyLogKnowledgeRepository(_db_session_factory())
+
+
+@lru_cache
 def _knowledge_relationship_engine() -> KnowledgeRelationshipEngine:
     return KnowledgeRelationshipEngine(
         _relationship_repository(),
@@ -137,6 +144,7 @@ def _knowledge_relationship_engine() -> KnowledgeRelationshipEngine:
         _sql_template_repository(),
         _playbook_repository(),
         _lookup_repository(),
+        _log_knowledge_repository(),
     )
 
 
@@ -157,6 +165,7 @@ def _knowledge_object_adapters() -> dict[KnowledgeObjectType, KnowledgeObjectAda
         _sql_template_repository(),
         _playbook_repository(),
         _lookup_repository(),
+        _log_knowledge_repository(),
     )
 
 
@@ -173,6 +182,11 @@ def _knowledge_object_service() -> KnowledgeObjectService:
 @lru_cache
 def _task_importer() -> TaskImporter:
     return TaskImporter(_knowledge_object_service(), _knowledge_relationship_engine())
+
+
+@lru_cache
+def _log_wiki_importer() -> LogWikiImporter:
+    return LogWikiImporter(_knowledge_object_service(), _knowledge_relationship_engine(), _component_profile_repository())
 
 
 @lru_cache
@@ -226,7 +240,7 @@ def get_knowledge_engine() -> KnowledgeEngine:
 
 
 def get_recommendation_engine() -> RecommendationEngine:
-    return RecommendationEngine(_knowledge_engine_singleton(), get_settings())
+    return RecommendationEngine(_knowledge_engine_singleton(), get_settings(), _log_knowledge_repository())
 
 
 def get_product_intelligence_engine() -> ProductIntelligenceEngine:
@@ -245,12 +259,24 @@ def get_knowledge_relationship_engine() -> KnowledgeRelationshipEngine:
     return _knowledge_relationship_engine()
 
 
+def get_log_knowledge_repository() -> LogKnowledgeRepository:
+    return _log_knowledge_repository()
+
+
 def get_knowledge_object_service() -> KnowledgeObjectService:
     return _knowledge_object_service()
 
 
 def get_task_importer() -> TaskImporter:
     return _task_importer()
+
+
+def get_log_wiki_importer() -> LogWikiImporter:
+    return _log_wiki_importer()
+
+
+def get_file_type_registry() -> FileTypeRegistry:
+    return _file_type_registry()
 
 
 def run_knowledge_foundation_migration() -> dict[str, int]:
@@ -295,10 +321,12 @@ def reset_singletons() -> None:
         _playbook_repository,
         _lookup_repository,
         _relationship_repository,
+        _log_knowledge_repository,
         _knowledge_relationship_engine,
         _version_repository,
         _knowledge_object_adapters,
         _knowledge_object_service,
         _task_importer,
+        _log_wiki_importer,
     ):
         fn.cache_clear()
