@@ -254,7 +254,27 @@ def _make_source(id_, name):
     )
 
 
-def test_full_technology_name_match_yields_critical_ordered_items():
+def _investigation_with_log_evidence(context_text: str, log_filenames: list[str] | None = None) -> InvestigationSession:
+    """Like _investigation_with_evidence, but can also attach LOG_FILE
+    evidence items with specific *filenames* (titles) -- the signal
+    "already collected" detection cross-references against. The task
+    description alone (no title) still drives technology/issue-type
+    text matching."""
+    investigation = _investigation_with_evidence(context_text)
+    for filename in log_filenames or []:
+        investigation.add_evidence(
+            Evidence(
+                investigation_id=investigation.id,
+                evidence_type=EvidenceType.LOG_FILE,
+                source="upload",
+                title=filename,
+                raw_content="(log content not relevant to this test)",
+            )
+        )
+    return investigation
+
+
+def test_full_technology_and_issue_type_match_yields_critical_ordered_items():
     scenario = _make_scenario(
         "sc-1", "RF Mesh", "Command Request (Outbound)",
         [_make_step("src-nms", "NMS", 2), _make_step("src-cp", "CommandProcessor", 1)],
@@ -263,7 +283,8 @@ def test_full_technology_name_match_yields_critical_ordered_items():
     log_repo = FakeLogKnowledgeRepo([scenario], sources)
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
 
-    investigation = _investigation_with_evidence("Command failed during RF Mesh outbound delivery")
+    # Mentions the full technology name AND the full issue-type phrase.
+    investigation = _investigation_with_evidence("Command Request (Outbound) failed during RF Mesh delivery")
     recommendation = engine.generate(investigation)
 
     assert len(recommendation.recommended_logs) == 2
@@ -272,6 +293,22 @@ def test_full_technology_name_match_yields_critical_ordered_items():
     assert [item.order for item in recommendation.recommended_logs] == [1, 2]
     assert recommendation.recommended_logs[0].component_name == "CommandProcessor"
     assert recommendation.recommended_logs[0].repository_root_path == "/var/log/landisgyr"
+
+
+def test_technology_only_match_yields_recommended_not_critical():
+    """Issue-aware matching (polishing phase): technology alone is no
+    longer enough for Critical -- the specific issue type must match
+    too, otherwise this is just one of several possible operations for
+    that technology."""
+    scenario = _make_scenario("sc-1", "RF Mesh", "Firmware Download", [_make_step("src-a", "A", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-a", "A")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_evidence("RF Mesh meter is unreachable, need to investigate")
+    recommendation = engine.generate(investigation)
+
+    assert len(recommendation.recommended_logs) == 1
+    assert recommendation.recommended_logs[0].priority_label == "Recommended"
 
 
 def test_unrelated_technology_is_not_recommended():
@@ -298,18 +335,20 @@ def test_partial_keyword_match_yields_optional_label():
     assert recommendation.recommended_logs[0].priority_label == "Optional"
 
 
-def test_best_match_is_critical_others_are_recommended():
+def test_best_matching_issue_type_is_critical_sibling_scenario_is_recommended():
     outbound = _make_scenario("sc-1", "RF Mesh", "Command Request (Outbound)", [_make_step("src-a", "A", 1)])
     response = _make_scenario("sc-2", "RF Mesh", "Command Response", [_make_step("src-b", "B", 1)])
     log_repo = FakeLogKnowledgeRepo([outbound, response], [_make_source("src-a", "A"), _make_source("src-b", "B")])
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
 
-    investigation = _investigation_with_evidence("RF Mesh command timed out with no response")
+    # Full "Command Response" phrase present; "Command Request (Outbound)"
+    # is not (its words overlap, but not as one contiguous phrase).
+    investigation = _investigation_with_evidence("RF Mesh Command Response never arrived after the outbound request")
     recommendation = engine.generate(investigation)
 
     labels = {item.scenario_type: item.priority_label for item in recommendation.recommended_logs}
-    assert "Critical" in labels.values()
-    assert "Recommended" in labels.values()
+    assert labels["Command Response"] == "Critical"
+    assert labels["Command Request (Outbound)"] == "Recommended"
 
 
 def test_no_log_knowledge_repo_yields_no_recommended_logs():
@@ -326,3 +365,154 @@ def test_empty_investigation_yields_no_recommended_logs():
 
     recommendation = engine.generate(InvestigationSession(title="Empty investigation"))
     assert recommendation.recommended_logs == []
+
+
+# --- Log Intelligence: match_reason ------------------------------------------
+
+
+def test_match_reason_names_both_technology_and_issue_type_when_both_match():
+    scenario = _make_scenario("sc-1", "RF Mesh", "Command Response", [_make_step("src-a", "A", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-a", "A")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_evidence("RF Mesh Command Response is failing")
+    recommendation = engine.generate(investigation)
+
+    reason = recommendation.recommended_logs[0].match_reason
+    assert "RF Mesh" in reason
+    assert "Command Response" in reason
+
+
+def test_match_reason_notes_unidentified_issue_type_when_only_technology_matches():
+    scenario = _make_scenario("sc-1", "RF Mesh", "Firmware Download", [_make_step("src-a", "A", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-a", "A")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_evidence("RF Mesh meter is unreachable")
+    recommendation = engine.generate(investigation)
+
+    reason = recommendation.recommended_logs[0].match_reason
+    assert "RF Mesh" in reason
+    assert "wasn't identified" in reason
+
+
+# --- Log Intelligence: already-collected detection ---------------------------
+
+
+def test_already_collected_true_when_component_name_appears_in_uploaded_filename():
+    scenario = _make_scenario("sc-1", "RF Mesh", "General", [_make_step("src-cp", "CommandProcessor", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-cp", "CommandProcessor")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_log_evidence(
+        "RF Mesh command issue", log_filenames=["CommandProcessor/logfile.log"]
+    )
+    recommendation = engine.generate(investigation)
+
+    assert recommendation.recommended_logs[0].already_collected is True
+
+
+def test_already_collected_false_when_no_matching_evidence_uploaded():
+    scenario = _make_scenario("sc-1", "RF Mesh", "General", [_make_step("src-cp", "CommandProcessor", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-cp", "CommandProcessor")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_log_evidence("RF Mesh command issue", log_filenames=["NMS_Listener.log"])
+    recommendation = engine.generate(investigation)
+
+    assert recommendation.recommended_logs[0].already_collected is False
+
+
+def test_already_collected_not_inferred_from_a_generic_filename_shared_by_many_sources():
+    """A bare 'logfile.log' upload can't distinguish CommandProcessor
+    from any of the dozens of other sources that share that exact
+    filename in the wiki -- must not be marked collected on that alone."""
+    scenario = _make_scenario("sc-1", "RF Mesh", "General", [_make_step("src-cp", "CommandProcessor", 1)])
+    source = _make_source("src-cp", "CommandProcessor")
+    source.location.filename_patterns = ["logfile.log"]
+    log_repo = FakeLogKnowledgeRepo([scenario], [source])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_log_evidence("RF Mesh command issue", log_filenames=["logfile.log"])
+    recommendation = engine.generate(investigation)
+
+    assert recommendation.recommended_logs[0].already_collected is False
+
+
+# --- Log Intelligence: Product Intelligence integration ----------------------
+
+
+class FakeRelationshipEngine:
+    def __init__(self, relationships_by_source_id: dict) -> None:
+        self._rels = relationships_by_source_id
+
+    def list_relationships(self, object_type, object_id):
+        return self._rels.get(object_id, [])
+
+
+def _resolved_implements_logging_for(source_id: str, component_id: str, component_name: str):
+    from app.domain.knowledge_relationships import (
+        KnowledgeObjectRef,
+        KnowledgeObjectType,
+        KnowledgeRelationship,
+        RelationshipType,
+        ResolvedRelationship,
+    )
+
+    return ResolvedRelationship(
+        relationship=KnowledgeRelationship(
+            id="rel-1",
+            from_type=KnowledgeObjectType.LOG_SOURCE_APPLICATION,
+            from_id=source_id,
+            to_type=KnowledgeObjectType.COMPONENT,
+            to_id=component_id,
+            relationship_type=RelationshipType.IMPLEMENTS_LOGGING_FOR,
+        ),
+        from_object=KnowledgeObjectRef(type=KnowledgeObjectType.LOG_SOURCE_APPLICATION, id=source_id, title="CommandProcessor"),
+        to_object=KnowledgeObjectRef(type=KnowledgeObjectType.COMPONENT, id=component_id, title=component_name),
+    )
+
+
+def test_linked_component_surfaced_when_relationship_exists():
+    scenario = _make_scenario("sc-1", "RF Mesh", "General", [_make_step("src-cp", "CommandProcessor", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-cp", "CommandProcessor")])
+    rel_engine = FakeRelationshipEngine(
+        {"src-cp": [_resolved_implements_logging_for("src-cp", "comp-1", "CommandProcessorHost")]}
+    )
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo, component_repo=None, relationship_engine=rel_engine
+    )
+
+    investigation = _investigation_with_evidence("RF Mesh command issue")
+    recommendation = engine.generate(investigation)
+
+    item = recommendation.recommended_logs[0]
+    assert item.linked_component_id == "comp-1"
+    assert item.linked_component_name == "CommandProcessorHost"
+
+
+def test_linked_component_none_when_no_relationship_exists():
+    scenario = _make_scenario("sc-1", "RF Mesh", "General", [_make_step("src-cp", "CommandProcessor", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-cp", "CommandProcessor")])
+    rel_engine = FakeRelationshipEngine({})
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo, component_repo=None, relationship_engine=rel_engine
+    )
+
+    investigation = _investigation_with_evidence("RF Mesh command issue")
+    recommendation = engine.generate(investigation)
+
+    item = recommendation.recommended_logs[0]
+    assert item.linked_component_id is None
+    assert item.linked_component_name is None
+
+
+def test_linked_component_none_when_no_relationship_engine_provided():
+    scenario = _make_scenario("sc-1", "RF Mesh", "General", [_make_step("src-cp", "CommandProcessor", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-cp", "CommandProcessor")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_evidence("RF Mesh command issue")
+    recommendation = engine.generate(investigation)
+
+    assert recommendation.recommended_logs[0].linked_component_id is None

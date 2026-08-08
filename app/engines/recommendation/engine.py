@@ -26,13 +26,17 @@ from typing import TYPE_CHECKING
 
 from app.config import Settings
 from app.domain.entities import ExtractedEntity
-from app.domain.enums import EntityType
+from app.domain.enums import EntityType, EvidenceType
 from app.domain.investigation import InvestigationSession
+from app.domain.knowledge_relationships import KnowledgeObjectType, RelationshipType
 from app.domain.recommendation import KnowledgeMatch, Recommendation, RecommendedLogCollectionItem, RootCauseHypothesis
 from app.engines.knowledge.engine import KnowledgeEngine
 
 if TYPE_CHECKING:
-    from app.domain.log_intelligence_kb import LogCollectionScenario
+    from app.domain.evidence import Evidence
+    from app.domain.log_intelligence_kb import LogCollectionScenario, LogSourceApplication
+    from app.engines.knowledge_relationships.engine import KnowledgeRelationshipEngine
+    from app.infrastructure.db.component_repository import ComponentProfileRepository
     from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository
 
 logger = logging.getLogger(__name__)
@@ -43,9 +47,10 @@ _PRIORITY_OPTIONAL = "Optional"
 
 _FULL_MATCH_SCORE = 1.0
 _PARTIAL_MATCH_SCORE = 0.5
-_MIN_TECHNOLOGY_WORD_LEN = 4
-"""Below this, a single word from a technology name (e.g. "IP") is too
-generic to treat as a meaningful partial-match signal on its own."""
+_MIN_KEYWORD_WORD_LEN = 4
+"""Below this, a single word from a technology/scenario-type name (e.g.
+"IP") is too generic to treat as a meaningful partial-match signal on
+its own."""
 
 _MAX_MATCHED_SCENARIOS = 3
 _MAX_RECOMMENDED_LOG_ITEMS = 20
@@ -53,6 +58,22 @@ _MAX_RECOMMENDED_LOG_ITEMS = 20
 in this engine -- a matched scenario can have a long step list; this
 keeps the "Recommended Log Collection" section scannable rather than
 dumping every matched technology's full log inventory."""
+
+_MIN_COMPONENT_NAME_LEN_FOR_COLLECTED_MATCH = 4
+"""A log source name shorter than this (rare, but the wiki has a few,
+e.g. generic single-word names) is too likely to false-positive as a
+substring of an unrelated uploaded filename to safely mark "already
+collected" from a name match alone."""
+
+_GENERIC_FILENAME_STEMS = {"log", "logfile", "logs"}
+"""Filenames this generic are reused by dozens of different log
+sources in the wiki (e.g. nearly every Windows service logs to
+"logfile.log") -- an uploaded file with one of these names does not
+reliably identify *which* source it came from, so it is deliberately
+excluded from the "already collected" filename check (falling back to
+the component-name-in-title check instead). Being wrong here has real
+cost: a false "already collected" could make an engineer skip
+gathering a log that's actually still missing."""
 
 _MAX_SNIPPET_CHARS = 600
 """Cap for any historical-match text (resolution, root_cause) surfaced
@@ -64,6 +85,79 @@ into "Next best step" (meant to be a short, scannable hint) reads as
 unusable wall-of-text, not a recommendation. The full resolution is
 still one click away (Historical Matches -> that investigation's own
 record); this cap only bounds what's echoed inline."""
+
+
+def _keyword_match_score(keyword: str, context: str) -> float:
+    """1.0 for the full phrase (technology name or scenario type)
+    appearing verbatim (word-boundary-safe) in the investigation text;
+    0.5 if only a significant individual word from a multi-word phrase
+    appears (e.g. investigation mentions "Mesh" but not the full
+    "RF Mesh" phrase, or "timeout" but not "Command Response"); 0.0
+    otherwise. Shared by both the technology and issue-type (scenario
+    type) matching passes -- same rule, different field."""
+    phrase = keyword.strip()
+    if not phrase:
+        return 0.0
+    # (?<!\w)...(?!\w), not \b...\b: several real scenario_type/technology
+    # names end in punctuation (e.g. "Command Request (Outbound)") -- a
+    # closing paren followed by a space is NOT a \b (neither side is a
+    # word character), so plain \b anchors silently never match those
+    # phrases at all. The lookaround form only cares that the phrase
+    # isn't glued directly onto another word character, which is what
+    # "whole phrase" actually means regardless of what punctuation borders it.
+    if re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", context, re.IGNORECASE):
+        return _FULL_MATCH_SCORE
+    words = [w for w in re.findall(r"[A-Za-z]+", phrase) if len(w) >= _MIN_KEYWORD_WORD_LEN]
+    if any(re.search(rf"\b{re.escape(w)}\b", context, re.IGNORECASE) for w in words):
+        return _PARTIAL_MATCH_SCORE
+    return 0.0
+
+
+def _match_reason(scenario: "LogCollectionScenario", tech_score: float, type_score: float) -> str:
+    """Deterministically explains *why this scenario* was selected --
+    distinct from each step's own ``explanation`` (its position in the
+    message flow). Built entirely from which score components fired;
+    never phrased by an LLM."""
+    tech_part = f'technology "{scenario.technology}"' if tech_score > 0 else None
+    type_part = f'issue type "{scenario.scenario_type}"' if type_score >= _FULL_MATCH_SCORE else None
+    matched = [p for p in (tech_part, type_part) if p]
+    if tech_score >= _FULL_MATCH_SCORE and type_score >= _FULL_MATCH_SCORE:
+        return f"Matched because the investigation mentions both {matched[0]} and {matched[1]} -- the specific operation this scenario covers."
+    if tech_score >= _FULL_MATCH_SCORE:
+        return f"Matched because the investigation mentions {matched[0]}; the specific issue type ({scenario.scenario_type}) wasn't identified, so this is one of several possible operations for that technology."
+    return f"Weakly matched: the investigation mentions a related keyword for {matched[0] if matched else scenario.technology}, not the full technology name."
+
+
+def _evidence_titles(investigation: InvestigationSession) -> list[str]:
+    """Titles (original filenames, for uploads) of every LOG_FILE
+    evidence item already attached to this investigation -- the signal
+    "already collected" detection cross-references against."""
+    return [e.title for e in investigation.evidence if e.evidence_type == EvidenceType.LOG_FILE and e.title]
+
+
+def _is_already_collected(component_name: str, source: "LogSourceApplication | None", evidence_titles: list[str]) -> bool:
+    """Conservative on purpose (false positives are worse than false
+    negatives here -- see _GENERIC_FILENAME_STEMS): a component-name
+    substring match against an uploaded filename covers the realistic
+    case of a zip upload preserving "ComponentName/logfile.log"-shaped
+    internal paths, or a descriptively-renamed file; a filename-pattern
+    match is only trusted when that pattern isn't one of the generic
+    names reused by dozens of unrelated sources."""
+    name = component_name.strip()
+    name_matches = len(name) >= _MIN_COMPONENT_NAME_LEN_FOR_COLLECTED_MATCH and any(
+        name.lower() in title.lower() for title in evidence_titles
+    )
+    if name_matches:
+        return True
+    if source is None:
+        return False
+    for pattern in source.location.filename_patterns:
+        stem = re.sub(r"\.\w+\*?$", "", pattern).lower()
+        if stem in _GENERIC_FILENAME_STEMS:
+            continue
+        if any(pattern.lower() in title.lower() for title in evidence_titles):
+            return True
+    return False
 
 
 def _snippet(text: str) -> str:
@@ -144,10 +238,14 @@ class RecommendationEngine:
         knowledge_engine: KnowledgeEngine,
         settings: Settings,
         log_knowledge_repo: "LogKnowledgeRepository | None" = None,
+        component_repo: "ComponentProfileRepository | None" = None,
+        relationship_engine: "KnowledgeRelationshipEngine | None" = None,
     ) -> None:
         self._knowledge = knowledge_engine
         self._settings = settings
         self._log_knowledge = log_knowledge_repo
+        self._components = component_repo
+        self._relationships = relationship_engine
 
     def generate(self, investigation: InvestigationSession) -> Recommendation:
         query_text = investigation.context_text
@@ -289,42 +387,65 @@ class RecommendationEngine:
         explicit design refinement -- this does not wait for a future
         Recommendation Engine V2). Matching is deterministic keyword
         matching between the investigation's own text and each
-        scenario's ``technology`` -- no embeddings, no LLM reasoning,
-        consistent with every other rule in this engine."""
+        scenario's ``technology`` *and* ``scenario_type`` -- no
+        embeddings, no LLM reasoning, consistent with every other rule
+        in this engine.
+
+        Issue-aware priority (polishing-phase addition): a technology
+        match alone used to be enough to earn "Critical", which meant
+        every scenario for the matched technology (Command Request,
+        Command Response, Firmware Download, ...) looked equally
+        urgent regardless of what the investigation is actually about.
+        Now Critical requires the scenario's *issue type* to match too
+        -- the log collection for the specific operation described in
+        the investigation, not just the general technology area.
+        """
         if self._log_knowledge is None:
             return []
         context = investigation.context_text
         if not context.strip():
             return []
 
-        scored = [
-            (self._technology_match_score(scenario.technology, context), scenario)
-            for scenario in self._log_knowledge.list_scenarios()
-        ]
-        matched = sorted((pair for pair in scored if pair[0] > 0), key=lambda pair: pair[0], reverse=True)
+        evidence_titles = _evidence_titles(investigation)
+
+        scored: list[tuple[float, float, float, "LogCollectionScenario"]] = []
+        for scenario in self._log_knowledge.list_scenarios():
+            tech_score = _keyword_match_score(scenario.technology, context)
+            if tech_score <= 0:
+                continue
+            type_score = _keyword_match_score(scenario.scenario_type, context)
+            scored.append((tech_score + type_score, tech_score, type_score, scenario))
+        scored.sort(key=lambda row: row[0], reverse=True)
 
         items: list[RecommendedLogCollectionItem] = []
-        best_full_match_claimed = False
-        for score, scenario in matched[:_MAX_MATCHED_SCENARIOS]:
-            if score >= _FULL_MATCH_SCORE and not best_full_match_claimed:
+        for _combined, tech_score, type_score, scenario in scored[:_MAX_MATCHED_SCENARIOS]:
+            if tech_score >= _FULL_MATCH_SCORE and type_score >= _FULL_MATCH_SCORE:
                 label = _PRIORITY_CRITICAL
-                best_full_match_claimed = True
-            elif score >= _FULL_MATCH_SCORE:
+            elif tech_score >= _FULL_MATCH_SCORE:
                 label = _PRIORITY_RECOMMENDED
             else:
                 label = _PRIORITY_OPTIONAL
-            items.extend(self._scenario_items(scenario, label))
+            reason = _match_reason(scenario, tech_score, type_score)
+            items.extend(self._scenario_items(scenario, label, reason, evidence_titles))
             if len(items) >= _MAX_RECOMMENDED_LOG_ITEMS:
                 break
         return items[:_MAX_RECOMMENDED_LOG_ITEMS]
 
-    def _scenario_items(self, scenario: "LogCollectionScenario", label: str) -> list[RecommendedLogCollectionItem]:
+    def _scenario_items(
+        self,
+        scenario: "LogCollectionScenario",
+        label: str,
+        match_reason: str,
+        evidence_titles: list[str],
+    ) -> list[RecommendedLogCollectionItem]:
         items: list[RecommendedLogCollectionItem] = []
         for step in sorted(scenario.steps, key=lambda s: s.priority):
             source = self._log_knowledge.get_log_source(step.log_source_id) if self._log_knowledge else None
+            linked_id, linked_name = self._linked_component(step.log_source_id)
             items.append(
                 RecommendedLogCollectionItem(
                     priority_label=label,
+                    match_reason=match_reason,
                     order=step.priority,
                     component_name=step.component_name,
                     scenario_technology=scenario.technology,
@@ -337,26 +458,28 @@ class RecommendationEngine:
                     filename_patterns=list(source.location.filename_patterns) if source else [],
                     log_source_id=step.log_source_id,
                     scenario_id=scenario.id,
+                    already_collected=_is_already_collected(step.component_name, source, evidence_titles),
+                    linked_component_id=linked_id,
+                    linked_component_name=linked_name,
                 )
             )
         return items
 
-    @staticmethod
-    def _technology_match_score(technology: str, context: str) -> float:
-        """1.0 for the full technology name appearing verbatim
-        (word-boundary-safe) in the investigation text; 0.5 if only a
-        significant individual word from a multi-word technology name
-        appears (e.g. investigation mentions "Mesh" but not the full
-        "RF Mesh" phrase); 0.0 otherwise."""
-        tech = technology.strip()
-        if not tech:
-            return 0.0
-        if re.search(rf"\b{re.escape(tech)}\b", context, re.IGNORECASE):
-            return _FULL_MATCH_SCORE
-        words = [w for w in re.findall(r"[A-Za-z]+", tech) if len(w) >= _MIN_TECHNOLOGY_WORD_LEN]
-        if any(re.search(rf"\b{re.escape(w)}\b", context, re.IGNORECASE) for w in words):
-            return _PARTIAL_MATCH_SCORE
-        return 0.0
+    def _linked_component(self, log_source_id: str) -> tuple[str | None, str | None]:
+        """Product Intelligence integration: surfaces the real
+        IMPLEMENTS_LOGGING_FOR relationship created at import time
+        (app/engines/log_knowledge/importer.py), when one exists --
+        never a new/independent match, just exposing what the
+        relationship graph already knows."""
+        if self._relationships is None:
+            return None, None
+        for rel in self._relationships.list_relationships(KnowledgeObjectType.LOG_SOURCE_APPLICATION, log_source_id):
+            if rel.relationship.relationship_type != RelationshipType.IMPLEMENTS_LOGGING_FOR:
+                continue
+            other = rel.to_object if rel.relationship.from_type == KnowledgeObjectType.LOG_SOURCE_APPLICATION else rel.from_object
+            if other.type == KnowledgeObjectType.COMPONENT:
+                return other.id, other.title
+        return None, None
 
     def _suggest_sql(self, entities: list[ExtractedEntity]) -> list[str]:
         entity_by_type = {e.entity_type: e for e in entities}

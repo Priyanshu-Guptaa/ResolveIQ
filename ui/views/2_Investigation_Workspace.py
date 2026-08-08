@@ -228,7 +228,12 @@ with center:
                     st.markdown(f"- **{rc['description']}** _(confidence {rc['confidence']:.0%})_")
                     st.caption(rc["rationale"])
 
-            render_recommended_log_collection(recommendation.get("recommended_logs", []))
+            navigate_to_component = render_recommended_log_collection(
+                recommendation.get("recommended_logs", []), investigation_id=investigation_id
+            )
+            if navigate_to_component:
+                st.session_state[f"pi_component_pending_{investigation_id}"] = navigate_to_component
+                st.rerun()
 
     with tab_playbook:
         st.caption(

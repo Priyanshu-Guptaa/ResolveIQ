@@ -240,7 +240,13 @@ def get_knowledge_engine() -> KnowledgeEngine:
 
 
 def get_recommendation_engine() -> RecommendationEngine:
-    return RecommendationEngine(_knowledge_engine_singleton(), get_settings(), _log_knowledge_repository())
+    return RecommendationEngine(
+        _knowledge_engine_singleton(),
+        get_settings(),
+        _log_knowledge_repository(),
+        _component_profile_repository(),
+        _knowledge_relationship_engine(),
+    )
 
 
 def get_product_intelligence_engine() -> ProductIntelligenceEngine:

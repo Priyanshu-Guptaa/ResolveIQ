@@ -38,10 +38,18 @@ class RecommendedLogCollectionItem(BaseModel):
     """
 
     priority_label: str
-    """"Critical" | "Recommended" | "Optional" -- derived from how
-    confidently the *scenario* matched the investigation (keyword match
-    strength, not an LLM judgment); the wiki itself carries no such
-    label."""
+    """"Critical" | "Recommended" | "Optional" -- Critical requires the
+    scenario's *technology* and *issue type* (``scenario_type``) to both
+    match the investigation text; Recommended is a technology-only full
+    match; Optional is a partial/single-keyword match. See
+    ``RecommendationEngine._recommend_logs`` -- keyword match strength,
+    never an LLM judgment."""
+    match_reason: str
+    """A one-line, deterministically-built explanation of *why this
+    scenario* was selected for this investigation (which matched
+    keywords drove the label) -- distinct from ``explanation``, which
+    explains this step's position in the message flow, not why the
+    scenario itself was recommended."""
     order: int
     """The wiki-preserved collection order within its scenario, 1 =
     first -- copied from ``LogCollectionStep.priority``."""
@@ -57,6 +65,19 @@ class RecommendedLogCollectionItem(BaseModel):
     filename_patterns: list[str] = Field(default_factory=list)
     log_source_id: str
     scenario_id: str
+    already_collected: bool = False
+    """True when a piece of already-uploaded evidence appears to be
+    this exact log (filename or component name match against the
+    investigation's own evidence titles) -- lets the guided workflow
+    skip straight to what's actually still missing instead of asking
+    for logs already in hand."""
+    linked_component_id: str | None = None
+    linked_component_name: str | None = None
+    """Set when this log source has a real, deterministic
+    IMPLEMENTS_LOGGING_FOR relationship to a Product Intelligence
+    Component Registry entry (Sprint 3, Phase 3.3/3.4 relationship
+    graph) -- lets the UI jump straight to that component's Architecture
+    Explorer profile. None when no such match exists; never guessed."""
 
 
 class Recommendation(BaseModel):
