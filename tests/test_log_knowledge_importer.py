@@ -164,6 +164,46 @@ def test_extract_log_entries_captures_inline_note():
     assert any("captures inbound events" in e.note for e in noted)
 
 
+_SAMPLE_WIKI_TEXT_WITH_FLOW_SUMMARY = """\
+RF Mesh workflow and log location
+
+Command
+Request
+(Outbound)
+Command Flow: Web UI  CommandProcessor  CommandPayloadProcessor  EventListener/AUTD  Service
+Logs:
+~\\Logs\\CommandProcessor\\logfile.log
+
+Command
+Response
+(Inbound)
+Response Flow: ReadingProcessorHost  MsgProcCmdRspHost  EventListener  Network
+Logs:
+~\\Logs\\MsgProcCmdRspHost\\logfile.log
+"""
+
+
+def test_extract_log_entries_scenario_label_survives_flow_summary_line():
+    """Real-document shape: short label fragments ("Command" / "Request"
+    / "(Outbound)"), then the scenario's arrow-chain summary line
+    ("Command Flow: ..."), then "Logs:". The summary line is always
+    longer than the label-fragment threshold and must not be treated as
+    ordinary overflow text that wipes the fragments collected just
+    before it -- every real scenario in the wiki has exactly this shape,
+    and before this fix every one of them silently collapsed to
+    "General"."""
+    entries = extract_log_entries(_SAMPLE_WIKI_TEXT_WITH_FLOW_SUMMARY)
+    outbound = [e for e in entries if e.scenario_type == "Command Request (Outbound)"]
+    assert len(outbound) == 1
+    assert outbound[0].path_text == "~\\Logs\\CommandProcessor\\logfile.log"
+
+    inbound = [e for e in entries if e.scenario_type == "Command Response (Inbound)"]
+    assert len(inbound) == 1
+    assert inbound[0].path_text == "~\\Logs\\MsgProcCmdRspHost\\logfile.log"
+
+    assert not any(e.scenario_type == "General" for e in entries)
+
+
 def test_extract_generic_log_dir_bug_is_fixed_end_to_end():
     """The EIC section's '/var/log/RemoteAccess.log' line must group
     under the EIC technology (its section fallback), never under a

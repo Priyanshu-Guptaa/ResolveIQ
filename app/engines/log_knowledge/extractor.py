@@ -241,11 +241,18 @@ def extract_log_entries(text: str) -> list[_RawLogEntry]:
             # The table's own "Workflow and Logs" column header also
             # matches this pattern (it contains "workflow" + "logs") but
             # has nothing before "workflow" -- it must never overwrite
-            # the real technology heading that came just before it.
+            # the real technology heading that came just before it. It
+            # still marks a genuine table-structure boundary though (it
+            # sits right before the first scenario row), so it must
+            # clear label_buffer even when tech is empty -- otherwise
+            # stray short lines between the technology heading and this
+            # column-header row (observed: a repeated "RF Mesh" cell and
+            # a "Type" column header) leak into the first scenario's
+            # label as a messy prefix.
             if tech:
                 current_technology = tech
                 current_scenario = "General"
-                label_buffer.clear()
+            label_buffer.clear()
             continue
 
         ref_match = _REFERENCE_HEADER_RE.match(stripped)
@@ -289,8 +296,21 @@ def extract_log_entries(text: str) -> list[_RawLogEntry]:
         # PDF export, e.g. "Command" / "Request" / "(Outbound)").
         if len(stripped) <= 40 and not stripped.lower().startswith("note"):
             label_buffer.append(stripped)
-        else:
+        elif _normalize_scenario_label(" ".join(label_buffer)) is None:
             label_buffer.clear()
+        # else: the fragments collected so far already resolve to a
+        # real scenario label (e.g. "Command" + "Request" +
+        # "(Outbound)" -> "Command Request (Outbound)"), and this long
+        # line is that scenario's arrow-chain flow summary -- confirmed
+        # structural content (sometimes prefixed "Command Flow:"/
+        # "Response Flow:", sometimes bare component names with no
+        # prefix at all, and sometimes wrapped across several such long
+        # physical lines by the PDF export) but never further label
+        # text. Leave label_buffer untouched rather than letting it
+        # clear the label already collected -- this was a real bug:
+        # every scenario in the document has this exact shape, and the
+        # flow summary previously wiped the label right before "Logs:"
+        # consumed it, collapsing the type to "General".
 
     return entries
 

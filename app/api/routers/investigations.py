@@ -8,7 +8,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
 
-from app.api.dependencies import get_investigation_engine, get_recommendation_engine
+from app.api.dependencies import get_investigation_engine, get_log_knowledge_repository, get_recommendation_engine
 from app.api.schemas import (
     AddNoteRequest,
     CreateInvestigationRequest,
@@ -23,13 +23,16 @@ from app.domain.investigation import (
     InvestigationListItem,
     InvestigationSession,
 )
+from app.domain.log_flow import CommandFlow, LogSearchResult
 from app.domain.recommendation import Recommendation
 from app.engines.investigation.engine import (
     EvidenceNotFoundError,
     InvestigationEngine,
     InvestigationNotFoundError,
 )
+from app.engines.log_intelligence import flow as log_flow
 from app.engines.recommendation.engine import RecommendationEngine
+from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository
 
 logger = logging.getLogger(__name__)
 
@@ -214,3 +217,46 @@ def get_recommendations(
     except InvestigationNotFoundError as exc:
         raise _not_found(exc) from exc
     return recommendation_engine.generate(investigation)
+
+
+@router.get("/{investigation_id}/log-search", response_model=LogSearchResult)
+def search_investigation_logs(
+    investigation_id: str,
+    entity_type: str | None = Query(None),
+    entity_value: str | None = Query(None),
+    keyword: str | None = Query(None),
+    level: str | None = Query(None),
+    investigation_engine: InvestigationEngine = Depends(get_investigation_engine),
+) -> LogSearchResult:
+    """Cross-file filter over every LOG_FILE evidence item's parsed
+    events -- replaces "pick one file, see every line in it" with an
+    actual search. At least one of entity_type/entity_value/keyword/
+    level is expected; an empty filter set just returns everything
+    (still capped), which isn't useful but isn't an error either."""
+    try:
+        investigation = investigation_engine.get_investigation(investigation_id)
+    except InvestigationNotFoundError as exc:
+        raise _not_found(exc) from exc
+    return log_flow.search_logs(investigation, entity_type=entity_type, entity_value=entity_value, keyword=keyword, level=level)
+
+
+@router.get("/{investigation_id}/log-flow", response_model=CommandFlow)
+def get_command_flow(
+    investigation_id: str,
+    entity_type: str = Query(...),
+    entity_value: str = Query(...),
+    investigation_engine: InvestigationEngine = Depends(get_investigation_engine),
+    log_knowledge_repo: LogKnowledgeRepository = Depends(get_log_knowledge_repository),
+) -> CommandFlow:
+    """Reconstructs the ordered, directional flow (Command Request
+    Outbound -> ... -> Meter, or Meter -> ... -> Command Response
+    Inbound) for one correlating value, grounded entirely in the
+    wiki-derived Log Intelligence Knowledge Base -- see
+    app/engines/log_intelligence/flow.py's docstring."""
+    try:
+        investigation = investigation_engine.get_investigation(investigation_id)
+    except InvestigationNotFoundError as exc:
+        raise _not_found(exc) from exc
+    return log_flow.reconstruct_flow(
+        investigation, entity_type=entity_type, entity_value=entity_value, log_knowledge_repo=log_knowledge_repo
+    )
