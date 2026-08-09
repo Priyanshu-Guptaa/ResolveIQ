@@ -133,10 +133,31 @@ with tab_upload:
 
     just_uploaded = st.session_state.get("km_just_uploaded") or []
     if just_uploaded:
+        # "Just uploaded" is a review queue for Draft/Under Review
+        # documents, not a permanent log -- a document that's been
+        # published (or archived) from here has served its purpose and
+        # should drop out, otherwise it lingers showing "Published"
+        # forever until the admin manually clears the whole list (the
+        # bug this pre-filter fixes). Re-fetched every render, including
+        # the rerun a Publish/Archive click itself triggers, so a
+        # just-published document is gone on the very next render --
+        # never rendered again, not even once more in its new status.
+        still_reviewing: list[str] = []
+        fetched: dict[str, dict] = {}
+        for document_id in just_uploaded:
+            document = api_get(f"/admin/knowledge/documents/{document_id}")
+            if document is not None and document["status"] in ("draft", "under_review"):
+                still_reviewing.append(document_id)
+                fetched[document_id] = document
+        if still_reviewing != just_uploaded:
+            st.session_state["km_just_uploaded"] = still_reviewing
+            just_uploaded = still_reviewing
+
+    if just_uploaded:
         st.divider()
         st.markdown("##### Just uploaded -- review before publishing")
         for document_id in just_uploaded:
-            render_document_detail(document_id, key_prefix=f"upload_{document_id}")
+            render_document_detail(document_id, key_prefix=f"upload_{document_id}", document=fetched.get(document_id))
             st.divider()
         if st.button("Clear this list", key="km_clear_uploaded"):
             st.session_state["km_just_uploaded"] = []

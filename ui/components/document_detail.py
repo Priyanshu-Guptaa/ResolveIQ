@@ -12,12 +12,22 @@ from api_client import api_get, api_patch, api_post, get_component_profiles_cach
 from components.document_status_badge import document_status_badge_html
 
 
-def render_document_detail(document_id: str, *, key_prefix: str | None = None) -> None:
+def render_document_detail(
+    document_id: str, *, key_prefix: str | None = None, document: dict | None = None
+) -> dict | None:
+    """Returns the (possibly just-fetched) document dict, or None if it
+    no longer exists -- callers that need to react to a status change
+    (e.g. Upload's "just uploaded" review queue, which should drop a
+    document once it's no longer Draft/Under Review) read the returned
+    status instead of re-fetching it themselves. Pass an already-fetched
+    ``document`` to skip the internal fetch entirely, for callers that
+    need the same document for other purposes on the same render."""
     prefix = key_prefix or document_id
-    document = api_get(f"/admin/knowledge/documents/{document_id}")
+    if document is None:
+        document = api_get(f"/admin/knowledge/documents/{document_id}")
     if document is None:
         st.warning("This document no longer exists.")
-        return
+        return None
 
     st.markdown(
         f"### {document['title']} &nbsp; {document_status_badge_html(document['status'])}",
@@ -113,3 +123,5 @@ def render_document_detail(document_id: str, *, key_prefix: str | None = None) -
         if action_cols[0].button("↩ Restore to Draft", key=f"{prefix}_restore", use_container_width=True):
             if api_post(f"/admin/knowledge/documents/{document_id}/restore") is not None:
                 st.rerun()
+
+    return document
