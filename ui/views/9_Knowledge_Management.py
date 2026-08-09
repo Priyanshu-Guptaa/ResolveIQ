@@ -116,14 +116,26 @@ with tab_upload:
         "that parses investigation evidence; every document starts as **Draft** and isn't "
         "searchable until you publish it below."
     )
-    uploaded_files = st.file_uploader(
-        "Upload documents",
-        type=["pdf", "docx", "pptx", "xlsx", "txt", "log", "json", "csv", "xml", "zip"],
-        accept_multiple_files=True,
-        key="km_uploader",
-        label_visibility="collapsed",
-    )
-    if uploaded_files and st.button("Upload & Extract", type="primary"):
+    # clear_on_submit=True is what actually empties the file_uploader's
+    # own staged-file list after a successful upload -- a bare
+    # st.file_uploader (outside a form) keeps whatever was selected
+    # across reruns indefinitely, with no built-in way to clear it from
+    # a plain st.button click. Without this, an already-uploaded (and
+    # possibly already-published) file stayed staged in the widget, so
+    # adding a new file for a second upload silently re-included it --
+    # clicking "Upload & Extract" would have re-uploaded it as a
+    # duplicate draft.
+    with st.form("km_upload_form", clear_on_submit=True):
+        uploaded_files = st.file_uploader(
+            "Upload documents",
+            type=["pdf", "docx", "pptx", "xlsx", "txt", "log", "json", "csv", "xml", "zip"],
+            accept_multiple_files=True,
+            key="km_uploader",
+            label_visibility="collapsed",
+        )
+        submitted = st.form_submit_button("Upload & Extract", type="primary")
+
+    if submitted and uploaded_files:
         files_payload = [("files", (f.name, f.getvalue())) for f in uploaded_files]
         results = api_post("/admin/knowledge/documents/upload", files=files_payload, timeout=300)
         if results is not None:
