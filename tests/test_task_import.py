@@ -22,7 +22,12 @@ from app.engines.knowledge_object_framework.adapters import build_adapters
 from app.engines.knowledge_object_framework.service import KnowledgeObjectService
 from app.engines.knowledge.engine import KnowledgeEngine
 from app.engines.knowledge_relationships.engine import KnowledgeRelationshipEngine
-from app.engines.task_import.extractors import extract_from_json_bytes, extract_from_xlsx_bytes, extract_tasks
+from app.engines.task_import.extractors import (
+    extract_from_csv_bytes,
+    extract_from_json_bytes,
+    extract_from_xlsx_bytes,
+    extract_tasks,
+)
 from app.engines.task_import.importer import TaskImporter
 from app.infrastructure.db.component_repository import SqlAlchemyComponentProfileRepository
 from app.infrastructure.db.knowledge_repository import SqlAlchemyKnowledgeRepository
@@ -223,6 +228,90 @@ def test_xlsx_extractor_falls_back_to_work_notes_when_comments_column_empty():
     assert records[0].resolution == "Resolved via work notes"
 
 
+# --- CSV extraction -----------------------------------------------------------
+
+
+def _csv_bytes(header: list[str], rows: list[list], *, bom: bool = False) -> bytes:
+    import csv as _csv
+
+    buf = io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(header)
+    for row in rows:
+        writer.writerow(row)
+    text = buf.getvalue()
+    return ("﻿" + text if bom else text).encode("utf-8")
+
+
+def test_csv_extractor_maps_fields_correctly():
+    raw = _csv_bytes(
+        _XLSX_HEADER,
+        [
+            [
+                "TASK0500163", "3 - Moderate", "Closed Complete", "Vivek Jindal", "Noida",
+                "CC - Check Kafka", "Incident Task", "2026-08-04", "",
+                "Restarted the service, lag cleared", "Kafka consumer lag alert", "Restarted the service, lag cleared",
+            ]
+        ],
+    )
+    records = extract_from_csv_bytes(raw)
+    assert len(records) == 1
+    r = records[0]
+    assert r.ticket_number == "TASK0500163"
+    assert r.title == "CC - Check Kafka"
+    assert r.description == "Kafka consumer lag alert"
+    assert r.resolution == "Restarted the service, lag cleared"
+    assert r.priority == "3 - Moderate"
+    assert r.state == "Closed Complete"
+    assert "assignee:Vivek Jindal" in r.extra_tags
+    assert "location:Noida" in r.extra_tags
+    assert "type:Incident Task" in r.extra_tags
+
+
+def test_csv_extractor_strips_leading_byte_order_mark():
+    """Excel's own "Save As CSV (UTF-8)" writes a BOM -- must not end
+    up glued onto the first header name (which would silently break
+    that column's lookup)."""
+    raw = _csv_bytes(
+        _XLSX_HEADER,
+        [["TASK0777", "3", "Closed", "A", "X", "Title", "Task", "", "", "Fixed it", "desc", "Fixed it"]],
+        bom=True,
+    )
+    records = extract_from_csv_bytes(raw)
+    assert len(records) == 1
+    assert records[0].ticket_number == "TASK0777"
+
+
+def test_csv_extractor_skips_rows_without_resolution():
+    raw = _csv_bytes(
+        _XLSX_HEADER,
+        [
+            ["TASK0001", "3", "Closed", "A", "X", "No resolution", "Task", "", "", "", "desc", ""],
+            ["TASK0002", "3", "Closed", "A", "X", "Has resolution", "Task", "", "", "Fixed", "desc", "Fixed"],
+        ],
+    )
+    records = extract_from_csv_bytes(raw)
+    assert len(records) == 1
+    assert records[0].ticket_number == "TASK0002"
+
+
+def test_csv_extractor_falls_back_to_work_notes_when_comments_column_empty():
+    raw = _csv_bytes(
+        _XLSX_HEADER,
+        [["TASK0003", "3", "Closed", "A", "X", "Title", "Task", "", "", "", "desc", "Resolved via work notes"]],
+    )
+    records = extract_from_csv_bytes(raw)
+    assert len(records) == 1
+    assert records[0].resolution == "Resolved via work notes"
+
+
+def test_extract_tasks_dispatches_csv_by_extension():
+    raw = _csv_bytes(_XLSX_HEADER, [["TASK0009", "3", "Closed", "A", "X", "T", "Task", "", "", "Fixed", "d", "Fixed"]])
+    records = extract_tasks("export.csv", raw)
+    assert len(records) == 1
+    assert records[0].ticket_number == "TASK0009"
+
+
 def _corrupt_xlsx_dimension(xlsx_bytes: bytes, *, stale_ref: str = "A1:A1") -> bytes:
     """Same real-world failure mode fixed in xlsx_parser.py -- proves
     this extractor's own openpyxl call (read_only=False) is immune."""
@@ -257,8 +346,11 @@ def test_extract_tasks_dispatches_by_extension():
     xlsx_raw = _xlsx_bytes(_XLSX_HEADER, [["T2", "3", "Closed", "A", "X", "y", "Task", None, None, "fixed", "d", "fixed"]])
     assert len(extract_tasks("export.xlsx", xlsx_raw)) == 1
 
+    csv_raw = _csv_bytes(_XLSX_HEADER, [["T3", "3", "Closed", "A", "X", "y", "Task", "", "", "fixed", "d", "fixed"]])
+    assert len(extract_tasks("export.csv", csv_raw)) == 1
+
     with pytest.raises(ValueError):
-        extract_tasks("export.csv", b"")
+        extract_tasks("export.pdf", b"")
 
 
 # --- TaskImporter: duplicate detection / row mapping / indexing ------------

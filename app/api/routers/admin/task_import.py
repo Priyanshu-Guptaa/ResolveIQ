@@ -34,8 +34,8 @@ async def import_tasks(
     actor: str = "admin",
     importer: TaskImporter = Depends(get_task_importer),
 ) -> TaskImportSummary:
-    """Accepts one .json or .xlsx ServiceNow task export. Every row
-    becomes its own Historical Investigation (never a single blob
+    """Accepts one .json, .xlsx, or .csv ServiceNow task export. Every
+    row becomes its own Historical Investigation (never a single blob
     document) -- duplicate detection, versioning, and search indexing
     all reuse existing machinery (see importer.py's docstring)."""
     filename = file.filename or "upload"

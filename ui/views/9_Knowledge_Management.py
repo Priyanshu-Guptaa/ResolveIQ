@@ -135,13 +135,22 @@ with tab_upload:
         )
         submitted = st.form_submit_button("Upload & Extract", type="primary")
 
-    if submitted and uploaded_files:
-        files_payload = [("files", (f.name, f.getvalue())) for f in uploaded_files]
-        results = api_post("/admin/knowledge/documents/upload", files=files_payload, timeout=300)
-        if results is not None:
-            st.success(f"Created {len(results)} draft document(s) -- review them below before publishing.")
-            st.session_state["km_just_uploaded"] = [r["document"]["id"] for r in results]
-            st.rerun()
+    if submitted:
+        if not uploaded_files:
+            # Previously a silent no-op -- clicking "Upload & Extract"
+            # with nothing selected just reran the page with no
+            # indication anything was wrong. This is the visible
+            # feedback for that case; api_post already surfaces a
+            # visible st.error for a genuine request failure, so this
+            # covers the one path that had none.
+            st.warning("Select at least one file before uploading.")
+        else:
+            files_payload = [("files", (f.name, f.getvalue())) for f in uploaded_files]
+            results = api_post("/admin/knowledge/documents/upload", files=files_payload, timeout=300)
+            if results is not None:
+                st.success(f"Created {len(results)} draft document(s) -- review them below before publishing.")
+                st.session_state["km_just_uploaded"] = [r["document"]["id"] for r in results]
+                st.rerun()
 
     just_uploaded = st.session_state.get("km_just_uploaded") or []
     if just_uploaded:

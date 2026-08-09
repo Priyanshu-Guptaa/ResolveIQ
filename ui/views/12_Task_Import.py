@@ -1,6 +1,6 @@
-"""Task Import -- decomposes a ServiceNow task export (JSON or XLSX)
-directly into individual Historical Investigation records, one per
-row, instead of one searchable blob document. See
+"""Task Import -- decomposes a ServiceNow task export (JSON, XLSX, or
+CSV) directly into individual Historical Investigation records, one
+per row, instead of one searchable blob document. See
 ``app/engines/task_import/importer.py`` for why this is a separate
 pipeline from Knowledge Management's document upload.
 
@@ -22,7 +22,7 @@ from theme import inject_theme
 inject_theme()
 st.title("📥 Task Import")
 st.caption(
-    "Administration · imports a ServiceNow task export (.json or .xlsx) as individual Historical "
+    "Administration · imports a ServiceNow task export (.json, .xlsx, or .csv) as individual Historical "
     "Investigation records -- each row becomes its own searchable, linkable record, not one giant blob "
     "document."
 )
@@ -33,12 +33,13 @@ tab_import, tab_archive = st.tabs(["📥 Import", "🗄️ Archive Original Sour
 # === Import ================================================================
 with tab_import:
     st.markdown(
-        "Upload a **.json** or **.xlsx** export. Only rows with a captured resolution are imported -- "
-        "everything else is skipped (nothing to teach the Recommendation Engine without one). Re-uploading "
-        "the same file, or a file with overlapping tickets, is safe: already-imported tickets are detected "
-        "by number and only updated if their content actually changed."
+        "Upload a **.json**, **.xlsx**, or **.csv** export. Only rows with a captured resolution are "
+        "imported -- everything else is skipped (nothing to teach the Recommendation Engine without one). "
+        "Re-uploading the same file, or a file with overlapping tickets, is safe: already-imported tickets "
+        "are detected by number and only updated if their content actually changed -- upload your full "
+        "running case list each time and only genuinely new or changed tickets are added."
     )
-    uploaded = st.file_uploader("Task export", type=["json", "xlsx", "xlsm"], key="task_import_uploader")
+    uploaded = st.file_uploader("Task export", type=["json", "xlsx", "xlsm", "csv"], key="task_import_uploader")
     actor = st.text_input("Imported by", value="admin", key="task_import_actor")
 
     if uploaded and st.button("Import", type="primary"):

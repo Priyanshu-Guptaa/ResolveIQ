@@ -21,10 +21,12 @@ search relevance.
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 import logging
 from pathlib import Path
+from typing import Iterable, Sequence
 
 from app.domain.task_import import TaskRecord
 
@@ -42,7 +44,9 @@ def extract_tasks(filename: str, content: bytes) -> list[TaskRecord]:
         return extract_from_json_bytes(content)
     if suffix in (".xlsx", ".xlsm"):
         return extract_from_xlsx_bytes(content)
-    raise ValueError(f"Unsupported task import format: {suffix or 'no extension'} (expected .json or .xlsx)")
+    if suffix == ".csv":
+        return extract_from_csv_bytes(content)
+    raise ValueError(f"Unsupported task import format: {suffix or 'no extension'} (expected .json, .xlsx, or .csv)")
 
 
 def extract_from_json_bytes(content: bytes) -> list[TaskRecord]:
@@ -100,28 +104,16 @@ _XLSX_LOCATION_COL = "Location"
 _XLSX_TASK_TYPE_COL = "Task type"
 
 
-def extract_from_xlsx_bytes(content: bytes) -> list[TaskRecord]:
-    from openpyxl import load_workbook
-
-    # read_only=False deliberately -- see xlsx_parser.py's docstring:
-    # openpyxl's read_only streaming mode trusts a workbook's declared
-    # <dimension> XML element, which real-world exports (this exact
-    # ServiceNow report export included) can leave stale, silently
-    # truncating iteration to a tiny fraction of the real data.
-    workbook = load_workbook(io.BytesIO(content), data_only=True, read_only=False)
-    if not workbook.worksheets:
-        return []
-    sheet = workbook.worksheets[0]
-
-    rows = sheet.iter_rows(values_only=True)
-    try:
-        header_row = next(rows)
-    except StopIteration:
-        return []
-    header = [str(cell).strip() if cell is not None else "" for cell in header_row]
+def _rows_to_records(rows: Iterable[Sequence], header: list[str]) -> list[TaskRecord]:
+    """Shared by the XLSX and CSV extractors -- both are the same
+    ServiceNow report shape (identical column names), just two
+    different export formats for it. Only how rows are produced
+    differs (openpyxl cells vs. a csv.reader); this is everything after
+    that: column lookup, the resolution-column fallback, tagging, and
+    the "only rows with a captured resolution" filter."""
     col_index = {name: i for i, name in enumerate(header)}
 
-    def cell(row: tuple, column_name: str) -> str:
+    def cell(row: Sequence, column_name: str) -> str:
         idx = col_index.get(column_name)
         if idx is None or idx >= len(row):
             return ""
@@ -160,3 +152,43 @@ def extract_from_xlsx_bytes(content: bytes) -> list[TaskRecord]:
             )
         )
     return records
+
+
+def extract_from_xlsx_bytes(content: bytes) -> list[TaskRecord]:
+    from openpyxl import load_workbook
+
+    # read_only=False deliberately -- see xlsx_parser.py's docstring:
+    # openpyxl's read_only streaming mode trusts a workbook's declared
+    # <dimension> XML element, which real-world exports (this exact
+    # ServiceNow report export included) can leave stale, silently
+    # truncating iteration to a tiny fraction of the real data.
+    workbook = load_workbook(io.BytesIO(content), data_only=True, read_only=False)
+    if not workbook.worksheets:
+        return []
+    sheet = workbook.worksheets[0]
+
+    rows = sheet.iter_rows(values_only=True)
+    try:
+        header_row = next(rows)
+    except StopIteration:
+        return []
+    header = [str(cell).strip() if cell is not None else "" for cell in header_row]
+    return _rows_to_records(rows, header)
+
+
+def extract_from_csv_bytes(content: bytes) -> list[TaskRecord]:
+    """Same ServiceNow report, exported as CSV instead of XLSX -- same
+    column names, so this reuses _rows_to_records rather than
+    reimplementing the mapping. utf-8-sig strips a leading byte-order
+    mark, which Excel's own "Save As CSV" writes and plain utf-8
+    decoding would otherwise leave as a stray character glued onto the
+    first header name."""
+    text = content.decode("utf-8-sig", errors="replace")
+    reader = csv.reader(io.StringIO(text))
+    rows = iter(reader)
+    try:
+        header_row = next(rows)
+    except StopIteration:
+        return []
+    header = [cell.strip() for cell in header_row]
+    return _rows_to_records(rows, header)
