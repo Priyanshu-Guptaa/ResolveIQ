@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import streamlit as st
 
+from components.historical_match import render_historical_match
 from components.recommended_log_collection import render_recommended_log_collection
+from formatting import truncate_words
 
 _STAGE_DISPLAY = {
     "triage": ("🆕", "Triage"),
@@ -86,19 +88,19 @@ def render_investigation_strategy(strategy: dict, *, investigation_id: str) -> s
     historical = strategy["historical_investigations"]
     if historical:
         with st.expander(f"📊 Historical investigations ({len(historical)})", expanded=False):
-            for match in historical[:5]:
-                st.markdown(f"**{match['title'][:60]}** _({match['score']:.0%})_")
+            for i, match in enumerate(historical[:5]):
+                render_historical_match(match, key=f"strategy_hist_{investigation_id}_{i}")
 
     known_bugs = strategy["known_bugs"]
     if known_bugs:
         with st.expander(f"🐞 Known bugs ({len(known_bugs)})", expanded=False):
             for bug in known_bugs[:5]:
-                st.markdown(f"**{bug['title'][:60]}**")
+                st.markdown(f"**{truncate_words(bug['title'])}**")
 
     documentation = strategy["documentation"]
     if documentation:
         with st.expander(f"📚 Documentation ({len(documentation)})", expanded=False):
             for doc in documentation[:5]:
-                st.markdown(f"**{doc['title'][:60]}**")
+                st.markdown(f"**{truncate_words(doc['title'])}**")
 
     return navigate_to_component

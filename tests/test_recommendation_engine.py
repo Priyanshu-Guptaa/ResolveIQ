@@ -439,6 +439,75 @@ def test_already_collected_not_inferred_from_a_generic_filename_shared_by_many_s
     assert recommendation.recommended_logs[0].already_collected is False
 
 
+# --- Log Intelligence: manual technology browse ------------------------------
+
+
+def test_logs_for_technology_returns_every_scenario_for_that_technology_regardless_of_issue_text():
+    """The manual counterpart to _recommend_logs(): issue-type text is
+    irrelevant here on purpose -- covers the real gap automatic
+    matching can't (e.g. a "Data Extract" issue when the Knowledge Base
+    has no Data Extract scenario_type at all)."""
+    outbound = _make_scenario("sc-1", "RF Mesh IP", "Command Request (Outbound)", [_make_step("src-a", "A", 1)])
+    inbound = _make_scenario("sc-2", "RF Mesh IP", "Command Response (Inbound)", [_make_step("src-b", "B", 1)])
+    other_tech = _make_scenario("sc-3", "Wi-Sun", "Events", [_make_step("src-c", "C", 1)])
+    log_repo = FakeLogKnowledgeRepo(
+        [outbound, inbound, other_tech], [_make_source("src-a", "A"), _make_source("src-b", "B"), _make_source("src-c", "C")]
+    )
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    investigation = _investigation_with_evidence("Interval Data Extract for all meters is empty")
+    items = engine.logs_for_technology(investigation, "RF Mesh IP")
+
+    assert {item.component_name for item in items} == {"A", "B"}
+    assert all(item.priority_label == "Browsed" for item in items)
+
+
+def test_logs_for_technology_matches_case_insensitively():
+    scenario = _make_scenario("sc-1", "RF Mesh IP", "General", [_make_step("src-a", "A", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-a", "A")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    items = engine.logs_for_technology(_investigation_with_evidence("x"), "rf mesh ip")
+
+    assert len(items) == 1
+
+
+def test_logs_for_technology_empty_for_unknown_technology():
+    scenario = _make_scenario("sc-1", "RF Mesh IP", "General", [_make_step("src-a", "A", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-a", "A")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    items = engine.logs_for_technology(_investigation_with_evidence("x"), "Gas Meter")
+
+    assert items == []
+
+
+def test_logs_for_technology_empty_when_no_log_knowledge_repo():
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), None)
+
+    items = engine.logs_for_technology(_investigation_with_evidence("x"), "RF Mesh IP")
+
+    assert items == []
+
+
+def test_available_log_technologies_lists_distinct_real_technologies():
+    scenarios = [
+        _make_scenario("sc-1", "RF Mesh IP", "Command Request (Outbound)", [_make_step("src-a", "A", 1)]),
+        _make_scenario("sc-2", "RF Mesh IP", "Command Response (Inbound)", [_make_step("src-a", "A", 1)]),
+        _make_scenario("sc-3", "Wi-Sun", "General", [_make_step("src-a", "A", 1)]),
+    ]
+    log_repo = FakeLogKnowledgeRepo(scenarios, [_make_source("src-a", "A")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+
+    assert engine.available_log_technologies() == ["RF Mesh IP", "Wi-Sun"]
+
+
+def test_available_log_technologies_empty_when_no_log_knowledge_repo():
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), None)
+
+    assert engine.available_log_technologies() == []
+
+
 # --- Log Intelligence: Product Intelligence integration ----------------------
 
 

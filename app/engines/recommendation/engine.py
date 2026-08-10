@@ -55,6 +55,10 @@ logger = logging.getLogger(__name__)
 _PRIORITY_CRITICAL = "Critical"
 _PRIORITY_RECOMMENDED = "Recommended"
 _PRIORITY_OPTIONAL = "Optional"
+_PRIORITY_BROWSED = "Browsed"
+"""Not a real priority -- labels items from ``logs_for_technology()``'s
+manual technology browse, which was never scored against the
+investigation's issue text at all (see that method's docstring)."""
 
 _FULL_MATCH_SCORE = 1.0
 _PARTIAL_MATCH_SCORE = 0.5
@@ -474,6 +478,50 @@ class RecommendationEngine:
             if len(items) >= _MAX_RECOMMENDED_LOG_ITEMS:
                 break
         return items[:_MAX_RECOMMENDED_LOG_ITEMS]
+
+    def logs_for_technology(
+        self, investigation: InvestigationSession, technology: str
+    ) -> list[RecommendedLogCollectionItem]:
+        """Every documented scenario for exactly one technology,
+        regardless of what the investigation's own text says -- the
+        manual counterpart to ``_recommend_logs()``'s automatic
+        technology+issue-type matching, for the real case that matching
+        can't cover: the Log Intelligence Knowledge Base has no
+        scenario_type at all for the actual operation under
+        investigation (e.g. a data-extract job, not a meter command
+        flow), so automatic matching has nothing relevant to surface no
+        matter how the issue is worded. Same conservative
+        already-collected detection, same per-step data -- just no
+        issue-type filter and no priority ranking, since nothing here
+        was actually matched to anything."""
+        if self._log_knowledge is None:
+            return []
+        technology = technology.strip()
+        if not technology:
+            return []
+
+        evidence_titles = _evidence_titles(investigation)
+        reason = (
+            f'Technology filter: every documented scenario for "{technology}" -- not matched to this '
+            "investigation's issue type, since it was explicitly browsed rather than auto-matched."
+        )
+        items: list[RecommendedLogCollectionItem] = []
+        for scenario in self._log_knowledge.list_scenarios():
+            if scenario.technology.strip().lower() != technology.lower():
+                continue
+            items.extend(self._scenario_items(scenario, _PRIORITY_BROWSED, reason, evidence_titles))
+            if len(items) >= _MAX_RECOMMENDED_LOG_ITEMS:
+                break
+        return items[:_MAX_RECOMMENDED_LOG_ITEMS]
+
+    def available_log_technologies(self) -> list[str]:
+        """Distinct technology names actually present in the Log
+        Intelligence Knowledge Base -- real imported data, not a
+        hardcoded list of the technologies this product happens to
+        support today."""
+        if self._log_knowledge is None:
+            return []
+        return sorted({s.technology for s in self._log_knowledge.list_scenarios() if s.technology.strip()})
 
     def _scenario_items(
         self,

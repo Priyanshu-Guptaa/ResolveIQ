@@ -22,15 +22,27 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 
-from app.api.dependencies import get_file_type_registry, get_log_wiki_importer
+from app.api.dependencies import get_file_type_registry, get_log_wiki_importer, get_recommendation_engine
 from app.domain.log_intelligence_kb import LogWikiImportSummary
 from app.engines.ingestion.file_type_registry import FileTypeRegistry
 from app.engines.log_knowledge.extractor import extract
 from app.engines.log_knowledge.importer import LogWikiImporter
+from app.engines.recommendation.engine import RecommendationEngine
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/log-knowledge", tags=["admin-log-knowledge"])
+
+
+@router.get("/technologies", response_model=list[str])
+def list_technologies(
+    recommendation_engine: RecommendationEngine = Depends(get_recommendation_engine),
+) -> list[str]:
+    """Distinct technology names actually present in the Log
+    Intelligence Knowledge Base -- backs the Recommended Log
+    Collection section's manual "browse by technology" filter (real
+    imported data, never a hardcoded technology list)."""
+    return recommendation_engine.available_log_technologies()
 
 
 @router.post("/import", response_model=LogWikiImportSummary, status_code=201)

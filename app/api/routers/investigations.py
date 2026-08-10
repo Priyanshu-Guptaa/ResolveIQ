@@ -24,7 +24,7 @@ from app.domain.investigation import (
     InvestigationSession,
 )
 from app.domain.log_flow import CommandFlow, LogSearchResult
-from app.domain.recommendation import Recommendation
+from app.domain.recommendation import Recommendation, RecommendedLogCollectionItem
 from app.engines.investigation.engine import (
     EvidenceNotFoundError,
     InvestigationEngine,
@@ -217,6 +217,27 @@ def get_recommendations(
     except InvestigationNotFoundError as exc:
         raise _not_found(exc) from exc
     return recommendation_engine.generate(investigation)
+
+
+@router.get("/{investigation_id}/log-collection", response_model=list[RecommendedLogCollectionItem])
+def browse_log_collection_for_technology(
+    investigation_id: str,
+    technology: str = Query(...),
+    investigation_engine: InvestigationEngine = Depends(get_investigation_engine),
+    recommendation_engine: RecommendationEngine = Depends(get_recommendation_engine),
+) -> list[RecommendedLogCollectionItem]:
+    """Manual counterpart to the automatic ``recommended_logs`` on
+    ``/recommendations`` -- every documented scenario for one technology,
+    not filtered by the investigation's described issue type. See
+    ``RecommendationEngine.logs_for_technology``'s docstring for why
+    this exists (the automatic matcher has nothing to offer when the
+    Knowledge Base has no scenario for the actual operation under
+    investigation, e.g. a data-extract job)."""
+    try:
+        investigation = investigation_engine.get_investigation(investigation_id)
+    except InvestigationNotFoundError as exc:
+        raise _not_found(exc) from exc
+    return recommendation_engine.logs_for_technology(investigation, technology)
 
 
 @router.get("/{investigation_id}/log-search", response_model=LogSearchResult)

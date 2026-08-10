@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import streamlit as st
 from api_client import api_get, ensure_api_available, search_knowledge_cached
+from components.historical_match import render_historical_match
 from context import get_active_investigation_id
 from theme import inject_theme
 
@@ -32,9 +33,8 @@ if investigation_id:
         recommendation = api_get(f"/investigations/{investigation_id}/recommendations")
         if recommendation and recommendation["similar_investigations"]:
             st.subheader("Similar to this investigation")
-            for m in recommendation["similar_investigations"]:
-                st.markdown(f"**{m['title']}** _({m['score']:.0%} similarity)_")
-                st.caption(m["snippet"])
+            for i, m in enumerate(recommendation["similar_investigations"]):
+                render_historical_match(m, key=f"histpage_sim_{investigation_id}_{i}")
             st.divider()
 
 st.subheader("Search all historical investigations")
@@ -43,11 +43,8 @@ if query.strip():
     results = search_knowledge_cached(query, collection="historical_investigations", top_k=10) or []
     if not results:
         st.caption("No matches.")
-    for r in results:
-        st.markdown(f"**{r['title']}** _({r['score']:.0%} similarity)_")
-        st.caption(r["snippet"])
-        if r["metadata"].get("root_cause"):
-            st.caption(f"Root cause: {r['metadata']['root_cause']}")
+    for i, r in enumerate(results):
+        render_historical_match(r, key=f"histpage_search_{i}")
         st.divider()
 else:
     st.info("Type a search term above.")
