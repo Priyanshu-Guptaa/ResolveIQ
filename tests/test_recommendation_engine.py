@@ -630,6 +630,37 @@ def test_strategy_is_always_populated_even_for_empty_investigation():
     assert recommendation.strategy.progress == 0.0
 
 
+def test_strategy_tfs_and_wiki_matches_stay_none_without_external_knowledge_service():
+    """Backward compatibility: RecommendationEngine still works exactly
+    as before when no ExternalKnowledgeService is injected -- the
+    field stays None, not an empty/failed result."""
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    recommendation = engine.generate(InvestigationSession(title="Some investigation"))
+
+    assert recommendation.strategy.tfs_matches is None
+    assert recommendation.strategy.wiki_matches is None
+
+
+def test_strategy_populates_tfs_and_wiki_matches_when_service_provided():
+    from app.domain.external_knowledge import ExternalKnowledgeResult, ExternalSource
+
+    class FakeExternalKnowledgeService:
+        def gather(self, investigation, entities, matched_component, technology):
+            return (
+                ExternalKnowledgeResult(source=ExternalSource.TFS, available=True, query_summary="test"),
+                ExternalKnowledgeResult(source=ExternalSource.WIKI, available=False, error="Wiki is not configured."),
+            )
+
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), external_knowledge=FakeExternalKnowledgeService()
+    )
+    recommendation = engine.generate(InvestigationSession(title="Some investigation"))
+
+    assert recommendation.strategy.tfs_matches.available is True
+    assert recommendation.strategy.wiki_matches.available is False
+    assert recommendation.strategy.wiki_matches.error == "Wiki is not configured."
+
+
 def test_strategy_stage_is_evidence_collection_when_logs_missing():
     from app.domain.log_intelligence_kb import LogCollectionScenario, LogCollectionStep, LogRepositoryLocation, LogSourceApplication
 

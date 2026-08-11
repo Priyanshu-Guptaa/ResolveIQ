@@ -32,6 +32,11 @@ from app.engines.log_intelligence.log_parser import GenericLogParser, LogParser
 from app.engines.log_knowledge.importer import LogWikiImporter
 from app.engines.product_intelligence.component_registry import ComponentRegistry
 from app.engines.product_intelligence.engine import ProductIntelligenceEngine
+from app.engines.external_knowledge.service import ExternalKnowledgeService
+from app.engines.external_knowledge.tfs_connector import TfsConnector
+from app.engines.external_knowledge.tfs_rest_client import TfsRestConnector
+from app.engines.external_knowledge.wiki_connector import WikiConnector
+from app.engines.external_knowledge.wiki_rest_client import WikiRestConnector
 from app.engines.recommendation.engine import RecommendationEngine
 from app.engines.sql_library.engine import SqlLibraryEngine
 from app.engines.task_import.importer import TaskImporter
@@ -239,6 +244,41 @@ def get_knowledge_engine() -> KnowledgeEngine:
     return _knowledge_engine_singleton()
 
 
+@lru_cache
+def _tfs_connector() -> TfsConnector:
+    settings = get_settings()
+    return TfsRestConnector(
+        base_url=settings.tfs_base_url,
+        project=settings.tfs_project,
+        timeout_seconds=settings.external_knowledge_timeout_seconds,
+    )
+
+
+@lru_cache
+def _wiki_connector() -> WikiConnector:
+    settings = get_settings()
+    return WikiRestConnector(
+        base_url=settings.wiki_base_url,
+        username=settings.wiki_api_username,
+        api_token=settings.wiki_api_token,
+        space_key=settings.wiki_space_key,
+        timeout_seconds=settings.external_knowledge_timeout_seconds,
+    )
+
+
+@lru_cache
+def _external_knowledge_service() -> ExternalKnowledgeService:
+    return ExternalKnowledgeService(
+        tfs_connector=_tfs_connector(),
+        wiki_connector=_wiki_connector(),
+        settings=get_settings(),
+    )
+
+
+def get_external_knowledge_service() -> ExternalKnowledgeService:
+    return _external_knowledge_service()
+
+
 def get_recommendation_engine() -> RecommendationEngine:
     return RecommendationEngine(
         _knowledge_engine_singleton(),
@@ -247,6 +287,7 @@ def get_recommendation_engine() -> RecommendationEngine:
         _component_profile_repository(),
         _knowledge_relationship_engine(),
         _sql_library_engine(),
+        _external_knowledge_service(),
     )
 
 

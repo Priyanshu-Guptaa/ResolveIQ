@@ -41,10 +41,12 @@ from app.domain.recommendation import (
     SuggestedSqlItem,
 )
 from app.engines.knowledge.engine import KnowledgeEngine
+from app.engines.shared.text_matching import keyword_match_score
 
 if TYPE_CHECKING:
     from app.domain.evidence import Evidence
     from app.domain.log_intelligence_kb import LogCollectionScenario, LogSourceApplication
+    from app.engines.external_knowledge.service import ExternalKnowledgeService
     from app.engines.knowledge_relationships.engine import KnowledgeRelationshipEngine
     from app.engines.sql_library.engine import SqlLibraryEngine
     from app.infrastructure.db.component_repository import ComponentProfileRepository
@@ -103,29 +105,13 @@ record); this cap only bounds what's echoed inline."""
 
 
 def _keyword_match_score(keyword: str, context: str) -> float:
-    """1.0 for the full phrase (technology name or scenario type)
-    appearing verbatim (word-boundary-safe) in the investigation text;
-    0.5 if only a significant individual word from a multi-word phrase
-    appears (e.g. investigation mentions "Mesh" but not the full
-    "RF Mesh" phrase, or "timeout" but not "Command Response"); 0.0
-    otherwise. Shared by both the technology and issue-type (scenario
-    type) matching passes -- same rule, different field."""
-    phrase = keyword.strip()
-    if not phrase:
-        return 0.0
-    # (?<!\w)...(?!\w), not \b...\b: several real scenario_type/technology
-    # names end in punctuation (e.g. "Command Request (Outbound)") -- a
-    # closing paren followed by a space is NOT a \b (neither side is a
-    # word character), so plain \b anchors silently never match those
-    # phrases at all. The lookaround form only cares that the phrase
-    # isn't glued directly onto another word character, which is what
-    # "whole phrase" actually means regardless of what punctuation borders it.
-    if re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", context, re.IGNORECASE):
-        return _FULL_MATCH_SCORE
-    words = [w for w in re.findall(r"[A-Za-z]+", phrase) if len(w) >= _MIN_KEYWORD_WORD_LEN]
-    if any(re.search(rf"\b{re.escape(w)}\b", context, re.IGNORECASE) for w in words):
-        return _PARTIAL_MATCH_SCORE
-    return 0.0
+    """Thin re-export -- the real implementation moved to
+    ``app.engines.shared.text_matching.keyword_match_score`` so
+    ``app.engines.external_knowledge.ranking`` (TFS/Wiki live search)
+    reuses the exact same, already-fixed logic instead of a second
+    copy. Kept as a module-level function here (not just an import
+    alias) so every existing call site in this file is unchanged."""
+    return keyword_match_score(keyword, context, min_word_len=_MIN_KEYWORD_WORD_LEN)
 
 
 def _match_reason(scenario: "LogCollectionScenario", tech_score: float, type_score: float) -> str:
@@ -256,6 +242,7 @@ class RecommendationEngine:
         component_repo: "ComponentProfileRepository | None" = None,
         relationship_engine: "KnowledgeRelationshipEngine | None" = None,
         sql_library: "SqlLibraryEngine | None" = None,
+        external_knowledge: "ExternalKnowledgeService | None" = None,
     ) -> None:
         self._knowledge = knowledge_engine
         self._settings = settings
@@ -263,6 +250,14 @@ class RecommendationEngine:
         self._components = component_repo
         self._relationships = relationship_engine
         self._sql_library = sql_library
+        self._external_knowledge = external_knowledge
+        """None in older call sites/tests -- tfs_matches/wiki_matches
+        stay None on the resulting Strategy in that case (see
+        InvestigationStrategy's docstring for that field). A configured
+        ExternalKnowledgeService always populates both fields, even
+        when the underlying connector is unreachable (available=False),
+        since External Knowledge itself being present is a build-time
+        fact, not a per-request one."""
 
     def generate(self, investigation: InvestigationSession) -> Recommendation:
         query_text = investigation.context_text
@@ -613,6 +608,12 @@ class RecommendationEngine:
         stage, stage_rationale = self._current_stage(investigation, missing_evidence, root_causes)
         progress, progress_summary = self._progress(stage, required_evidence, missing_evidence)
 
+        tfs_matches = wiki_matches = None
+        if self._external_knowledge is not None:
+            tfs_matches, wiki_matches = self._external_knowledge.gather(
+                investigation, entities, matched_component, investigation.technology
+            )
+
         return InvestigationStrategy(
             current_stage=stage,
             stage_rationale=stage_rationale,
@@ -628,6 +629,8 @@ class RecommendationEngine:
             historical_investigations=similar_investigations,
             known_bugs=known_bugs,
             documentation=relevant_docs,
+            tfs_matches=tfs_matches,
+            wiki_matches=wiki_matches,
             decision_checkpoint=self._decision_checkpoint(root_causes),
         )
 

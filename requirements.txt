@@ -16,6 +16,11 @@ tokenizers==0.20.3
 protobuf<6,>=4.21
 streamlit==1.41.1
 requests==2.32.3
+requests-negotiate-sspi==0.5.2
+# External Knowledge (TFS live connector): Windows-only SSPI/NTLM auth,
+# so the app must still start and degrade gracefully (TfsConnectorError,
+# not an ImportError at startup) if this is ever unavailable -- see
+# app/engines/external_knowledge/tfs_rest_client.py's _auth().
 pytest==8.3.4
 httpx==0.28.1
 

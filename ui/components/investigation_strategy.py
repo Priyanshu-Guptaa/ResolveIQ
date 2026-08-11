@@ -1,10 +1,12 @@
 """Investigation Strategy (Recommendation Engine V2) -- the primary
 recommendation experience: one guided, explainable hierarchy instead of
-independent panels. Renders exactly the sections
-``InvestigationStrategy`` carries, in the approved order: stage,
-progress, next action, decision checkpoint, required/missing evidence,
-ordered log collection, suggested SQL, related Product Intelligence,
-historical investigations, known bugs, documentation.
+independent panels. Render order (revised for External Knowledge):
+stage, progress, next action, required/missing evidence, ordered log
+collection, local KB matches (historical investigations/known bugs/
+documentation), external knowledge (TFS/Wiki, live), suggested SQL,
+related Product Intelligence, decision checkpoint. Decision checkpoint
+moved from just-after-next-action to last -- everything else is
+additive, nothing removed.
 
 Reuses existing renderers where the underlying data is itself reused
 (not duplicated) from another module -- ``render_recommended_log_collection``
@@ -12,13 +14,15 @@ for the ordered log collection section is the same component the
 Recommendations tab used before this phase, now called with the
 Strategy's ``ordered_log_collection`` (the exact same list as the
 legacy ``recommended_logs`` field, per the Recommendation Engine's own
-"reuse, don't duplicate" design).
+"reuse, don't duplicate" design). ``render_external_knowledge`` is the
+same discipline applied to the live TFS/Wiki results.
 """
 
 from __future__ import annotations
 
 import streamlit as st
 
+from components.external_knowledge import render_external_knowledge
 from components.historical_match import render_historical_match
 from components.recommended_log_collection import render_recommended_log_collection
 from formatting import truncate_words
@@ -45,9 +49,6 @@ def render_investigation_strategy(strategy: dict, *, investigation_id: str) -> s
     st.markdown(strategy["recommended_next_action"])
     st.caption(strategy["next_action_rationale"])
 
-    if strategy["decision_checkpoint"]:
-        st.info(f"🧭 **Decision checkpoint:** {strategy['decision_checkpoint']}")
-
     navigate_to_component: str | None = None
 
     required = strategy["required_evidence"]
@@ -62,6 +63,26 @@ def render_investigation_strategy(strategy: dict, *, investigation_id: str) -> s
     nav = render_recommended_log_collection(strategy["ordered_log_collection"], investigation_id=investigation_id)
     if nav:
         navigate_to_component = nav
+
+    historical = strategy["historical_investigations"]
+    if historical:
+        with st.expander(f"📊 Historical investigations ({len(historical)})", expanded=False):
+            for i, match in enumerate(historical[:5]):
+                render_historical_match(match, key=f"strategy_hist_{investigation_id}_{i}")
+
+    known_bugs = strategy["known_bugs"]
+    if known_bugs:
+        with st.expander(f"🐞 Known bugs ({len(known_bugs)})", expanded=False):
+            for bug in known_bugs[:5]:
+                st.markdown(f"**{truncate_words(bug['title'])}**")
+
+    documentation = strategy["documentation"]
+    if documentation:
+        with st.expander(f"📚 Documentation ({len(documentation)})", expanded=False):
+            for doc in documentation[:5]:
+                st.markdown(f"**{truncate_words(doc['title'])}**")
+
+    render_external_knowledge(strategy.get("tfs_matches"), strategy.get("wiki_matches"))
 
     if strategy["suggested_sql"]:
         with st.expander("🗄 Suggested SQL", expanded=False):
@@ -85,22 +106,7 @@ def render_investigation_strategy(strategy: dict, *, investigation_id: str) -> s
             ):
                 navigate_to_component = matched_component["component_name"]
 
-    historical = strategy["historical_investigations"]
-    if historical:
-        with st.expander(f"📊 Historical investigations ({len(historical)})", expanded=False):
-            for i, match in enumerate(historical[:5]):
-                render_historical_match(match, key=f"strategy_hist_{investigation_id}_{i}")
-
-    known_bugs = strategy["known_bugs"]
-    if known_bugs:
-        with st.expander(f"🐞 Known bugs ({len(known_bugs)})", expanded=False):
-            for bug in known_bugs[:5]:
-                st.markdown(f"**{truncate_words(bug['title'])}**")
-
-    documentation = strategy["documentation"]
-    if documentation:
-        with st.expander(f"📚 Documentation ({len(documentation)})", expanded=False):
-            for doc in documentation[:5]:
-                st.markdown(f"**{truncate_words(doc['title'])}**")
+    if strategy["decision_checkpoint"]:
+        st.info(f"🧭 **Decision checkpoint:** {strategy['decision_checkpoint']}")
 
     return navigate_to_component

@@ -7,6 +7,7 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 from app.domain.enums import KnowledgeCollection
+from app.domain.external_knowledge import ExternalKnowledgeResult
 
 
 class KnowledgeMatch(BaseModel):
@@ -203,6 +204,16 @@ class InvestigationStrategy(BaseModel):
     """The exact same list as ``Recommendation.known_bugs``."""
     documentation: list[KnowledgeMatch] = Field(default_factory=list)
     """The exact same list as ``Recommendation.relevant_documentation``."""
+    tfs_matches: ExternalKnowledgeResult | None = None
+    """Live TFS search results, ranked against this investigation --
+    never imported/persisted (see app/domain/external_knowledge.py's
+    module docstring). None only when the External Knowledge feature
+    itself is unavailable in this build (e.g. old cached Recommendation
+    objects predating this field); a configured-but-unreachable TFS
+    still populates this with ``available=False``, never leaves it
+    None, so the UI can always show a real status line."""
+    wiki_matches: ExternalKnowledgeResult | None = None
+    """Live Wiki search results -- same contract as ``tfs_matches``."""
     decision_checkpoint: str | None = None
     """The specific thing to verify/decide next -- built from how many
     root-cause candidates exist (distinguish between them if >1, confirm
