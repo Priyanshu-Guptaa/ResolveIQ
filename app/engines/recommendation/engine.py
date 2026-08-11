@@ -620,10 +620,10 @@ class RecommendationEngine:
         tfs_matches = wiki_matches = recommended_solution = None
         if self._external_knowledge is not None:
             tfs_matches, wiki_matches = self._external_knowledge.gather(
-                investigation, entities, matched_component, investigation.technology
+                investigation, entities, matched_component, self._infer_technology(investigation)
             )
             recommended_solution = self._synthesize_recommendation(
-                similar_investigations, tfs_matches, wiki_matches, missing_evidence
+                root_causes, similar_investigations, tfs_matches, wiki_matches, missing_evidence
             )
 
         return InvestigationStrategy(
@@ -647,8 +647,47 @@ class RecommendationEngine:
             decision_checkpoint=self._decision_checkpoint(root_causes),
         )
 
+    def _infer_technology(self, investigation: InvestigationSession) -> str | None:
+        """Real bug fix: the structured Summary Card ``technology``
+        field is very often left blank even when the pasted task
+        description names a real technology in free text (e.g. a real
+        ServiceNow export literally containing "Technology: rf mesh")
+        -- and External Knowledge's search-term builder previously used
+        *only* that structured field, so a blank field meant TFS/Wiki
+        got no technology anchor at all even though a real one was
+        sitting in the evidence the whole time.
+
+        Deliberately independent of ``_recommend_logs()``'s own
+        technology+issue-type scenario matching (frozen -- "bug fixes
+        only" per explicit instruction) rather than reusing its top
+        result: that method breaks combined-score ties by whichever
+        scenario happens to come first in Log Intelligence Knowledge
+        Base iteration order, which is a real, separate quality issue
+        of its own and not something this fix should silently inherit
+        or paper over. This applies the exact same deterministic
+        keyword_match_score used everywhere else in this file directly
+        against the real, distinct technology names in the Knowledge
+        Base, picking whichever single technology name actually scores
+        highest against the investigation's own text -- simpler and
+        answers a narrower question ("which technology name is
+        actually mentioned") than the scenario matcher needs to."""
+        if investigation.technology:
+            return investigation.technology
+        if self._log_knowledge is None:
+            return None
+        context = investigation.context_text
+        best_technology: str | None = None
+        best_score = 0.0
+        for technology in self.available_log_technologies():
+            score = keyword_match_score(technology, context)
+            if score > best_score:
+                best_score = score
+                best_technology = technology
+        return best_technology
+
     def _synthesize_recommendation(
         self,
+        root_causes: list[RootCauseHypothesis],
         similar_investigations: list[KnowledgeMatch],
         tfs_result: "ExternalKnowledgeResult | None",
         wiki_result: "ExternalKnowledgeResult | None",
@@ -712,12 +751,50 @@ class RecommendationEngine:
         recommended_resolution: str | None = None
         confidence_score = 0.0
 
-        if best_local is not None:
-            root_cause = best_local.metadata.get("root_cause")
-            likely_issue = _snippet(root_cause) if root_cause else best_local.title
-            rationale_parts.append(f"a similar local historical investigation ({best_local.score:.0%} similarity)")
-            confidence_score = max(confidence_score, best_local.score)
-            local_resolution = best_local.metadata.get("resolution")
+        # Prefer the already-computed root-cause hierarchy over deriving
+        # "likely issue" from best_local directly: _build_root_causes()
+        # already (a) skips historical matches with no recorded root
+        # cause instead of falling back to their raw ticket title (which
+        # is what caused the reported bug -- an unrelated customer's
+        # ticket title being shown as if it diagnosed this case), and
+        # (b) blends in entity-derived hypotheses that can outrank a
+        # title-only match. Only fall back to best_local's title, with
+        # an explicit "no confirmed root cause" caveat, when there is no
+        # root-cause hypothesis at all.
+        #
+        # ``correlated_match`` tracks *which* similar_investigations
+        # entry (if any) the surfaced likely_issue actually came from --
+        # its ``resolution`` is only trustworthy to quote when it's the
+        # same record, never a different top-similarity match that
+        # happens to be unrelated (e.g. likely_issue driven by an entity
+        # heuristic while best_local is about a completely different
+        # defect) -- that mismatch is exactly what produced a resolution
+        # about an unrelated "Grid location ID in a CSV extract" case
+        # for a totally different RF Mesh command error in live testing.
+        correlated_match: KnowledgeMatch | None = None
+        if root_causes:
+            top_cause = root_causes[0]
+            likely_issue = top_cause.description
+            rationale_parts.append(
+                top_cause.rationale.rstrip(".") if top_cause.rationale else "a matched root-cause hypothesis"
+            )
+            confidence_score = max(confidence_score, top_cause.confidence)
+            if top_cause.rationale.startswith("Matches historical investigation"):
+                for match in similar_investigations[:2]:
+                    root_cause_text = match.metadata.get("root_cause")
+                    if root_cause_text and _snippet(root_cause_text) == top_cause.description:
+                        correlated_match = match
+                        break
+        elif best_local is not None:
+            likely_issue = f"Possibly related to a similar past case: \"{best_local.title}\" (no confirmed root cause on file)"
+            rationale_parts.append(
+                f"a similar local historical investigation ({best_local.score:.0%} similarity) with no recorded root cause"
+            )
+            confidence_score = max(confidence_score, best_local.score * 0.5)
+            correlated_match = best_local
+
+        if correlated_match is not None:
+            local_resolution = correlated_match.metadata.get("resolution")
             if local_resolution:
                 recommended_resolution = f"Based on a similar past case: {_snippet(local_resolution)}"
 
@@ -748,7 +825,7 @@ class RecommendationEngine:
             recommended_resolution=recommended_resolution,
             insufficient_evidence=recommended_resolution is None,
             confidence=confidence_for_score(confidence_score) if recommended_resolution else "Low",
-            source_local=best_local is not None,
+            source_local=correlated_match is not None,
             source_tfs=best_tfs is not None,
             source_wiki=best_wiki is not None,
             supporting_tfs_id=best_tfs.tfs_case.tfs_id if best_tfs else None,

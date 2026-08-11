@@ -11,7 +11,7 @@ from app.config import Settings
 from app.domain.enums import EvidenceType, KnowledgeCollection
 from app.domain.evidence import Evidence
 from app.domain.investigation import InvestigationSession
-from app.domain.recommendation import KnowledgeMatch
+from app.domain.recommendation import KnowledgeMatch, RootCauseHypothesis
 from app.engines.knowledge.engine import KnowledgeEngine
 from app.engines.log_intelligence.entity_extractor import RegexEntityExtractor
 from app.engines.recommendation.engine import RecommendationEngine
@@ -956,7 +956,7 @@ def _wiki_result(matches=None, available=True):
 
 def test_synthesize_recommendation_insufficient_evidence_when_nothing_clears_bar():
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
+    solution = engine._synthesize_recommendation([], [], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
 
     assert solution.insufficient_evidence is True
     assert solution.recommended_resolution is None
@@ -969,7 +969,7 @@ def test_synthesize_recommendation_never_fabricates_when_tfs_match_has_no_resolu
     recorded a resolution -- must not fabricate one."""
     case = _tfs_case(resolution=None)
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+    solution = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
 
     assert solution.source_tfs is True
     assert solution.recommended_resolution is None
@@ -979,7 +979,7 @@ def test_synthesize_recommendation_never_fabricates_when_tfs_match_has_no_resolu
 def test_synthesize_recommendation_uses_tfs_resolution_when_available():
     case = _tfs_case(resolution="Restart CommandProcessorHost and verify init messages")
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+    solution = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
 
     assert solution.insufficient_evidence is False
     assert "Restart CommandProcessorHost" in solution.recommended_resolution
@@ -991,7 +991,7 @@ def test_synthesize_recommendation_uses_tfs_resolution_when_available():
 def test_synthesize_recommendation_below_floor_tfs_match_does_not_drive_solution():
     case = _tfs_case(resolution="Restart the service")
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([], _tfs_result(matches=[(case, 0.1)]), _wiki_result(matches=[]), [])
+    solution = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.1)]), _wiki_result(matches=[]), [])
 
     assert solution.source_tfs is False
     assert solution.insufficient_evidence is True
@@ -1008,7 +1008,7 @@ def test_synthesize_recommendation_correlates_tfs_crm_id_with_local_ticket():
     )
     case = _tfs_case(resolution="Reissued GEI, confirmed fixed", crm_id="CS0122697/CSTASK0087353")
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([match], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+    solution = engine._synthesize_recommendation([], [match], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
 
     assert solution.source_local is True
     assert solution.source_tfs is True
@@ -1018,7 +1018,7 @@ def test_synthesize_recommendation_correlates_tfs_crm_id_with_local_ticket():
 def test_synthesize_recommendation_what_to_check_falls_back_to_generic_when_no_missing_evidence():
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
     case = _tfs_case()
-    solution = engine._synthesize_recommendation([], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+    solution = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
 
     assert len(solution.what_to_check) >= 1
 
@@ -1027,10 +1027,57 @@ def test_synthesize_recommendation_wiki_fills_resolution_when_tfs_has_none():
     case = _tfs_case(resolution=None)
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
     solution = engine._synthesize_recommendation(
-        [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[("Troubleshooting CommandProcessorHost", "Restart the service and check logs", 0.6)]), []
+        [], [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[("Troubleshooting CommandProcessorHost", "Restart the service and check logs", 0.6)]), []
     )
 
     assert solution.source_wiki is True
     assert solution.insufficient_evidence is False
     assert "Troubleshooting CommandProcessorHost" in solution.recommended_resolution
     assert solution.supporting_wiki_title == "Troubleshooting CommandProcessorHost"
+
+
+def test_synthesize_recommendation_prefers_root_cause_over_raw_local_match_title():
+    """Regression test for a real reported bug: a local historical match
+    with no recorded root_cause used to fall back to its raw ticket
+    title, which could be an unrelated customer's ticket title presented
+    as if it diagnosed the current case. root_causes (already filtered
+    by _build_root_causes) must win when present."""
+    match = KnowledgeMatch(
+        collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS,
+        record_id="hi-1",
+        title="CLP | Prod | CC 9.0 | Meter load profile found with frozen value",
+        snippet="x",
+        score=0.55,
+        metadata={},  # no root_cause on file -- the exact real-world case
+    )
+    root_causes = [
+        RootCauseHypothesis(
+            description="Unhandled application exception: DCWErr_Invalid_Response_Length",
+            confidence=0.6,
+            rationale="Investigation evidence contains a exception_type ('DCWErr_Invalid_Response_Length').",
+        )
+    ]
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    solution = engine._synthesize_recommendation(root_causes, [match], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
+
+    assert solution.likely_issue == root_causes[0].description
+    assert "CLP | Prod | CC 9.0" not in solution.likely_issue
+
+
+def test_synthesize_recommendation_local_title_fallback_is_labeled_unconfirmed():
+    """When there's no root-cause hypothesis at all, a title-only local
+    match may still be surfaced, but must be clearly caveated as
+    unconfirmed rather than presented as a diagnosis."""
+    match = KnowledgeMatch(
+        collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS,
+        record_id="hi-1",
+        title="CLP | Prod | CC 9.0 | Meter load profile found with frozen value",
+        snippet="x",
+        score=0.55,
+        metadata={},
+    )
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    solution = engine._synthesize_recommendation([], [match], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
+
+    assert "no confirmed root cause" in solution.likely_issue.lower()
+    assert match.title in solution.likely_issue
