@@ -771,7 +771,14 @@ class RecommendationEngine:
         # defect) -- that mismatch is exactly what produced a resolution
         # about an unrelated "Grid location ID in a CSV extract" case
         # for a totally different RF Mesh command error in live testing.
+        # ``local_contributed`` separately tracks whether local KB
+        # informed ``likely_issue`` at all (root-cause-derived or
+        # title-only fallback) -- used for the "Sources: Local KB" tag,
+        # which should show whenever local KB genuinely shaped the
+        # answer, even in the low-confidence fallback case where its
+        # *resolution* still isn't trustworthy enough to quote.
         correlated_match: KnowledgeMatch | None = None
+        local_contributed = False
         if root_causes:
             top_cause = root_causes[0]
             likely_issue = top_cause.description
@@ -780,18 +787,30 @@ class RecommendationEngine:
             )
             confidence_score = max(confidence_score, top_cause.confidence)
             if top_cause.rationale.startswith("Matches historical investigation"):
+                local_contributed = True
                 for match in similar_investigations[:2]:
                     root_cause_text = match.metadata.get("root_cause")
                     if root_cause_text and _snippet(root_cause_text) == top_cause.description:
                         correlated_match = match
                         break
         elif best_local is not None:
+            # Deliberately does NOT set correlated_match here: we've just
+            # said we don't trust this match's root cause enough to state
+            # it as the likely issue (it has none on file, only a title/
+            # customer/component overlap) -- so its resolution text isn't
+            # trustworthy either, and must not be surfaced as if it
+            # addresses this specific problem. Found live: a real CLECO
+            # case where the top local match (86% similarity, same
+            # customer/meter type, no root cause) was a *different*
+            # defect (ST-03 advisory events) from the current one (meter
+            # program change), yet its Closure Summary was still being
+            # shown as "the" recommended resolution.
             likely_issue = f"Possibly related to a similar past case: \"{best_local.title}\" (no confirmed root cause on file)"
             rationale_parts.append(
                 f"a similar local historical investigation ({best_local.score:.0%} similarity) with no recorded root cause"
             )
             confidence_score = max(confidence_score, best_local.score * 0.5)
-            correlated_match = best_local
+            local_contributed = True
 
         if correlated_match is not None:
             local_resolution = correlated_match.metadata.get("resolution")
@@ -825,7 +844,7 @@ class RecommendationEngine:
             recommended_resolution=recommended_resolution,
             insufficient_evidence=recommended_resolution is None,
             confidence=confidence_for_score(confidence_score) if recommended_resolution else "Low",
-            source_local=correlated_match is not None,
+            source_local=local_contributed,
             source_tfs=best_tfs is not None,
             source_wiki=best_wiki is not None,
             supporting_tfs_id=best_tfs.tfs_case.tfs_id if best_tfs else None,

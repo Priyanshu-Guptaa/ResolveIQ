@@ -1081,3 +1081,30 @@ def test_synthesize_recommendation_local_title_fallback_is_labeled_unconfirmed()
 
     assert "no confirmed root cause" in solution.likely_issue.lower()
     assert match.title in solution.likely_issue
+
+
+def test_synthesize_recommendation_title_fallback_never_quotes_resolution_of_untrusted_match():
+    """Regression test for a second real reported bug (same CLECO case):
+    when the top local match has no recorded root cause, we already
+    caveat likely_issue as unconfirmed -- but the old code still quoted
+    that same match's *resolution* as if it were a trustworthy fix,
+    even though it may describe a genuinely different defect (same
+    customer/component, different root cause). A resolution must never
+    be attached to a match we've just said we don't trust the root
+    cause of."""
+    match = KnowledgeMatch(
+        collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS,
+        record_id="hi-1",
+        title="CLECO: RF Enhanced Focus AX: Request for Full Meter Read Analysis",
+        snippet="x",
+        score=0.86,
+        metadata={"resolution": "Closure Summary: unrelated ST-03 advisory investigation, not this defect."},
+    )
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    solution = engine._synthesize_recommendation([], [match], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
+
+    assert solution.recommended_resolution is None
+    assert solution.insufficient_evidence is True
+    # Local KB still genuinely shaped the (caveated) likely_issue, so it's
+    # still an honest source to disclose -- just not for the resolution.
+    assert solution.source_local is True
