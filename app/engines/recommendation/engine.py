@@ -43,6 +43,7 @@ from app.domain.recommendation import (
 )
 from app.engines.external_knowledge.ranking import confidence_for_score
 from app.engines.knowledge.engine import KnowledgeEngine
+from app.engines.shared.text_cleaning import strip_low_signal_boilerplate
 from app.engines.shared.text_matching import keyword_match_score
 
 if TYPE_CHECKING:
@@ -269,7 +270,16 @@ class RecommendationEngine:
         fact, not a per-request one."""
 
     def generate(self, investigation: InvestigationSession) -> Recommendation:
-        query_text = investigation.context_text
+        # Cleaned before it becomes a search query (never for anything
+        # else -- entity extraction, technology inference, etc. all use
+        # investigation.context_text directly): a ServiceNow-templated
+        # task description's disclaimer paragraph and empty label:value
+        # header lines carry no discriminating signal but can consume a
+        # large fraction of the embedding model's small (256-token)
+        # window, crowding out the actual defect description. See
+        # strip_low_signal_boilerplate's docstring for the real case
+        # that surfaced this.
+        query_text = strip_low_signal_boilerplate(investigation.context_text)
         entities = investigation.merged_entities
 
         similar_investigations: list[KnowledgeMatch] = []

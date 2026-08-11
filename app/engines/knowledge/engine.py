@@ -30,6 +30,7 @@ from app.domain.enums import DocumentStatus, KnowledgeCollection
 from app.domain.evidence import DocumentationRecord, HistoricalInvestigationRecord, KnownBugRecord
 from app.domain.recommendation import KnowledgeMatch
 from app.engines.knowledge.knowledge_store import KnowledgeStore
+from app.engines.shared.text_cleaning import strip_low_signal_boilerplate
 
 if TYPE_CHECKING:
     from app.infrastructure.db.knowledge_repository import KnowledgeRepository
@@ -89,7 +90,7 @@ class KnowledgeEngine:
         self, record: HistoricalInvestigationRecord, *, imported_at: str | None = None
     ) -> None:
         searchable_text = (
-            f"{record.title}\n{record.description}\nRoot cause: {record.root_cause}\n"
+            f"{record.title}\n{strip_low_signal_boilerplate(record.description)}\nRoot cause: {record.root_cause}\n"
             f"Resolution: {record.resolution}\nTags: {', '.join(record.tags)}"
         )
         self._store.upsert(
@@ -145,7 +146,7 @@ class KnowledgeEngine:
     # implementation.
 
     def index_documentation(self, record: DocumentationRecord, *, imported_at: str | None = None) -> None:
-        searchable_text = f"{record.title}\n{record.content}\nTags: {', '.join(record.tags)}"
+        searchable_text = f"{record.title}\n{strip_low_signal_boilerplate(record.content)}\nTags: {', '.join(record.tags)}"
         self._store.upsert(
             KnowledgeCollection.DOCUMENTATION,
             record.id,
@@ -179,7 +180,7 @@ class KnowledgeEngine:
 
     def index_known_bug(self, record: KnownBugRecord, *, imported_at: str | None = None) -> None:
         searchable_text = (
-            f"{record.title}\n{record.description}\n"
+            f"{record.title}\n{strip_low_signal_boilerplate(record.description)}\n"
             f"Affected: {', '.join(record.affected_components)}\n"
             f"Workaround: {record.workaround or 'none'}"
         )
