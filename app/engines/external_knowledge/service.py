@@ -47,6 +47,16 @@ historical incident, even one caused by the same underlying bug.
 Exception type names are the one category that genuinely recurs across
 unrelated real-world occurrences of the same class of problem."""
 
+_TICKET_NUMBER_RE = re.compile(r"\b(?:CSTASK|CS|TASK|INC)\d{5,}\b", re.IGNORECASE)
+"""Real prefixes observed in this project's actual ServiceNow/TFS data
+this session (e.g. CSTASK0066554, CS0122697, TASK0469743, INC0045821 --
+see [[external-knowledge-feature]]/Task Import) -- not a guessed
+pattern. TFS Bugs carry the matching ticket number verbatim in
+``LandisGyr.CRMID`` (e.g. "CS0122697/CSTASK0087353"), so a ticket
+number mentioned in the investigation's own text is one of the
+strongest possible anchors: it can point straight at the TFS work item
+that actually fixed this exact customer's exact case."""
+
 
 @dataclass(frozen=True)
 class SearchTerms:
@@ -90,7 +100,12 @@ def build_search_terms(
     technology: str | None,
 ) -> SearchTerms:
     """Deterministic, reuses signals the Recommendation Engine already
-    computed -- no new NLP."""
+    computed -- no new NLP. Anchors, strongest first: a ticket number
+    (points at one specific TFS work item, if this exact case was
+    already logged there), customer, product/version (structured
+    Summary Card fields -- real, curated, not free-text guesses),
+    technology, matched component. Supporting: title keywords,
+    exception-type entities."""
     anchor: list[str] = []
     supporting: list[str] = []
     seen: set[str] = set()
@@ -104,6 +119,12 @@ def build_search_terms(
             seen.add(key)
             bucket.append(cleaned)
 
+    for ticket in _TICKET_NUMBER_RE.findall(f"{investigation.title}\n{_first_evidence_text(investigation)}"):
+        _add(anchor, ticket.upper(), limit=_MAX_TOTAL_TERMS)
+
+    _add(anchor, investigation.customer, limit=_MAX_TOTAL_TERMS)
+    _add(anchor, investigation.product, limit=_MAX_TOTAL_TERMS)
+    _add(anchor, investigation.version, limit=_MAX_TOTAL_TERMS)
     _add(anchor, technology, limit=_MAX_TOTAL_TERMS)
     if matched_component is not None:
         _add(anchor, matched_component.component_name, limit=_MAX_TOTAL_TERMS)
@@ -117,6 +138,17 @@ def build_search_terms(
             _add(supporting, entity.value, limit=_MAX_TOTAL_TERMS)
 
     return SearchTerms(anchor=anchor, supporting=supporting)
+
+
+def _first_evidence_text(investigation: "InvestigationSession", *, max_chars: int = 4000) -> str:
+    """The task description (first piece of evidence) is where a
+    ticket number is actually likely to appear (e.g. a pasted
+    ServiceNow template) -- capped, not the full context_text, since
+    this only feeds a regex scan, not a search query itself."""
+    for item in investigation.evidence:
+        if item.raw_content:
+            return item.raw_content[:max_chars]
+    return ""
 
 
 def _cache_key(source: ExternalSource, terms: SearchTerms) -> str:

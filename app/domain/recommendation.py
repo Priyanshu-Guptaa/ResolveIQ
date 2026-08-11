@@ -160,6 +160,48 @@ class MatchedComponent(BaseModel):
     match_reason: str
 
 
+class RecommendedSolution(BaseModel):
+    """The single synthesized answer to "what's likely happening and
+    what should I do" -- correlates local knowledge, live TFS matches,
+    and live Wiki matches into one deterministic recommendation.
+    Nothing here is generated text in the LLM sense: ``likely_issue``
+    and ``recommended_resolution`` are built from templates that quote
+    or directly reference real source content (a historical
+    investigation's own root_cause field, a TFS case's own
+    resolution_text, ...), never invented. Every field that names a
+    source (``source_local``/``source_tfs``/``source_wiki`` and the
+    ``supporting_*`` reference fields) traces to something a human can
+    click through and verify -- see each source's own record for
+    "ResolveIQ's own knowledge" vs "TFS-derived" vs "Wiki-derived"
+    provenance, kept genuinely separate rather than blended into one
+    unattributed paragraph."""
+
+    likely_issue: str
+    rationale: str
+    """Names which source(s) actually support ``likely_issue`` -- e.g.
+    "3 similar local historical investigations and TFS-2441987
+    (Closed) point to the same root cause." Never omits attribution."""
+    what_to_check: list[str] = Field(default_factory=list)
+    recommended_resolution: str | None = None
+    """None (never a placeholder string) when there isn't enough real
+    evidence to state one -- see ``insufficient_evidence``."""
+    insufficient_evidence: bool = True
+    """True means: say so, don't guess. The engine defaults to this
+    and only flips it when a real source clears the confidence bar."""
+    confidence: str = "Insufficient"
+    """"High" | "Medium" | "Low" | "Insufficient" -- fixed bands from
+    the same scoring already used elsewhere (ranking.py's
+    confidence_for_score for TFS/Wiki, min_similarity_for_root_cause
+    for local matches), never a free-floating claim."""
+    source_local: bool = False
+    source_tfs: bool = False
+    source_wiki: bool = False
+    supporting_tfs_id: int | None = None
+    supporting_tfs_url: str | None = None
+    supporting_wiki_title: str | None = None
+    supporting_wiki_url: str | None = None
+
+
 class InvestigationStrategy(BaseModel):
     """The single, explainable, orchestrated investigation plan --
     Recommendation Engine V2's primary output (approved design:
@@ -214,6 +256,13 @@ class InvestigationStrategy(BaseModel):
     None, so the UI can always show a real status line."""
     wiki_matches: ExternalKnowledgeResult | None = None
     """Live Wiki search results -- same contract as ``tfs_matches``."""
+    recommended_solution: RecommendedSolution | None = None
+    """The synthesized, cross-source answer -- correlates
+    ``historical_investigations``, ``tfs_matches``, and
+    ``wiki_matches`` into one recommendation with explicit source
+    attribution. None only when External Knowledge isn't wired in this
+    build; when it is, always populated, with ``insufficient_evidence``
+    set honestly rather than a fabricated resolution."""
     decision_checkpoint: str | None = None
     """The specific thing to verify/decide next -- built from how many
     root-cause candidates exist (distinguish between them if >1, confirm

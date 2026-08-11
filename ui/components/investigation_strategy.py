@@ -35,6 +35,57 @@ _STAGE_DISPLAY = {
 }
 
 
+def _render_recommended_solution(solution: dict | None) -> None:
+    """The synthesized, cross-source answer -- correlates local KB +
+    live TFS + live Wiki (RecommendationEngine._synthesize_recommendation)
+    into one recommendation, rendered first/most prominently since
+    it's meant to answer "what's likely happening and what do I do"
+    directly. Every source that contributed is tagged explicitly
+    (never a blended, unattributed claim), and an honest
+    "additional investigation is required" replaces a resolution when
+    the engine didn't find enough real evidence -- never a fabricated
+    fix."""
+    if solution is None:
+        return
+
+    st.markdown("#### 💡 Recommended Solution")
+    st.markdown(f"**Likely issue:** {solution['likely_issue']}")
+    st.caption(f"Why: {solution['rationale']}")
+
+    source_tags = []
+    if solution["source_local"]:
+        source_tags.append("📚 Local KB")
+    if solution["source_tfs"]:
+        source_tags.append("🔧 TFS")
+    if solution["source_wiki"]:
+        source_tags.append("🌐 Wiki")
+    if source_tags:
+        st.caption("Sources: " + " · ".join(source_tags))
+
+    if solution["what_to_check"]:
+        st.markdown("**What to check:**")
+        for item in solution["what_to_check"]:
+            st.markdown(f"- {item}")
+
+    if solution["insufficient_evidence"]:
+        st.warning(
+            "⚠️ Additional investigation is required -- no source currently has enough evidence to "
+            "recommend a specific resolution."
+        )
+    else:
+        st.success(f"**Recommended resolution** _(confidence: {solution['confidence']})_")
+        st.markdown(solution["recommended_resolution"])
+
+    link_cols = []
+    if solution.get("supporting_tfs_url"):
+        link_cols.append(f"[TFS-{solution['supporting_tfs_id']} →]({solution['supporting_tfs_url']})")
+    if solution.get("supporting_wiki_url"):
+        link_cols.append(f"[{solution['supporting_wiki_title']} (Wiki) →]({solution['supporting_wiki_url']})")
+    if link_cols:
+        st.caption(" · ".join(link_cols))
+    st.markdown("---")
+
+
 def render_investigation_strategy(strategy: dict, *, investigation_id: str) -> str | None:
     """Returns the linked component name the engineer clicked through to
     Product Intelligence for, if any -- same cross-navigation contract
@@ -44,6 +95,8 @@ def render_investigation_strategy(strategy: dict, *, investigation_id: str) -> s
     st.markdown(f"### {icon} {label}")
     st.caption(strategy["stage_rationale"])
     st.progress(strategy["progress"], text=strategy["progress_summary"])
+
+    _render_recommended_solution(strategy.get("recommended_solution"))
 
     st.markdown("#### ➡️ Recommended next action")
     st.markdown(strategy["recommended_next_action"])

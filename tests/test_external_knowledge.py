@@ -193,9 +193,10 @@ def test_build_cql_anchor_excludes_supporting_terms():
 # --- service.py: build_search_terms -----------------------------------------
 
 
-class _Investigation:
-    def __init__(self, title: str) -> None:
-        self.title = title
+def _Investigation(title: str):
+    from app.domain.investigation import InvestigationSession
+
+    return InvestigationSession(title=title)
 
 
 def test_build_search_terms_component_and_technology_are_anchors():
@@ -235,6 +236,33 @@ def test_build_search_terms_caps_total_count():
     inv = _Investigation("alpha bravo charlie delta echo foxtrot golf hotel india juliet")
     terms = build_search_terms(inv, [], None, None)
     assert len(terms.all) <= 8
+
+
+def test_build_search_terms_includes_customer_product_version_as_anchors():
+    inv = _Investigation("Meter stuck")
+    inv.customer = "Salt River Project"
+    inv.product = "Command Center"
+    inv.version = "9.0.5"
+    terms = build_search_terms(inv, [], None, None)
+    assert "Salt River Project" in terms.anchor
+    assert "Command Center" in terms.anchor
+    assert "9.0.5" in terms.anchor
+
+
+def test_build_search_terms_extracts_ticket_number_from_title_as_anchor():
+    inv = _Investigation("CS0122697 Meter stuck in Discovered state")
+    terms = build_search_terms(inv, [], None, None)
+    assert "CS0122697" in terms.anchor
+
+
+def test_build_search_terms_extracts_ticket_number_from_task_description():
+    from app.domain.evidence import Evidence
+    from app.domain.enums import EvidenceType
+
+    inv = _Investigation("Meter stuck")
+    inv.add_evidence(Evidence(investigation_id=inv.id, evidence_type=EvidenceType.MANUAL_NOTE, raw_content="See CSTASK0087353 for background."))
+    terms = build_search_terms(inv, [], None, None)
+    assert "CSTASK0087353" in terms.anchor
 
 
 # --- service.py: ExternalKnowledgeService -----------------------------------

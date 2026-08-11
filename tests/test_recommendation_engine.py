@@ -905,3 +905,132 @@ def test_missing_evidence_is_subset_of_required_evidence_where_unsatisfied():
     for item in recommendation.strategy.missing_evidence:
         assert item.satisfied is False
     assert all(item in recommendation.strategy.required_evidence for item in recommendation.strategy.missing_evidence)
+
+
+# --- RecommendationEngine._synthesize_recommendation --------------------------
+
+
+def _tfs_case(tfs_id=1, title="CommandProcessorHost issue", state="Closed", resolution="Restart the service", crm_id=None):
+    from datetime import datetime
+
+    from app.domain.external_knowledge import TfsCase
+
+    return TfsCase(
+        tfs_id=tfs_id,
+        work_item_type="Bug",
+        title=title,
+        state=state,
+        area_path="Command Center",
+        team_project="Command Center",
+        changed_date=datetime(2026, 1, 1),
+        description_text="x",
+        resolution_text=resolution,
+        crm_id=crm_id,
+        url=f"https://am.tfs.landisgyr.net/tfs/DefaultCollection/Command%20Center/_workitems/edit/{tfs_id}",
+    )
+
+
+def _tfs_result(matches=None, available=True):
+    from app.domain.external_knowledge import ExternalKnowledgeResult, ExternalMatch, ExternalSource
+
+    if matches is None:
+        return ExternalKnowledgeResult(source=ExternalSource.TFS, available=available, matches=[])
+    external_matches = [
+        ExternalMatch(source=ExternalSource.TFS, tfs_case=case, score=score, confidence="Medium", match_reasons=["x"])
+        for case, score in matches
+    ]
+    return ExternalKnowledgeResult(source=ExternalSource.TFS, available=available, matches=external_matches)
+
+
+def _wiki_result(matches=None, available=True):
+    from app.domain.external_knowledge import ExternalKnowledgeResult, ExternalMatch, ExternalSource, WikiPage
+
+    if matches is None:
+        return ExternalKnowledgeResult(source=ExternalSource.WIKI, available=available, matches=[])
+    external_matches = [
+        ExternalMatch(source=ExternalSource.WIKI, wiki_page=WikiPage(page_id="1", title=title, space_key="CC", excerpt=excerpt, url="https://wiki.landisgyr.net/1"), score=score, confidence="Medium", match_reasons=["x"])
+        for title, excerpt, score in matches
+    ]
+    return ExternalKnowledgeResult(source=ExternalSource.WIKI, available=available, matches=external_matches)
+
+
+def test_synthesize_recommendation_insufficient_evidence_when_nothing_clears_bar():
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    solution = engine._synthesize_recommendation([], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
+
+    assert solution.insufficient_evidence is True
+    assert solution.recommended_resolution is None
+    assert solution.confidence == "Insufficient"
+
+
+def test_synthesize_recommendation_never_fabricates_when_tfs_match_has_no_resolution_text():
+    """Real requirement: a TFS match can clear the ranking confidence
+    bar (component/technology matched) without TFS itself having ever
+    recorded a resolution -- must not fabricate one."""
+    case = _tfs_case(resolution=None)
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    solution = engine._synthesize_recommendation([], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+
+    assert solution.source_tfs is True
+    assert solution.recommended_resolution is None
+    assert solution.insufficient_evidence is True
+
+
+def test_synthesize_recommendation_uses_tfs_resolution_when_available():
+    case = _tfs_case(resolution="Restart CommandProcessorHost and verify init messages")
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    solution = engine._synthesize_recommendation([], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+
+    assert solution.insufficient_evidence is False
+    assert "Restart CommandProcessorHost" in solution.recommended_resolution
+    assert f"TFS-{case.tfs_id}" in solution.recommended_resolution
+    assert solution.supporting_tfs_id == case.tfs_id
+    assert solution.supporting_tfs_url == case.url
+
+
+def test_synthesize_recommendation_below_floor_tfs_match_does_not_drive_solution():
+    case = _tfs_case(resolution="Restart the service")
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    solution = engine._synthesize_recommendation([], _tfs_result(matches=[(case, 0.1)]), _wiki_result(matches=[]), [])
+
+    assert solution.source_tfs is False
+    assert solution.insufficient_evidence is True
+
+
+def test_synthesize_recommendation_correlates_tfs_crm_id_with_local_ticket():
+    match = KnowledgeMatch(
+        collection=KnowledgeCollection.HISTORICAL_INVESTIGATIONS,
+        record_id="hi-1",
+        title="ATCO - RF Mesh IP - similar case",
+        snippet="x",
+        score=0.5,
+        metadata={"tags": "ticket:CSTASK0087353, priority:High", "root_cause": "Stale DCW", "resolution": "Reissued GEI"},
+    )
+    case = _tfs_case(resolution="Reissued GEI, confirmed fixed", crm_id="CS0122697/CSTASK0087353")
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    solution = engine._synthesize_recommendation([match], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+
+    assert solution.source_local is True
+    assert solution.source_tfs is True
+    assert "same real-world case" in solution.rationale
+
+
+def test_synthesize_recommendation_what_to_check_falls_back_to_generic_when_no_missing_evidence():
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    case = _tfs_case()
+    solution = engine._synthesize_recommendation([], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+
+    assert len(solution.what_to_check) >= 1
+
+
+def test_synthesize_recommendation_wiki_fills_resolution_when_tfs_has_none():
+    case = _tfs_case(resolution=None)
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
+    solution = engine._synthesize_recommendation(
+        [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[("Troubleshooting CommandProcessorHost", "Restart the service and check logs", 0.6)]), []
+    )
+
+    assert solution.source_wiki is True
+    assert solution.insufficient_evidence is False
+    assert "Troubleshooting CommandProcessorHost" in solution.recommended_resolution
+    assert solution.supporting_wiki_title == "Troubleshooting CommandProcessorHost"

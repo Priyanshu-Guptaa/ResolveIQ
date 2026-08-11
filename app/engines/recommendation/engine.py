@@ -36,15 +36,18 @@ from app.domain.recommendation import (
     MatchedComponent,
     Recommendation,
     RecommendedLogCollectionItem,
+    RecommendedSolution,
     RequiredEvidenceItem,
     RootCauseHypothesis,
     SuggestedSqlItem,
 )
+from app.engines.external_knowledge.ranking import confidence_for_score
 from app.engines.knowledge.engine import KnowledgeEngine
 from app.engines.shared.text_matching import keyword_match_score
 
 if TYPE_CHECKING:
     from app.domain.evidence import Evidence
+    from app.domain.external_knowledge import ExternalKnowledgeResult
     from app.domain.log_intelligence_kb import LogCollectionScenario, LogSourceApplication
     from app.engines.external_knowledge.service import ExternalKnowledgeService
     from app.engines.knowledge_relationships.engine import KnowledgeRelationshipEngine
@@ -68,6 +71,12 @@ _MIN_KEYWORD_WORD_LEN = 4
 """Below this, a single word from a technology/scenario-type name (e.g.
 "IP") is too generic to treat as a meaningful partial-match signal on
 its own."""
+
+_SOLUTION_CONFIDENCE_FLOOR = 0.4
+"""A TFS/Wiki match below this (ranking.py's own "Medium" floor)
+doesn't clear the bar to drive the synthesized RecommendedSolution --
+still shown in its own External Knowledge section, just not treated as
+strong enough evidence to state a likely issue/resolution from."""
 
 _MAX_MATCHED_SCENARIOS = 3
 _MAX_RECOMMENDED_LOG_ITEMS = 20
@@ -608,10 +617,13 @@ class RecommendationEngine:
         stage, stage_rationale = self._current_stage(investigation, missing_evidence, root_causes)
         progress, progress_summary = self._progress(stage, required_evidence, missing_evidence)
 
-        tfs_matches = wiki_matches = None
+        tfs_matches = wiki_matches = recommended_solution = None
         if self._external_knowledge is not None:
             tfs_matches, wiki_matches = self._external_knowledge.gather(
                 investigation, entities, matched_component, investigation.technology
+            )
+            recommended_solution = self._synthesize_recommendation(
+                similar_investigations, tfs_matches, wiki_matches, missing_evidence
             )
 
         return InvestigationStrategy(
@@ -631,7 +643,118 @@ class RecommendationEngine:
             documentation=relevant_docs,
             tfs_matches=tfs_matches,
             wiki_matches=wiki_matches,
+            recommended_solution=recommended_solution,
             decision_checkpoint=self._decision_checkpoint(root_causes),
+        )
+
+    def _synthesize_recommendation(
+        self,
+        similar_investigations: list[KnowledgeMatch],
+        tfs_result: "ExternalKnowledgeResult | None",
+        wiki_result: "ExternalKnowledgeResult | None",
+        missing_evidence: list[RequiredEvidenceItem],
+    ) -> RecommendedSolution:
+        """Correlates local KB + live TFS + live Wiki into one answer.
+        Deterministic throughout: picks whichever real source(s) clear
+        a confidence bar, quotes/references their actual content, and
+        is honest (``insufficient_evidence=True``, no resolution text)
+        when none do -- never invents a fix. See RecommendedSolution's
+        own docstring for the full source-attribution contract."""
+        what_to_check = [item.description for item in missing_evidence[:5]] or [
+            "Confirm the affected component/technology and gather logs from around the time of the issue."
+        ]
+
+        best_local = (
+            similar_investigations[0]
+            if similar_investigations and similar_investigations[0].score >= self._settings.min_similarity_for_root_cause
+            else None
+        )
+        best_tfs = (
+            tfs_result.matches[0]
+            if tfs_result and tfs_result.available and tfs_result.matches and tfs_result.matches[0].score >= _SOLUTION_CONFIDENCE_FLOOR
+            else None
+        )
+        best_wiki = (
+            wiki_result.matches[0]
+            if wiki_result and wiki_result.available and wiki_result.matches and wiki_result.matches[0].score >= _SOLUTION_CONFIDENCE_FLOOR
+            else None
+        )
+
+        if not (best_local or best_tfs or best_wiki):
+            return RecommendedSolution(
+                likely_issue="Not enough evidence yet to identify a likely root cause.",
+                rationale="No local historical match, TFS case, or Wiki page currently meets the confidence "
+                "bar -- more evidence is needed before recommending a specific fix.",
+                what_to_check=what_to_check,
+                recommended_resolution=None,
+                insufficient_evidence=True,
+                confidence="Insufficient",
+            )
+
+        # Real cross-source correlation, not a guess: a TFS Bug's own
+        # LandisGyr.CRMID field carries the exact ServiceNow ticket
+        # number(s) that reported it -- the same convention Task Import
+        # already tags Historical Investigations with (tags:
+        # ["ticket:<number>"]). When they match, this isn't "two
+        # similar cases" -- it's the same real-world incident seen from
+        # two systems.
+        correlated_local: KnowledgeMatch | None = None
+        if best_tfs is not None and best_tfs.tfs_case.crm_id:
+            crm_tokens = [t.strip().upper() for t in best_tfs.tfs_case.crm_id.split("/") if t.strip()]
+            for match in similar_investigations:
+                tags = str(match.metadata.get("tags", "")).upper()
+                if any(token and token in tags for token in crm_tokens):
+                    correlated_local = match
+                    break
+
+        rationale_parts: list[str] = []
+        likely_issue: str | None = None
+        recommended_resolution: str | None = None
+        confidence_score = 0.0
+
+        if best_local is not None:
+            root_cause = best_local.metadata.get("root_cause")
+            likely_issue = _snippet(root_cause) if root_cause else best_local.title
+            rationale_parts.append(f"a similar local historical investigation ({best_local.score:.0%} similarity)")
+            confidence_score = max(confidence_score, best_local.score)
+            local_resolution = best_local.metadata.get("resolution")
+            if local_resolution:
+                recommended_resolution = f"Based on a similar past case: {_snippet(local_resolution)}"
+
+        if best_tfs is not None:
+            case = best_tfs.tfs_case
+            if likely_issue is None:
+                likely_issue = case.title
+            correlation_note = " -- the same real-world case as the local historical match above (matching CRM/ticket reference)" if correlated_local else ""
+            rationale_parts.append(f"TFS-{case.tfs_id} ({case.state}, {best_tfs.confidence.lower()} confidence){correlation_note}")
+            confidence_score = max(confidence_score, best_tfs.score)
+            if case.resolution_text:
+                recommended_resolution = f"Based on TFS-{case.tfs_id} ({case.state}): {case.resolution_text}"
+
+        if best_wiki is not None:
+            page = best_wiki.wiki_page
+            rationale_parts.append(f'the Wiki page "{page.title}"')
+            confidence_score = max(confidence_score, best_wiki.score)
+            if recommended_resolution is None and page.excerpt:
+                recommended_resolution = f'Per Wiki page "{page.title}": {page.excerpt}'
+
+        if likely_issue is None:
+            likely_issue = "Multiple weak signals found -- no single source clearly explains the issue yet."
+
+        return RecommendedSolution(
+            likely_issue=likely_issue,
+            rationale="Based on " + " and ".join(rationale_parts) + ".",
+            what_to_check=what_to_check,
+            recommended_resolution=recommended_resolution,
+            insufficient_evidence=recommended_resolution is None,
+            confidence=confidence_for_score(confidence_score) if recommended_resolution else "Low",
+            source_local=best_local is not None,
+            source_tfs=best_tfs is not None,
+            source_wiki=best_wiki is not None,
+            supporting_tfs_id=best_tfs.tfs_case.tfs_id if best_tfs else None,
+            supporting_tfs_url=best_tfs.tfs_case.url if best_tfs else None,
+            supporting_wiki_title=best_wiki.wiki_page.title if best_wiki else None,
+            supporting_wiki_url=best_wiki.wiki_page.url if best_wiki else None,
         )
 
     def _match_component(
