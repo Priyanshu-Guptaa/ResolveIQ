@@ -72,8 +72,7 @@ def render_external_knowledge(tfs_result: dict | None, wiki_result: dict | None)
         elif not tfs_result["matches"]:
             st.caption("No relevant historical issues found.")
         else:
-            cache_note = " (cached)" if tfs_result.get("from_cache") else ""
-            st.success(f"✓ {len(tfs_result['matches'])} relevant historical issue(s) found{cache_note}")
+            _render_result_status(tfs_result["matches"], noun="historical issue", cached=bool(tfs_result.get("from_cache")))
             for match in tfs_result["matches"]:
                 _render_tfs_match(match)
 
@@ -84,7 +83,25 @@ def render_external_knowledge(tfs_result: dict | None, wiki_result: dict | None)
         elif not wiki_result["matches"]:
             st.caption("No relevant documentation found.")
         else:
-            cache_note = " (cached)" if wiki_result.get("from_cache") else ""
-            st.success(f"✓ {len(wiki_result['matches'])} relevant page(s) found{cache_note}")
+            _render_result_status(wiki_result["matches"], noun="page", cached=bool(wiki_result.get("from_cache")))
             for match in wiki_result["matches"]:
                 _render_wiki_match(match)
+
+
+def _render_result_status(matches: list[dict], *, noun: str, cached: bool) -> None:
+    """A green "relevant" checkmark overclaims when every match is
+    Low confidence -- found live: 5 real TFS matches, all Low
+    confidence (technology-only overlap), were shown as "5 relevant
+    historical issue(s) found" with a success banner even though none
+    of them addressed the investigation's actual problem. Only claim
+    "relevant" when at least one match genuinely cleared the bar;
+    otherwise say plainly that these share only the technology and
+    need manual review."""
+    cache_note = " (cached)" if cached else ""
+    if any(m["confidence"] != "Low" for m in matches):
+        st.success(f"✓ {len(matches)} relevant {noun}(s) found{cache_note}")
+    else:
+        st.caption(
+            f"{len(matches)} {noun}(s) found with overlapping technology/keywords{cache_note}, but none closely "
+            "match this investigation's specific problem -- review manually before relying on any of them."
+        )

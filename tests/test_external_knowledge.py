@@ -423,12 +423,18 @@ def test_gather_caches_repeat_queries():
 
 
 def test_tfs_recommended_action_quotes_resolution_never_invents():
+    """Needs a genuinely confident match (near-identical title + a
+    matching technology, same as a real Analyze call would supply) --
+    recommended_action is deliberately withheld for Low-confidence
+    matches (see test_tfs_recommended_action_none_for_low_confidence
+    below), so a bare title-only match no longer exercises this path."""
     tfs = FakeTfsConnector(cases=[_make_case(resolution="Restart CommandProcessorHost and verify init messages")])
     wiki = FakeWikiConnector(pages=[])
     service = ExternalKnowledgeService(tfs_connector=tfs, wiki_connector=wiki, settings=Settings())
 
-    tfs_result, _ = service.gather(_investigation(), [], None, None)
+    tfs_result, _ = service.gather(_investigation(), [], None, "Meter stuck in Discovered state")
 
+    assert tfs_result.matches[0].confidence != "Low"
     assert "Restart CommandProcessorHost and verify init messages" in tfs_result.matches[0].recommended_action
 
 
@@ -442,3 +448,30 @@ def test_tfs_recommended_action_none_when_no_resolution_text():
 
     if tfs_result.matches:
         assert tfs_result.matches[0].recommended_action is None
+
+
+def test_tfs_recommended_action_none_for_low_confidence_match():
+    """Regression test for a real reported bug: a Low-confidence TFS
+    match (technology-only overlap, weak title overlap) about a
+    genuinely different defect was still being boxed as a confident
+    "ResolveIQ recommendation" just because it had *any* resolution
+    text on file -- the same class of bug already fixed twice in the
+    local-KB synthesis layer, found live in the TFS card renderer too."""
+    case = _make_case(
+        title="Completely unrelated billing extract issue",
+        state="Active",
+        resolution="Some unrelated fix for a different problem entirely",
+    )
+    tfs = FakeTfsConnector(cases=[case])
+    wiki = FakeWikiConnector(pages=[])
+    service = ExternalKnowledgeService(tfs_connector=tfs, wiki_connector=wiki, settings=Settings())
+
+    tfs_result, _ = service.gather(_investigation(), [], None, None)
+
+    if tfs_result.matches:
+        assert tfs_result.matches[0].confidence == "Low"
+        assert tfs_result.matches[0].recommended_action is None
+        # The raw TFS-reported resolution is still available -- this
+        # only gates ResolveIQ's own endorsement of it, never hides
+        # the source fact.
+        assert tfs_result.matches[0].tfs_case.resolution_text == "Some unrelated fix for a different problem entirely"

@@ -159,10 +159,19 @@ def _entity_values(entities: list["ExtractedEntity"]) -> list[str]:
     return [e.value for e in entities if e.entity_type in _ENTITY_TYPES_WORTH_SEARCHING]
 
 
-def _tfs_recommended_action(case: TfsCase) -> str | None:
-    """Quotes the extracted resolution directly -- never a paraphrase.
-    None when TFS genuinely has no resolution content to quote."""
-    if not case.resolution_text:
+def _tfs_recommended_action(case: TfsCase, *, confidence: str) -> str | None:
+    """Quotes the extracted resolution directly -- never a paraphrase --
+    but only when ``confidence`` clears "Low". A Low-confidence match
+    (technology-only overlap, weak title overlap) hasn't earned the
+    "ResolveIQ recommendation:" framing -- found live: a real Low-
+    confidence TFS match about a completely different defect (Gap Recon
+    command delivery vs. a Get LP command DCW error) was still being
+    boxed as a confident recommendation just because it had *any*
+    resolution text, the same class of bug already fixed twice in the
+    local-KB synthesis layer. The raw "TFS reported resolution" text
+    (rendered separately, unconditionally, straight from the source)
+    is untouched -- this only gates ResolveIQ's own endorsement of it."""
+    if not case.resolution_text or confidence == "Low":
         return None
     return f"Based on TFS-{case.tfs_id} ({case.state}): {case.resolution_text}"
 
@@ -178,13 +187,14 @@ def _score_tfs(case: TfsCase, *, investigation_title: str, matched_component_nam
         technology=technology,
         entity_values=entity_values,
     )
+    confidence = confidence_for_score(score)
     return ExternalMatch(
         source=ExternalSource.TFS,
         tfs_case=case,
         score=score,
-        confidence=confidence_for_score(score),
+        confidence=confidence,
         match_reasons=reasons,
-        recommended_action=_tfs_recommended_action(case),
+        recommended_action=_tfs_recommended_action(case, confidence=confidence),
     )
 
 
