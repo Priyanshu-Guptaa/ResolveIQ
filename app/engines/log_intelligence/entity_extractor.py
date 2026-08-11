@@ -86,7 +86,22 @@ _PATTERN_REGISTRY: dict[EntityType, list[_Pattern]] = {
         _Pattern(_compile(r"\bx-correlation-id\s*[:=]\s*([\w\-]+)")),
     ],
     EntityType.EXCEPTION_TYPE: [
-        _Pattern(_compile(r"\b([\w.$]+(?:Exception|Error))\b", flags=0)),
+        # Negative lookahead excludes a ServiceNow-template-style empty
+        # field label (e.g. "ContainsError = ;") -- found live: a real
+        # investigation's "Likely issue" ended up naming an empty field
+        # label as the exception, because the field happened to be
+        # named "...Error" and this pattern doesn't otherwise care
+        # whether it was ever actually thrown. A real exception/error
+        # name is never immediately followed by "= ;", "= ,", or "="
+        # at end of text -- that's specifically the shape of an unset
+        # template field.
+        _Pattern(_compile(r"\b([\w.$]+(?:Exception|Error))\b(?!\s*=\s*(?:[;,]|$))", flags=0)),
+        # A domain error-code convention seen in real ticket text
+        # ("DCWErr_Invalid_Response_Length") that the pattern above
+        # never catches, since it doesn't end in the literal suffix
+        # "Exception"/"Error" -- general "<Prefix>Err_<detail>" shape,
+        # not specific to any one product's naming.
+        _Pattern(_compile(r"\b([A-Za-z]+Err_[A-Za-z0-9_]+)\b", flags=0)),
     ],
     EntityType.STACK_TRACE: [
         _Pattern(_compile(r"^\s*(at\s+[\w.$]+\([^)]*\))", flags=re.MULTILINE), group=1),

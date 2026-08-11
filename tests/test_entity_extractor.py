@@ -41,6 +41,41 @@ def test_extracts_exception_type_and_stack_trace_frames():
     assert any("OrderProcessor.calculateTotal" in frame for frame in stack_frames)
 
 
+def test_exception_type_ignores_empty_servicenow_template_field():
+    """Regression test for a real reported bug: a ServiceNow-template
+    empty field happened to be named "...Error" (e.g. "ContainsError")
+    and was being extracted as if it were an actual thrown exception,
+    which then drove a misleading "Likely issue" for a real
+    investigation. An unset field's shape ("Label = ;" / "Label =," /
+    "Label =" at end) must never be mistaken for a real exception name,
+    while a real error code elsewhere in the same text (which doesn't
+    even follow the Exception/Error suffix convention) should still be
+    found."""
+    extractor = RegexEntityExtractor()
+    text = (
+        "Meter is getting the error ContainsError = ; Command failed due to ST-07 error = ; "
+        "Procedure: = DCW Error; Reason: = DCWErr_Invalid_Response_Length while sending the get "
+        "Load profile command"
+    )
+
+    entities = extractor.extract(text)
+    values = _values_for(entities, EntityType.EXCEPTION_TYPE)
+
+    assert "ContainsError" not in values
+    assert "DCWErr_Invalid_Response_Length" in values
+
+
+def test_exception_type_still_matches_a_real_populated_field():
+    """The empty-value exclusion must not swallow a genuinely populated
+    "Label = Value" occurrence."""
+    extractor = RegexEntityExtractor()
+    text = "Root cause: ConnectionTimeoutError = the upstream service did not respond in time"
+
+    entities = extractor.extract(text)
+
+    assert "ConnectionTimeoutError" in _values_for(entities, EntityType.EXCEPTION_TYPE)
+
+
 def test_extracts_meter_and_serial_and_endpoint():
     extractor = RegexEntityExtractor()
     text = "CommandTimeout for meter=80071234567 endpoint_id=EP-99213 serial_number=SN-4471882"
