@@ -508,6 +508,44 @@ def test_available_log_technologies_empty_when_no_log_knowledge_repo():
     assert engine.available_log_technologies() == []
 
 
+def test_infer_technology_prefers_the_more_specific_tied_match():
+    """Regression test for a real reported bug: "RF Mesh" and "RF Mesh
+    IP" both score a full 1.0 keyword_match_score against text
+    containing "Technology: RF Mesh IP" (the word-boundary check after
+    "Mesh" is satisfied by the space before "IP"), so a real ATCO RF
+    Mesh IP investigation had its live TFS/Wiki search anchored on the
+    vaguer "RF Mesh" purely because it happened to be listed first --
+    pulling in genuinely unrelated generic RF Mesh tickets instead of
+    RF-Mesh-IP-specific ones. On a tied score, the longer (more
+    specific) technology name must win, regardless of list order."""
+    scenarios = [
+        _make_scenario("sc-1", "RF Mesh", "Command Request (Outbound)", [_make_step("src-a", "A", 1)]),
+        _make_scenario("sc-2", "RF Mesh IP", "Command Request (Outbound)", [_make_step("src-a", "A", 1)]),
+    ]
+    log_repo = FakeLogKnowledgeRepo(scenarios, [_make_source("src-a", "A")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+    investigation = _investigation_with_evidence(
+        "Organization Name: ATCO. Technology: RF Mesh IP. Defect: Interval Data Extract for All meters is Empty."
+    )
+
+    assert engine._infer_technology(investigation) == "RF Mesh IP"
+
+
+def test_infer_technology_list_order_reversed_still_prefers_specific_match():
+    """Same as above with the two technologies registered in the
+    opposite order, to prove the fix isn't accidentally still
+    depending on iteration order."""
+    scenarios = [
+        _make_scenario("sc-1", "RF Mesh IP", "Command Request (Outbound)", [_make_step("src-a", "A", 1)]),
+        _make_scenario("sc-2", "RF Mesh", "Command Request (Outbound)", [_make_step("src-a", "A", 1)]),
+    ]
+    log_repo = FakeLogKnowledgeRepo(scenarios, [_make_source("src-a", "A")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+    investigation = _investigation_with_evidence("Technology: RF Mesh IP.")
+
+    assert engine._infer_technology(investigation) == "RF Mesh IP"
+
+
 # --- Log Intelligence: Product Intelligence integration ----------------------
 
 

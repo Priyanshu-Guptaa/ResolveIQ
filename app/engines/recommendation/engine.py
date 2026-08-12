@@ -687,11 +687,26 @@ class RecommendationEngine:
             return None
         context = investigation.context_text
         best_technology: str | None = None
-        best_score = 0.0
+        best_key: tuple[float, int] = (0.0, 0)
         for technology in self.available_log_technologies():
             score = keyword_match_score(technology, context)
-            if score > best_score:
-                best_score = score
+            # Real bug this fixes: "RF Mesh" and "RF Mesh IP" both score
+            # a full 1.0 against text containing "Technology: RF Mesh
+            # IP" -- keyword_match_score's word-boundary check only
+            # requires a non-word character after the phrase (the space
+            # before "IP" satisfies it), so a shorter technology name
+            # that's a strict prefix of a more specific one ties with
+            # it rather than losing to it. Breaking that tie by mere
+            # iteration order picked the vaguer "RF Mesh" over "RF Mesh
+            # IP" for a real ATCO RF-Mesh-IP investigation, anchoring
+            # the live TFS/Wiki search on the wrong, broader technology
+            # and pulling in genuinely unrelated generic RF-Mesh
+            # tickets. On a tied score, prefer the longer (more
+            # specific) technology name -- it still fully matched, so
+            # it's strictly more informative, never less correct.
+            key = (score, len(technology))
+            if key > best_key:
+                best_key = key
                 best_technology = technology
         return best_technology
 
