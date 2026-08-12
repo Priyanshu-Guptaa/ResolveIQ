@@ -37,15 +37,32 @@ logger = logging.getLogger(__name__)
 
 _MIN_WORD_LEN = 4
 _MAX_TITLE_WORDS = 5
+_MAX_DESCRIPTION_WORDS = 5
 _MAX_TOTAL_TERMS = 8
 _TFS_WORK_ITEM_TYPES = ["Bug", "Issue"]
-_ENTITY_TYPES_WORTH_SEARCHING = {EntityType.EXCEPTION_TYPE}
-"""Deliberately narrow: most extracted entity types (thread/session/
-correlation ids, serial numbers, ...) are per-instance values specific
-to *this* occurrence and will never appear verbatim in a different
-historical incident, even one caused by the same underlying bug.
-Exception type names are the one category that genuinely recurs across
-unrelated real-world occurrences of the same class of problem."""
+_ENTITY_TYPES_WORTH_SEARCHING = {
+    EntityType.EXCEPTION_TYPE,
+    EntityType.METER_NUMBER,
+    EntityType.SERIAL_NUMBER,
+    EntityType.CORRELATION_ID,
+    EntityType.HOST_NAME,
+}
+"""Deliberately still a narrow allowlist, not every entity type: most
+(thread/session/process ids, request ids, ...) are per-instance values
+specific to *this* occurrence and will never appear verbatim in a
+different historical incident, even one caused by the same underlying
+bug. The five kept here each have a real reason to recur: exception
+type names recur across unrelated occurrences of the same class of
+problem; a meter/serial number recurs when the *same physical device*
+shows up in more than one ticket (a genuinely strong signal, not a
+coincidence); a host name can be a stable, reused server identity
+rather than a per-request value. Correlation ID is the shakiest of the
+five (usually unique per transaction, so it will rarely actually
+recur) -- kept anyway because on the rare occasion it *does* match,
+that's about as strong and precise a signal as exists; it costs
+nothing when it doesn't match, since supporting terms only affect the
+live query when there's no anchor at all, and always affect ranking
+without ever being trusted alone."""
 
 _TICKET_NUMBER_RE = re.compile(r"\b(?:CSTASK|CS|TASK|INC)\d{5,}\b", re.IGNORECASE)
 """Real prefixes observed in this project's actual ServiceNow/TFS data
@@ -70,13 +87,24 @@ class SearchTerms:
     "[Meter.comm][DLMS SW Tool]" UI tickets that merely happened to
     contain the word "Meter").
 
-    ``anchor`` (component/technology -- the investigation's strongest,
-    most reusable signals) is what actually scopes the live query when
-    present: a connector requires at least one anchor term to match,
-    never ORs it in as just one more equally-weighted keyword.
-    ``supporting`` (title keywords, exception-type entities) is used
-    for local ranking always, and as the query filter only when there
-    is no anchor to scope by at all."""
+    ``anchor`` (ticket number, product/version, technology, matched
+    component -- the investigation's strongest, most reusable signals)
+    is what actually scopes the live query when present: a connector
+    requires at least one anchor term to match, never ORs it in as
+    just one more equally-weighted keyword. ``supporting`` (title
+    keywords, description keywords, a narrow allowlist of extracted
+    entities) is used for local ranking always, and as the query
+    filter only when there is no anchor to scope by at all.
+
+    Customer name is deliberately in neither list: it's a real,
+    valuable ranking signal (a same-customer prior case is worth
+    surfacing higher) but was found live to be a bad *query* term --
+    anchors are OR'd, so including it let a ticket qualify as a
+    candidate on customer-name overlap alone, regardless of technology
+    relevance, diluting results the same way flat-OR-everything did
+    before the anchor/supporting split existed. It's applied directly
+    in ``ranking.py``'s ``score_candidate()`` instead, from
+    ``investigation.customer``, never from ``SearchTerms``."""
 
     anchor: list[str] = field(default_factory=list)
     supporting: list[str] = field(default_factory=list)
@@ -102,10 +130,11 @@ def build_search_terms(
     """Deterministic, reuses signals the Recommendation Engine already
     computed -- no new NLP. Anchors, strongest first: a ticket number
     (points at one specific TFS work item, if this exact case was
-    already logged there), customer, product/version (structured
-    Summary Card fields -- real, curated, not free-text guesses),
-    technology, matched component. Supporting: title keywords,
-    exception-type entities."""
+    already logged there), product/version (structured Summary Card
+    fields -- real, curated, not free-text guesses), technology,
+    matched component -- deliberately NOT customer, see SearchTerms'
+    own docstring. Supporting: title keywords, description keywords,
+    a narrow allowlist of extracted entities."""
     anchor: list[str] = []
     supporting: list[str] = []
     seen: set[str] = set()
@@ -119,10 +148,11 @@ def build_search_terms(
             seen.add(key)
             bucket.append(cleaned)
 
-    for ticket in _TICKET_NUMBER_RE.findall(f"{investigation.title}\n{_first_evidence_text(investigation)}"):
+    description_text = _first_evidence_text(investigation)
+
+    for ticket in _TICKET_NUMBER_RE.findall(f"{investigation.title}\n{description_text}"):
         _add(anchor, ticket.upper(), limit=_MAX_TOTAL_TERMS)
 
-    _add(anchor, investigation.customer, limit=_MAX_TOTAL_TERMS)
     _add(anchor, investigation.product, limit=_MAX_TOTAL_TERMS)
     _add(anchor, investigation.version, limit=_MAX_TOTAL_TERMS)
     _add(anchor, technology, limit=_MAX_TOTAL_TERMS)
@@ -131,6 +161,16 @@ def build_search_terms(
 
     title_words = [w for w in re.findall(r"[A-Za-z]+", investigation.title) if len(w) >= _MIN_WORD_LEN]
     for word in title_words[:_MAX_TITLE_WORDS]:
+        _add(supporting, word, limit=_MAX_TOTAL_TERMS)
+
+    # Description keywords, same treatment as title keywords -- only
+    # ever broadens the live query when there's no anchor at all
+    # (SearchTerms' own contract), otherwise just improves local
+    # ranking. Capped separately from title words so a long
+    # description can't crowd out every title word before dedup even
+    # gets a chance to run.
+    description_words = [w for w in re.findall(r"[A-Za-z]+", description_text) if len(w) >= _MIN_WORD_LEN]
+    for word in description_words[:_MAX_DESCRIPTION_WORDS]:
         _add(supporting, word, limit=_MAX_TOTAL_TERMS)
 
     for entity in entities:
@@ -176,7 +216,7 @@ def _tfs_recommended_action(case: TfsCase, *, confidence: str) -> str | None:
     return f"Based on TFS-{case.tfs_id} ({case.state}): {case.resolution_text}"
 
 
-def _score_tfs(case: TfsCase, *, investigation_title: str, matched_component_name, technology, entity_values):
+def _score_tfs(case: TfsCase, *, investigation_title: str, matched_component_name, technology, entity_values, customer):
     body = f"{case.description_text}\n{case.root_cause or ''}\n{case.resolution_text or ''}"
     score, reasons = score_candidate(
         investigation_title=investigation_title,
@@ -186,6 +226,7 @@ def _score_tfs(case: TfsCase, *, investigation_title: str, matched_component_nam
         matched_component_name=matched_component_name,
         technology=technology,
         entity_values=entity_values,
+        customer=customer,
     )
     confidence = confidence_for_score(score)
     return ExternalMatch(
@@ -198,7 +239,7 @@ def _score_tfs(case: TfsCase, *, investigation_title: str, matched_component_nam
     )
 
 
-def _score_wiki(page: WikiPage, *, investigation_title: str, matched_component_name, technology, entity_values):
+def _score_wiki(page: WikiPage, *, investigation_title: str, matched_component_name, technology, entity_values, customer):
     score, reasons = score_candidate(
         investigation_title=investigation_title,
         candidate_title=page.title,
@@ -207,6 +248,7 @@ def _score_wiki(page: WikiPage, *, investigation_title: str, matched_component_n
         matched_component_name=matched_component_name,
         technology=technology,
         entity_values=entity_values,
+        customer=customer,
     )
     return ExternalMatch(source=ExternalSource.WIKI, wiki_page=page, score=score, confidence=confidence_for_score(score), match_reasons=reasons)
 
@@ -244,15 +286,16 @@ class ExternalKnowledgeService:
         component_name = matched_component.component_name if matched_component else None
         entity_values = _entity_values(entities)
         title = investigation.title
+        customer = investigation.customer
         max_results = self._settings.external_knowledge_max_results
         timeout = self._settings.external_knowledge_timeout_seconds
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             tfs_future = executor.submit(
-                self._run_tfs, terms, title, component_name, technology, entity_values, max_results
+                self._run_tfs, terms, title, component_name, technology, entity_values, customer, max_results
             )
             wiki_future = executor.submit(
-                self._run_wiki, terms, title, component_name, technology, entity_values, max_results
+                self._run_wiki, terms, title, component_name, technology, entity_values, customer, max_results
             )
             # Each future's own connector call already carries the
             # configured request timeout internally (see the REST
@@ -272,7 +315,7 @@ class ExternalKnowledgeService:
             logger.warning("External knowledge (%s) failed: %s", source.value, exc.__class__.__name__)
             return ExternalKnowledgeResult(source=source, available=False, error=f"{source.value.upper()} lookup failed unexpectedly.")
 
-    def _run_tfs(self, terms: SearchTerms, title, component_name, technology, entity_values, max_results) -> ExternalKnowledgeResult:
+    def _run_tfs(self, terms: SearchTerms, title, component_name, technology, entity_values, customer, max_results) -> ExternalKnowledgeResult:
         cache_key = _cache_key(ExternalSource.TFS, terms)
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -302,7 +345,14 @@ class ExternalKnowledgeService:
             )
 
         matches = [
-            _score_tfs(c, investigation_title=title, matched_component_name=component_name, technology=technology, entity_values=entity_values)
+            _score_tfs(
+                c,
+                investigation_title=title,
+                matched_component_name=component_name,
+                technology=technology,
+                entity_values=entity_values,
+                customer=customer,
+            )
             for c in cases
         ]
         matches = sorted((m for m in matches if m.score >= 0.25), key=lambda m: m.score, reverse=True)[:max_results]
@@ -310,7 +360,7 @@ class ExternalKnowledgeService:
         self._cache.set(cache_key, result)
         return result
 
-    def _run_wiki(self, terms: SearchTerms, title, component_name, technology, entity_values, max_results) -> ExternalKnowledgeResult:
+    def _run_wiki(self, terms: SearchTerms, title, component_name, technology, entity_values, customer, max_results) -> ExternalKnowledgeResult:
         cache_key = _cache_key(ExternalSource.WIKI, terms)
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -334,7 +384,14 @@ class ExternalKnowledgeService:
             )
 
         matches = [
-            _score_wiki(p, investigation_title=title, matched_component_name=component_name, technology=technology, entity_values=entity_values)
+            _score_wiki(
+                p,
+                investigation_title=title,
+                matched_component_name=component_name,
+                technology=technology,
+                entity_values=entity_values,
+                customer=customer,
+            )
             for p in pages
         ]
         matches = sorted((m for m in matches if m.score >= 0.25), key=lambda m: m.score, reverse=True)[:max_results]

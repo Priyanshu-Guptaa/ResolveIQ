@@ -95,6 +95,36 @@ def test_score_candidate_clamped_to_one():
     assert score <= 1.0
 
 
+def test_score_candidate_rewards_same_customer():
+    score, reasons = score_candidate(
+        investigation_title="Unrelated topic entirely",
+        candidate_title="Completely different subject",
+        candidate_body="Reported by Salt River Project",
+        state="New",
+        matched_component_name=None,
+        technology=None,
+        entity_values=[],
+        customer="Salt River Project",
+    )
+    assert score > 0
+    assert any("customer" in r.lower() for r in reasons)
+
+
+def test_score_candidate_customer_none_is_a_noop():
+    score, reasons = score_candidate(
+        investigation_title="Unrelated topic entirely",
+        candidate_title="Completely different subject",
+        candidate_body="No overlap at all",
+        state="New",
+        matched_component_name=None,
+        technology=None,
+        entity_values=[],
+        customer=None,
+    )
+    assert score == 0.0
+    assert reasons == []
+
+
 def test_confidence_bands():
     assert confidence_for_score(0.9) == "High"
     assert confidence_for_score(0.65) == "High"
@@ -221,15 +251,42 @@ def test_build_search_terms_deduplicates_case_insensitively():
     assert terms.all.count("Mesh") == 1
 
 
-def test_build_search_terms_only_includes_exception_type_entities():
+def test_build_search_terms_only_includes_allowlisted_entity_types():
     inv = _Investigation("short")
     entities = [
         ExtractedEntity(entity_type=EntityType.EXCEPTION_TYPE, value="NullPointerException"),
+        ExtractedEntity(entity_type=EntityType.METER_NUMBER, value="63R0178"),
+        ExtractedEntity(entity_type=EntityType.SERIAL_NUMBER, value="SN-99887"),
+        ExtractedEntity(entity_type=EntityType.CORRELATION_ID, value="corr-abc-123"),
+        ExtractedEntity(entity_type=EntityType.HOST_NAME, value="cc-app-01"),
         ExtractedEntity(entity_type=EntityType.THREAD_ID, value="12345"),
     ]
     terms = build_search_terms(inv, entities, None, None)
     assert "NullPointerException" in terms.supporting
+    assert "63R0178" in terms.supporting
+    assert "SN-99887" in terms.supporting
+    assert "corr-abc-123" in terms.supporting
+    assert "cc-app-01" in terms.supporting
     assert "12345" not in terms.all
+
+
+def test_build_search_terms_includes_description_keywords_as_supporting():
+    """Regression test for a real reported request: the free-text task
+    description previously only contributed a ticket-number regex scan
+    to the live query -- real description keywords (beyond the title)
+    never counted as search input at all."""
+    from app.domain.evidence import Evidence
+    from app.domain.enums import EvidenceType
+
+    inv = _Investigation("Meter stuck")
+    inv.add_evidence(Evidence(
+        investigation_id=inv.id,
+        evidence_type=EvidenceType.TASK_DESCRIPTION,
+        raw_content="Interval data extract delivering empty files consistently on the sftp server.",
+    ))
+    terms = build_search_terms(inv, [], None, None)
+    assert "Interval" in terms.supporting or "interval" in [t.lower() for t in terms.supporting]
+    assert any(t.lower() == "extract" for t in terms.supporting)
 
 
 def test_build_search_terms_caps_total_count():
@@ -238,15 +295,26 @@ def test_build_search_terms_caps_total_count():
     assert len(terms.all) <= 8
 
 
-def test_build_search_terms_includes_customer_product_version_as_anchors():
+def test_build_search_terms_includes_product_version_as_anchors():
     inv = _Investigation("Meter stuck")
-    inv.customer = "Salt River Project"
     inv.product = "Command Center"
     inv.version = "9.0.5"
     terms = build_search_terms(inv, [], None, None)
-    assert "Salt River Project" in terms.anchor
     assert "Command Center" in terms.anchor
     assert "9.0.5" in terms.anchor
+
+
+def test_build_search_terms_never_includes_customer_as_a_query_term():
+    """Regression test for a real reported case (ATCO, a real RF-Mesh-IP
+    investigation): customer used to be OR'd in as an anchor, which let
+    a candidate qualify on customer-name overlap alone -- diluting
+    results with tickets unrelated in technology. Customer is a real,
+    valuable ranking signal (see ranking.py's score_candidate), just
+    never a live query term."""
+    inv = _Investigation("Meter stuck")
+    inv.customer = "Salt River Project"
+    terms = build_search_terms(inv, [], None, None)
+    assert "Salt River Project" not in terms.all
 
 
 def test_build_search_terms_extracts_ticket_number_from_title_as_anchor():

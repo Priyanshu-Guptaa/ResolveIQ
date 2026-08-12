@@ -24,6 +24,13 @@ _WEIGHT_ENTITY_MATCH_MAX = 0.30
 third+ matching entity is still real signal but shouldn't let entity
 overlap alone dominate the score over component/technology matches."""
 _WEIGHT_RESOLVED_STATE = 0.10
+_WEIGHT_CUSTOMER = 0.15
+"""Customer is deliberately a *ranking* signal only, never a live
+*query* term (see SearchTerms' own docstring, app/engines/external_
+knowledge/service.py) -- a same-customer prior case is real, useful
+evidence once a candidate is already in hand, but letting it qualify a
+candidate on its own (as an OR'd anchor) diluted results with
+unrelated tickets that merely mentioned the same customer name."""
 
 _RESOLVED_STATES = {"resolved", "closed", "done"}
 
@@ -68,6 +75,7 @@ def score_candidate(
     matched_component_name: str | None,
     technology: str | None,
     entity_values: list[str],
+    customer: str | None = None,
 ) -> tuple[float, list[str]]:
     """Returns (score, match_reasons). ``candidate_body`` is whatever
     plain-text content the candidate carries (TFS description, Wiki
@@ -101,6 +109,10 @@ def score_candidate(
     if state and state.strip().lower() in _RESOLVED_STATES:
         score += _WEIGHT_RESOLVED_STATE
         reasons.append(f"Already resolved (state: {state})")
+
+    if customer and keyword_match_score(customer, combined_context) > 0:
+        score += _WEIGHT_CUSTOMER
+        reasons.append(f"Same customer: {customer}")
 
     score = max(0.0, min(1.0, score))
     return score, reasons
