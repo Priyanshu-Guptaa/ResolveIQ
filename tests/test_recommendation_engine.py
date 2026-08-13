@@ -516,14 +516,20 @@ def test_infer_technology_prefers_the_more_specific_tied_match():
     Mesh IP investigation had its live TFS/Wiki search anchored on the
     vaguer "RF Mesh" purely because it happened to be listed first --
     pulling in genuinely unrelated generic RF Mesh tickets instead of
-    RF-Mesh-IP-specific ones. On a tied score, the longer (more
-    specific) technology name must win, regardless of list order."""
+    RF-Mesh-IP-specific ones. On a tied score, the more specific
+    technology must win, regardless of list order -- resolved via the
+    real Technology.parent_technology_id hierarchy (see
+    _match_single_technology, 2026-08-13), not technology-name length;
+    production always wires a LookupRepository alongside the log
+    knowledge repository (app/api/dependencies.py), so that's the
+    configuration under test here."""
     scenarios = [
         _make_scenario("sc-1", "RF Mesh", "Command Request (Outbound)", [_make_step("src-a", "A", 1)]),
         _make_scenario("sc-2", "RF Mesh IP", "Command Request (Outbound)", [_make_step("src-a", "A", 1)]),
     ]
     log_repo = FakeLogKnowledgeRepo(scenarios, [_make_source("src-a", "A")])
-    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+    lookup_repo = FakeLookupRepoForTechnology(_rf_mesh_family())
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo, lookup_repo=lookup_repo)
     investigation = _investigation_with_evidence(
         "Organization Name: ATCO. Technology: RF Mesh IP. Defect: Interval Data Extract for All meters is Empty."
     )
@@ -540,10 +546,32 @@ def test_infer_technology_list_order_reversed_still_prefers_specific_match():
         _make_scenario("sc-2", "RF Mesh", "Command Request (Outbound)", [_make_step("src-a", "A", 1)]),
     ]
     log_repo = FakeLogKnowledgeRepo(scenarios, [_make_source("src-a", "A")])
-    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+    lookup_repo = FakeLookupRepoForTechnology(_rf_mesh_family())
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo, lookup_repo=lookup_repo)
     investigation = _investigation_with_evidence("Technology: RF Mesh IP.")
 
     assert engine._infer_technology(investigation) == "RF Mesh IP"
+
+
+def test_infer_technology_no_lookup_repo_cannot_resolve_tie_returns_none():
+    """Without a LookupRepository (no hierarchy data available at
+    all), a genuine tie between "RF Mesh" and "RF Mesh IP" can no
+    longer be resolved by guessing (e.g. by string length) -- the
+    fixed rule returns None rather than a possibly-wrong answer. This
+    differs from the two tests above only in omitting lookup_repo;
+    production never omits it (both are always wired together, see
+    app/api/dependencies.py), so this documents the honest fallback
+    behavior for the incomplete configuration, not the production
+    path."""
+    scenarios = [
+        _make_scenario("sc-1", "RF Mesh", "Command Request (Outbound)", [_make_step("src-a", "A", 1)]),
+        _make_scenario("sc-2", "RF Mesh IP", "Command Request (Outbound)", [_make_step("src-a", "A", 1)]),
+    ]
+    log_repo = FakeLogKnowledgeRepo(scenarios, [_make_source("src-a", "A")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+    investigation = _investigation_with_evidence("Technology: RF Mesh IP.")
+
+    assert engine._infer_technology(investigation) is None
 
 
 # --- Log Intelligence: Product Intelligence integration ----------------------
@@ -994,7 +1022,7 @@ def _wiki_result(matches=None, available=True):
 
 def test_synthesize_recommendation_insufficient_evidence_when_nothing_clears_bar():
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([], [], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
+    solution, sources = engine._synthesize_recommendation([], [], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
 
     assert solution.insufficient_evidence is True
     assert solution.recommended_resolution is None
@@ -1007,7 +1035,7 @@ def test_synthesize_recommendation_never_fabricates_when_tfs_match_has_no_resolu
     recorded a resolution -- must not fabricate one."""
     case = _tfs_case(resolution=None)
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+    solution, sources = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
 
     assert solution.source_tfs is True
     assert solution.recommended_resolution is None
@@ -1017,7 +1045,7 @@ def test_synthesize_recommendation_never_fabricates_when_tfs_match_has_no_resolu
 def test_synthesize_recommendation_uses_tfs_resolution_when_available():
     case = _tfs_case(resolution="Restart CommandProcessorHost and verify init messages")
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+    solution, sources = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
 
     assert solution.insufficient_evidence is False
     assert "Restart CommandProcessorHost" in solution.recommended_resolution
@@ -1029,7 +1057,7 @@ def test_synthesize_recommendation_uses_tfs_resolution_when_available():
 def test_synthesize_recommendation_below_floor_tfs_match_does_not_drive_solution():
     case = _tfs_case(resolution="Restart the service")
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.1)]), _wiki_result(matches=[]), [])
+    solution, sources = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.1)]), _wiki_result(matches=[]), [])
 
     assert solution.source_tfs is False
     assert solution.insufficient_evidence is True
@@ -1046,7 +1074,7 @@ def test_synthesize_recommendation_correlates_tfs_crm_id_with_local_ticket():
     )
     case = _tfs_case(resolution="Reissued GEI, confirmed fixed", crm_id="CS0122697/CSTASK0087353")
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([], [match], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+    solution, sources = engine._synthesize_recommendation([], [match], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
 
     assert solution.source_local is True
     assert solution.source_tfs is True
@@ -1056,7 +1084,7 @@ def test_synthesize_recommendation_correlates_tfs_crm_id_with_local_ticket():
 def test_synthesize_recommendation_what_to_check_falls_back_to_generic_when_no_missing_evidence():
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
     case = _tfs_case()
-    solution = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
+    solution, sources = engine._synthesize_recommendation([], [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[]), [])
 
     assert len(solution.what_to_check) >= 1
 
@@ -1064,7 +1092,7 @@ def test_synthesize_recommendation_what_to_check_falls_back_to_generic_when_no_m
 def test_synthesize_recommendation_wiki_fills_resolution_when_tfs_has_none():
     case = _tfs_case(resolution=None)
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation(
+    solution, sources = engine._synthesize_recommendation(
         [], [], _tfs_result(matches=[(case, 0.6)]), _wiki_result(matches=[("Troubleshooting CommandProcessorHost", "Restart the service and check logs", 0.6)]), []
     )
 
@@ -1096,7 +1124,7 @@ def test_synthesize_recommendation_prefers_root_cause_over_raw_local_match_title
         )
     ]
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation(root_causes, [match], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
+    solution, sources = engine._synthesize_recommendation(root_causes, [match], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
 
     assert solution.likely_issue == root_causes[0].description
     assert "CLP | Prod | CC 9.0" not in solution.likely_issue
@@ -1115,7 +1143,7 @@ def test_synthesize_recommendation_local_title_fallback_is_labeled_unconfirmed()
         metadata={},
     )
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([], [match], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
+    solution, sources = engine._synthesize_recommendation([], [match], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
 
     assert "no confirmed root cause" in solution.likely_issue.lower()
     assert match.title in solution.likely_issue
@@ -1139,10 +1167,363 @@ def test_synthesize_recommendation_title_fallback_never_quotes_resolution_of_unt
         metadata={"resolution": "Closure Summary: unrelated ST-03 advisory investigation, not this defect."},
     )
     engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings())
-    solution = engine._synthesize_recommendation([], [match], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
+    solution, sources = engine._synthesize_recommendation([], [match], _tfs_result(matches=[]), _wiki_result(matches=[]), [])
 
     assert solution.recommended_resolution is None
     assert solution.insufficient_evidence is True
     # Local KB still genuinely shaped the (caveated) likely_issue, so it's
     # still an honest source to disclose -- just not for the resolution.
     assert solution.source_local is True
+
+
+# --- RF Mesh vs Mesh IP specificity fix (Context Dimensions phase, 2026-08-12,
+# approved product decision #6/#7) -------------------------------------------
+
+
+class FakeLookupRepoForTechnology:
+    """Structurally satisfies the parts of LookupRepository
+    _specificity_demoted_technologies/_resolve_retrieval_context use."""
+
+    def __init__(self, technologies) -> None:
+        self._technologies = technologies
+
+    def list_technologies(self, *, active_only: bool = True):
+        return self._technologies
+
+    def get_technology_by_name(self, name: str):
+        return next((t for t in self._technologies if t.name == name), None)
+
+    def get_customer_by_name(self, name: str):  # pragma: no cover -- unused in these tests
+        return None
+
+
+def _rf_mesh_family():
+    from app.domain.lookup_entities import Technology
+
+    parent = Technology(id="tech-rf-mesh", name="RF Mesh")
+    child_ip = Technology(id="tech-rf-mesh-ip", name="RF Mesh IP", parent_technology_id="tech-rf-mesh")
+    child_das = Technology(id="tech-rf-mesh-das", name="RF Mesh (DAS implementation)", parent_technology_id="tech-rf-mesh")
+    unrelated = Technology(id="tech-wi-sun", name="Wi-Sun")
+    return [parent, child_ip, child_das, unrelated]
+
+
+def test_bare_technology_is_demoted_when_specific_variant_also_mentioned():
+    """The real, reported bug: 'RF Mesh' used to score a full match
+    against text that actually said the more specific 'RF Mesh IP' --
+    both scenarios then looked equally 'Critical'."""
+    bare = _make_scenario("sc-bare", "RF Mesh", "Command Request (Outbound)", [_make_step("src-a", "A", 1)])
+    specific = _make_scenario("sc-specific", "RF Mesh IP", "Command Request (Outbound)", [_make_step("src-b", "B", 1)])
+    log_repo = FakeLogKnowledgeRepo([bare, specific], [_make_source("src-a", "A"), _make_source("src-b", "B")])
+    lookup_repo = FakeLookupRepoForTechnology(_rf_mesh_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo, lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence(
+        "Meter stuck in Discovered state. Technology: RF Mesh IP. Command Request is failing."
+    )
+
+    items = engine._recommend_logs(investigation)
+
+    specific_items = [i for i in items if i.scenario_technology == "RF Mesh IP"]
+    bare_items = [i for i in items if i.scenario_technology == "RF Mesh"]
+    assert specific_items, "the specifically-mentioned technology must still match"
+    assert all(i.priority_label != "Critical" or bare_items == [] for i in bare_items)
+    if bare_items:
+        assert bare_items[0].priority_label != "Critical"
+        assert "more specific" in bare_items[0].match_reason
+        assert "RF Mesh IP" in bare_items[0].match_reason
+
+
+def test_bare_technology_still_scores_critical_when_no_specific_variant_is_mentioned():
+    """No over-correction: mentioning bare 'RF Mesh' (with no 'IP')
+    must not demote the bare-technology scenario at all."""
+    bare = _make_scenario("sc-bare", "RF Mesh", "Command Request (Outbound)", [_make_step("src-a", "A", 1)])
+    log_repo = FakeLogKnowledgeRepo([bare], [_make_source("src-a", "A")])
+    lookup_repo = FakeLookupRepoForTechnology(_rf_mesh_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo, lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence(
+        "Meter stuck in Discovered state. Technology: RF Mesh. Command Request (Outbound) is failing."
+    )
+
+    items = engine._recommend_logs(investigation)
+
+    assert items
+    assert items[0].priority_label == "Critical"
+    assert items[0].scenario_technology == "RF Mesh"
+
+
+def test_no_lookup_repo_wired_never_demotes_anything():
+    """Graceful degradation: older call sites/tests with no
+    LookupRepository keep their exact pre-fix behavior."""
+    bare = _make_scenario("sc-bare", "RF Mesh", "Command Request (Outbound)", [_make_step("src-a", "A", 1)])
+    log_repo = FakeLogKnowledgeRepo([bare], [_make_source("src-a", "A")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+    investigation = _investigation_with_evidence(
+        "Meter stuck in Discovered state. Technology: RF Mesh IP. Command Request is failing."
+    )
+
+    demoted = engine._specificity_demoted_technologies(investigation.context_text)
+    assert demoted == {}
+
+
+def test_specificity_demoted_technologies_direct():
+    lookup_repo = FakeLookupRepoForTechnology(_rf_mesh_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), FakeLogKnowledgeRepo([], []), lookup_repo=lookup_repo
+    )
+
+    demoted = engine._specificity_demoted_technologies("Investigation mentions RF Mesh IP explicitly.")
+    assert demoted == {"RF Mesh": "RF Mesh IP"}
+
+    not_demoted = engine._specificity_demoted_technologies("Investigation mentions RF Mesh only.")
+    assert not_demoted == {}
+
+
+# --- Fabricated technology inference fix (2026-08-13, Final Knowledge-
+# Quality Acceptance Test, Findings #1/#2) -----------------------------
+
+
+class FakeLookupRepoWithList:
+    """Structurally satisfies the parts of LookupRepository
+    _match_single_technology uses -- unlike FakeLookupRepoForTechnology,
+    exposes list_technologies() with the real (id, parent_technology_id)
+    shape needed to test the hierarchy-aware tie-break directly."""
+
+    def __init__(self, technologies) -> None:
+        self._technologies = technologies
+
+    def list_technologies(self, *, active_only: bool = True):
+        return self._technologies
+
+    def get_technology_by_name(self, name: str):
+        return next((t for t in self._technologies if t.name == name), None)
+
+    def get_customer_by_name(self, name: str):  # pragma: no cover -- unused in these tests
+        return None
+
+
+def test_no_technology_mentioned_returns_none():
+    """Finding #1: a zero-score candidate must never win merely for
+    lacking competition."""
+    lookup_repo = FakeLookupRepoWithList(_rf_mesh_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), FakeLogKnowledgeRepo([], []), lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence("TEPCO customer reporting HES issue -- meters not communicating via DLMS.")
+
+    assert engine._infer_technology(investigation) is None
+
+
+def test_random_generic_text_returns_none():
+    """Finding #1, the literal reported case: fully generic text with
+    zero technology vocabulary must never resolve to the single
+    longest-named governed technology (or anything else)."""
+    lookup_repo = FakeLookupRepoWithList(_rf_mesh_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), FakeLogKnowledgeRepo([], []), lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence("Command processing appears delayed. Need to check command lifecycle and response status.")
+
+    assert engine._infer_technology(investigation) is None
+
+
+def test_bare_rf_mesh_infers_rf_mesh():
+    lookup_repo = FakeLookupRepoWithList(_rf_mesh_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), FakeLogKnowledgeRepo([], []), lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence("Commands are failing on the RF Mesh network. Technology: RF Mesh.")
+
+    assert engine._infer_technology(investigation) == "RF Mesh"
+
+
+def test_explicit_rf_mesh_ip_infers_rf_mesh_ip():
+    lookup_repo = FakeLookupRepoWithList(_rf_mesh_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), FakeLogKnowledgeRepo([], []), lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence("Meters showing Discovered state. Technology: RF Mesh IP.")
+
+    assert engine._infer_technology(investigation) == "RF Mesh IP"
+
+
+def test_mesh_ip_without_rf_prefix_resolves_to_rf_mesh_ip_not_das_implementation():
+    """Finding #2, the exact reported case, resolved by the generic
+    evidence-coverage rule (2026-08-13): 'Mesh IP' text contains the
+    single significant word "Mesh", which is 100% coverage of both
+    "RF Mesh"'s and "RF Mesh IP"'s own (single-word) significant
+    vocabulary -- both remain valid partial matches. "RF Mesh (DAS
+    implementation)" needs BOTH "Mesh" and "implementation" (its own
+    two significant words) to count as valid evidence; only "Mesh" is
+    present, so it's excluded outright (0.0, not merely "weaker").
+    That leaves "RF Mesh" (ancestor) and "RF Mesh IP" (its real,
+    governed child) tied at the top score -- specificity resolves this
+    exactly as it does for the full-phrase "RF Mesh IP" case, so the
+    real technology inference is "RF Mesh IP", not an unresolved
+    ambiguity and never the wrong sibling."""
+    lookup_repo = FakeLookupRepoWithList(_rf_mesh_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), FakeLogKnowledgeRepo([], []), lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence("Interval extract files are breaking on the Mesh IP network.")
+
+    result = engine._infer_technology(investigation)
+    assert result != "RF Mesh (DAS implementation)"
+    assert result == "RF Mesh IP"
+
+
+def test_explicit_das_implementation_infers_that_technology():
+    """Sanity check: the third sibling, when explicitly and uniquely
+    named, still resolves correctly -- proves the fix doesn't just
+    suppress the family, it correctly resolves an unambiguous case."""
+    lookup_repo = FakeLookupRepoWithList(_rf_mesh_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), FakeLogKnowledgeRepo([], []), lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence("Technology: RF Mesh (DAS implementation). Water module deployment.")
+
+    assert engine._infer_technology(investigation) == "RF Mesh (DAS implementation)"
+
+
+def test_no_lookup_repo_wired_still_never_fabricates_from_zero_score():
+    """Graceful degradation path (available_log_technologies() fallback,
+    no hierarchy) must obey the same 'zero score never wins' rule."""
+    scenario = _make_scenario("sc-1", "RF Mesh", "Command Request (Outbound)", [_make_step("src-a", "A", 1)])
+    log_repo = FakeLogKnowledgeRepo([scenario], [_make_source("src-a", "A")])
+    engine = RecommendationEngine(KnowledgeEngine(FakeKnowledgeStore()), Settings(), log_repo)
+    investigation = _investigation_with_evidence("Totally unrelated text about weather and lunch.")
+
+    assert engine._infer_technology(investigation) is None
+
+
+# --- Generic single-word-overlap evidence threshold (2026-08-13) -------
+
+
+def _multi_word_technology_family():
+    """A real-shaped multi-significant-word technology name plus an
+    unrelated single-significant-word one -- mirrors the real
+    'Tool Data (BCS / HHU) processing' vs 'RF Mesh' shapes without
+    hardcoding those exact real names into the test helper itself."""
+    from app.domain.lookup_entities import Technology
+
+    multi_word = Technology(id="tech-tool-data", name="Tool Data (BCS / HHU) processing")
+    unrelated = Technology(id="tech-wi-sun", name="Wi-Sun")
+    return [multi_word, unrelated]
+
+
+def test_single_generic_word_overlap_does_not_match_multi_word_technology():
+    """The exact reported case: text sharing only ONE of a multi-word
+    technology's several significant words ("processing" out of
+    {Tool, Data, processing}) must not be treated as evidence for that
+    technology at all."""
+    lookup_repo = FakeLookupRepoWithList(_multi_word_technology_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), FakeLogKnowledgeRepo([], []), lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence(
+        "Command processing appears delayed. Need to check command lifecycle and response status."
+    )
+
+    assert engine._infer_technology(investigation) is None
+
+
+def test_technology_evidence_score_requires_full_coverage_of_significant_words():
+    """Direct unit test of the scoring rule itself: one of two
+    significant words present scores 0.0 (insufficient), not a
+    partial/weak score."""
+    score_one_of_two = RecommendationEngine._technology_evidence_score(
+        "Tool Data (BCS / HHU) processing", "Something about processing only."
+    )
+    assert score_one_of_two == 0.0
+
+    score_all_present = RecommendationEngine._technology_evidence_score(
+        "Tool Data (BCS / HHU) processing", "Tool Data processing needs review."
+    )
+    assert score_all_present == 0.5
+
+    score_single_word_name = RecommendationEngine._technology_evidence_score("RF Mesh", "Something about the Mesh network.")
+    assert score_single_word_name == 0.5
+
+    score_exact_phrase = RecommendationEngine._technology_evidence_score(
+        "Tool Data (BCS / HHU) processing", "Uses Tool Data (BCS / HHU) processing directly."
+    )
+    assert score_exact_phrase == 1.0
+
+
+def test_explicit_full_technology_name_still_matches_despite_multiple_significant_words():
+    """Positive control: the full, exact technology name (all
+    significant words present, in the exact real phrase) must still
+    resolve correctly -- the fix tightens partial matching, it does
+    not break exact matching."""
+    lookup_repo = FakeLookupRepoWithList(_multi_word_technology_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), FakeLogKnowledgeRepo([], []), lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence(
+        "Investigating an issue in Tool Data (BCS / HHU) processing for a batch of endpoints."
+    )
+
+    assert engine._infer_technology(investigation) == "Tool Data (BCS / HHU) processing"
+
+
+def test_all_significant_words_present_but_not_as_exact_phrase_still_matches():
+    """Full coverage of a multi-word candidate's significant
+    vocabulary counts as valid (rule 2, "strong multi-word evidence"),
+    even when the words aren't adjacent/in the exact original phrase
+    order -- distinct from the single-word-only case above."""
+    lookup_repo = FakeLookupRepoWithList(_multi_word_technology_family())
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), FakeLogKnowledgeRepo([], []), lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence("Tool support ticket: Data processing pipeline is delayed for this batch.")
+
+    assert engine._infer_technology(investigation) == "Tool Data (BCS / HHU) processing"
+
+
+# --- Generic component matching fix (2026-08-13, Finding #3) -----------
+
+
+def test_generic_network_word_does_not_match_network_hub():
+    components = [_make_component("comp-1", "Network Hub")]
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), component_repo=FakeComponentRepo(components)
+    )
+    investigation = _investigation_with_evidence("Commands are failing on the RF Mesh network.")
+
+    recommendation = engine.generate(investigation)
+    assert recommendation.strategy.matched_component is None
+
+
+def test_explicit_network_hub_name_still_matches():
+    components = [_make_component("comp-1", "Network Hub")]
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), component_repo=FakeComponentRepo(components)
+    )
+    investigation = _investigation_with_evidence("Network Hub is failing to route endpoint traffic.")
+
+    recommendation = engine.generate(investigation)
+    matched = recommendation.strategy.matched_component
+    assert matched is not None
+    assert matched.component_name == "Network Hub"
+    assert matched.confidence == 1.0
+
+
+# --- TEPCO: customer only, never technology/component (Finding audit) --
+
+
+def test_tepco_customer_never_matched_as_technology_or_component():
+    """TEPCO exists only in the (separate) Customer table -- never in
+    Technology or Component candidates -- so it structurally cannot
+    ever be returned by either matcher, regardless of the fixes above."""
+    lookup_repo = FakeLookupRepoWithList(_rf_mesh_family())
+    components = [_make_component("comp-1", "Device Hub")]
+    engine = RecommendationEngine(
+        KnowledgeEngine(FakeKnowledgeStore()), Settings(), component_repo=FakeComponentRepo(components), lookup_repo=lookup_repo
+    )
+    investigation = _investigation_with_evidence("TEPCO customer reporting HES issue -- meters not communicating via DLMS.")
+
+    assert engine._infer_technology(investigation) is None
+    matched_component = engine._match_component(investigation, investigation.merged_entities)
+    assert matched_component is None

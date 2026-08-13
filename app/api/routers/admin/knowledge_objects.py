@@ -30,9 +30,40 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/objects", tags=["admin-knowledge-objects"])
 
+_RESERVED_RESOLUTION_VERIFICATION_FIELDS = {
+    "resolution_verified",
+    "resolution_verified_by",
+    "resolution_verified_at",
+    "resolution_verification_note",
+}
+"""Blocked from this generic edit endpoint (2026-08-13, Phase 0 --
+Resolution Provenance's approved design explicitly required no
+unrestricted UI/API control for these fields). This generic PATCH
+accepts an open bag of keys by design (see ``KnowledgeObjectWriteRequest``'s
+own docstring) -- without this guard, a caller could set
+``resolution_verified=True`` with no ``resolution_verified_by``/note at
+all, or edit one of the four without the others, silently bypassing the
+audit-paired discipline
+``app/api/routers/admin/resolution_verification.py``'s dedicated
+``/verify``/``/unverify`` endpoints enforce. Those endpoints are the
+only path to changing these fields."""
+
 
 def _not_found(exc: KnowledgeObjectNotFoundError) -> HTTPException:
     return HTTPException(status_code=404, detail=str(exc))
+
+
+def _reject_reserved_fields(fields: dict) -> None:
+    reserved = _RESERVED_RESOLUTION_VERIFICATION_FIELDS & fields.keys()
+    if reserved:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot set {sorted(reserved)} via this generic edit endpoint -- use "
+                "POST /admin/historical-investigations/{id}/verify or "
+                "POST /admin/known-bugs/{id}/verify instead."
+            ),
+        )
 
 
 def _conflict(exc: ObjectHasDependentsError) -> HTTPException:
@@ -82,6 +113,7 @@ def create_object(
     request: KnowledgeObjectWriteRequest,
     service: KnowledgeObjectService = Depends(get_knowledge_object_service),
 ) -> dict:
+    _reject_reserved_fields(request.fields)
     try:
         obj = service.create(object_type, created_by=request.actor, **request.fields)
     except Exception as exc:  # noqa: BLE001 -- surfaces Pydantic's own validation message
@@ -96,6 +128,7 @@ def edit_object(
     request: KnowledgeObjectWriteRequest,
     service: KnowledgeObjectService = Depends(get_knowledge_object_service),
 ) -> dict:
+    _reject_reserved_fields(request.fields)
     try:
         obj = service.edit_metadata(object_type, object_id, updated_by=request.actor, **request.fields)
     except KnowledgeObjectNotFoundError as exc:

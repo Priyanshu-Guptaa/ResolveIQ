@@ -31,7 +31,7 @@ from pydantic import BaseModel
 from app.domain.evidence import DocumentationRecord, HistoricalInvestigationRecord, KnownBugRecord
 from app.domain.knowledge_relationships import KnowledgeObjectRef, KnowledgeObjectType
 from app.domain.log_intelligence_kb import LogCollectionScenario, LogSourceApplication
-from app.domain.lookup_entities import Product, Technology, Version
+from app.domain.lookup_entities import Customer, Product, Region, Technology, Version
 from app.domain.playbook import Playbook
 from app.domain.product_intelligence import ComponentProfile
 from app.domain.sql_studio import QueryTemplate
@@ -150,6 +150,24 @@ def build_adapters(
             delete=lookup_repo.delete_version,
             to_ref=lambda o: KnowledgeObjectRef(type=T.VERSION, id=o.id, title=o.name),
             model_cls=Version,
+        ),
+        T.CUSTOMER: KnowledgeObjectAdapter(
+            get=lookup_repo.get_customer,
+            list_all=lookup_repo.list_customers,
+            save=lookup_repo.save_customer,
+            delete=lookup_repo.delete_customer,
+            to_ref=lambda o: KnowledgeObjectRef(
+                type=T.CUSTOMER, id=o.id, title=o.name, subtitle="verified" if o.verified else "unverified"
+            ),
+            model_cls=Customer,
+        ),
+        T.REGION: KnowledgeObjectAdapter(
+            get=lookup_repo.get_region,
+            list_all=lookup_repo.list_regions,
+            save=lookup_repo.save_region,
+            delete=lookup_repo.delete_region,
+            to_ref=lambda o: KnowledgeObjectRef(type=T.REGION, id=o.id, title=o.name),
+            model_cls=Region,
         ),
     }
 

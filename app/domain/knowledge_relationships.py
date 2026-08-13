@@ -49,6 +49,14 @@ class KnowledgeObjectType(str, Enum):
     """An ordered set of logs to collect for one technology + operation
     (e.g. "RF Mesh, Command Request (Outbound)") -- the primary object
     the Recommendation Engine's log-collection guidance is built from."""
+    CUSTOMER = "customer"
+    """A real customer/organization (Context Dimensions phase,
+    2026-08-12). Deliberately its own object type, never a Component --
+    see app/domain/lookup_entities.py's Customer docstring for why this
+    distinction is load-bearing."""
+    REGION = "region"
+    """A real geography/market region -- same governance shape as
+    CUSTOMER, see app/domain/lookup_entities.py's Region."""
 
 
 class RelationshipType(str, Enum):

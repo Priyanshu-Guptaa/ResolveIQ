@@ -60,6 +60,8 @@ _GROUP_ORDER = [
     KnowledgeObjectType.PRODUCT,
     KnowledgeObjectType.TECHNOLOGY,
     KnowledgeObjectType.VERSION,
+    KnowledgeObjectType.CUSTOMER,
+    KnowledgeObjectType.REGION,
 ]
 
 

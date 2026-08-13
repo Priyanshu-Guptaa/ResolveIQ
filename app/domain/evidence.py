@@ -106,6 +106,24 @@ class HistoricalInvestigationRecord(GovernanceFields):
     be empty when no component was mentioned. Distinct from ``tags``,
     which stays free text."""
 
+    # --- Resolution provenance (2026-08-13) ---------------------------------
+    # Explicit human verification -- the ONLY thing (besides real
+    # cross-source correlation, computed separately at recommendation
+    # time) that can ever earn ResolutionProvenance.CONFIRMED. Never set
+    # by any automated process; a similarity score alone can never set
+    # this. No admin UI exists yet to set these fields (deliberately --
+    # see the approved design's open question #1 on access control);
+    # they're added here so the *data model and provenance computation*
+    # are correct and testable now, with the write-action to follow.
+    resolution_verified: bool = False
+    resolution_verified_by: str | None = None
+    resolution_verified_at: datetime | None = None
+    resolution_verification_note: str | None = None
+    """Why/how it was verified -- e.g. "Confirmed with the customer
+    after applying the documented fix; issue did not recur." Free
+    text, always paired with verified_by/verified_at so the claim
+    itself is auditable, not just the fact that *some* claim was made."""
+
 
 class DocumentationRecord(GovernanceFields):
     """A knowledge-base document -- the Knowledge Management module's
@@ -210,3 +228,15 @@ class KnownBugRecord(GovernanceFields):
     association table (``known_bug_components``). See
     ``HistoricalInvestigationRecord.related_components`` for the same
     pattern."""
+
+    # --- Resolution provenance (2026-08-13) -- see
+    # HistoricalInvestigationRecord's identical fields for the full
+    # docstring; not yet consumed by RecommendationEngine's provenance
+    # tiering this phase (Known Bugs aren't currently a resolution
+    # source in _synthesize_recommendation at all -- a pre-existing
+    # structural fact, not something this phase expands), but the
+    # schema is added for both governed types together as approved.
+    resolution_verified: bool = False
+    resolution_verified_by: str | None = None
+    resolution_verified_at: datetime | None = None
+    resolution_verification_note: str | None = None

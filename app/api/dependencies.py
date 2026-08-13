@@ -19,6 +19,7 @@ from app.config import Settings, get_settings
 from app.engines.ingestion.engine import IngestionEngine
 from app.engines.ingestion.file_type_registry import FileTypeRegistry
 from app.engines.investigation.engine import InvestigationEngine
+from app.engines.knowledge.classification import DocumentClassificationEngine
 from app.engines.knowledge.embedding_provider import EmbeddingProvider, SentenceTransformerEmbeddingProvider
 from app.engines.knowledge.engine import KnowledgeEngine
 from app.engines.knowledge.knowledge_store import ChromaKnowledgeStore, KnowledgeStore
@@ -40,6 +41,7 @@ from app.engines.external_knowledge.wiki_rest_client import WikiRestConnector
 from app.engines.recommendation.engine import RecommendationEngine
 from app.engines.sql_library.engine import SqlLibraryEngine
 from app.engines.task_import.importer import TaskImporter
+from app.infrastructure.db.classification_repository import ClassificationRepository, SqlAlchemyClassificationRepository
 from app.infrastructure.db.component_repository import ComponentProfileRepository, SqlAlchemyComponentProfileRepository
 from app.infrastructure.db.knowledge_repository import KnowledgeRepository, SqlAlchemyKnowledgeRepository
 from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository, SqlAlchemyLogKnowledgeRepository
@@ -194,6 +196,34 @@ def _log_wiki_importer() -> LogWikiImporter:
     return LogWikiImporter(_knowledge_object_service(), _knowledge_relationship_engine(), _component_profile_repository())
 
 
+# --- Context Dimensions / Metadata Classification (2026-08-12) -------------
+
+
+@lru_cache
+def _classification_repository() -> ClassificationRepository:
+    return SqlAlchemyClassificationRepository(_db_session_factory())
+
+
+@lru_cache
+def _document_classification_engine() -> DocumentClassificationEngine:
+    return DocumentClassificationEngine(
+        _knowledge_repository(),
+        _lookup_repository(),
+        _component_profile_repository(),
+        _classification_repository(),
+        _knowledge_object_service(),
+        _knowledge_relationship_engine(),
+    )
+
+
+def get_document_classification_engine() -> DocumentClassificationEngine:
+    return _document_classification_engine()
+
+
+def get_lookup_repository() -> LookupRepository:
+    return _lookup_repository()
+
+
 @lru_cache
 def _entity_extractor() -> EntityExtractor:
     return RegexEntityExtractor()
@@ -288,6 +318,7 @@ def get_recommendation_engine() -> RecommendationEngine:
         _knowledge_relationship_engine(),
         _sql_library_engine(),
         _external_knowledge_service(),
+        _lookup_repository(),
     )
 
 
@@ -340,6 +371,7 @@ def run_knowledge_foundation_migration() -> dict[str, int]:
         knowledge_repo=_knowledge_repository(),
         sql_repo=_sql_template_repository(),
         lookup_repo=_lookup_repository(),
+        log_knowledge_repo=_log_knowledge_repository(),
         sample_knowledge_dir=settings.sample_knowledge_dir,
     )
 
@@ -376,5 +408,7 @@ def reset_singletons() -> None:
         _knowledge_object_service,
         _task_importer,
         _log_wiki_importer,
+        _classification_repository,
+        _document_classification_engine,
     ):
         fn.cache_clear()

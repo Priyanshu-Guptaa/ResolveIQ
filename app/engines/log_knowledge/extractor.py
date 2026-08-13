@@ -315,27 +315,59 @@ def extract_log_entries(text: str) -> list[_RawLogEntry]:
     return entries
 
 
-def _resolve_component(entry: "_RawLogEntry") -> tuple[str, str, str | None]:
+_UNSPECIFIED_COMPONENT = "Unspecified"
+"""Fallback used when the only available component name would be a
+known customer/organization name -- see ``_resolve_component``'s
+``known_customer_names`` parameter. A generic placeholder, never a
+customer name, and never silently dropped (the caller still gets a
+component to group the log under)."""
+
+
+def _resolve_component(
+    entry: "_RawLogEntry", known_customer_names: frozenset[str] = frozenset()
+) -> tuple[str, str, str | None]:
     """(root, component, filename), falling back to the entry's own
     technology/section name when the path has no directory segment at
-    all -- see _split_path's docstring for why."""
+    all -- see _split_path's docstring for why.
+
+    ``known_customer_names`` (Context Dimensions phase, 2026-08-12,
+    approved product decision #6: "customer-specific information such
+    as TEPCO is never interpreted as a product, module, component or
+    technology") guards this exact fallback: a wiki section heading
+    naming a customer (e.g. "TEPCO RF Mesh workflow and log location")
+    would otherwise become ``entry.technology`` and, via this fallback,
+    a component/log-source name. Lowercased, whole-string comparison
+    only (never a substring match, which would false-positive on any
+    technology name that happens to contain a customer name as a
+    fragment) against every governed customer name/alias. Empty by
+    default so existing callers/tests that don't pass real customer
+    data keep working unchanged."""
     root, component, filename = _split_path(entry.path_text)
-    return root, component or entry.technology, filename
+    resolved = component or entry.technology
+    if resolved and resolved.strip().lower() in known_customer_names:
+        resolved = _UNSPECIFIED_COMPONENT
+    return root, resolved, filename
 
 
 def build_records(
-    entries: list[_RawLogEntry], *, product: str, source_wiki_page: str
+    entries: list[_RawLogEntry],
+    *,
+    product: str,
+    source_wiki_page: str,
+    known_customer_names: frozenset[str] = frozenset(),
 ) -> tuple[list[LogSourceApplication], list[LogCollectionScenario]]:
     """Turns raw tagged path entries into governed domain records.
     Multiple entries for the same component name are merged into one
     LogSourceApplication (a component can appear in several scenarios);
     entries sharing (technology, scenario_type, region) become one
-    LogCollectionScenario with steps in the order they were found."""
+    LogCollectionScenario with steps in the order they were found.
+
+    ``known_customer_names`` -- see ``_resolve_component``'s docstring."""
     sources_by_name: dict[str, LogSourceApplication] = {}
     scenario_groups: dict[tuple[str, str, str | None], list[_RawLogEntry]] = {}
 
     for entry in entries:
-        root, component, filename = _resolve_component(entry)
+        root, component, filename = _resolve_component(entry, known_customer_names)
         platform = _classify_platform(entry.path_text)
         existing = sources_by_name.get(component)
         if existing is None:
@@ -363,9 +395,9 @@ def build_records(
     for (technology, scenario_type, region), group_entries in scenario_groups.items():
         steps: list[LogCollectionStep] = []
         seen_components: set[str] = set()
-        total_components = len({_resolve_component(e)[1] for e in group_entries})
+        total_components = len({_resolve_component(e, known_customer_names)[1] for e in group_entries})
         for entry in group_entries:
-            _, component, _ = _resolve_component(entry)
+            _, component, _ = _resolve_component(entry, known_customer_names)
             if component in seen_components:
                 continue
             seen_components.add(component)
@@ -403,6 +435,8 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60]
 
 
-def extract(text: str, *, product: str, source_wiki_page: str) -> tuple[list[LogSourceApplication], list[LogCollectionScenario]]:
+def extract(
+    text: str, *, product: str, source_wiki_page: str, known_customer_names: frozenset[str] = frozenset()
+) -> tuple[list[LogSourceApplication], list[LogCollectionScenario]]:
     entries = extract_log_entries(text)
-    return build_records(entries, product=product, source_wiki_page=source_wiki_page)
+    return build_records(entries, product=product, source_wiki_page=source_wiki_page, known_customer_names=known_customer_names)

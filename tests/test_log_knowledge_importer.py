@@ -242,6 +242,47 @@ def test_extract_explanation_describes_real_extracted_position():
     assert "step 1 of" in step.explanation
 
 
+# --- Context Dimensions phase (2026-08-12): a customer heading must never
+# become a component name (approved product decision #6) ------------------
+
+
+def test_customer_named_section_never_becomes_a_component_name():
+    """A wiki heading naming a real customer (here: 'Tepco workflow and
+    log location') must not produce a LogSourceApplication/component
+    literally named after that customer -- see
+    _resolve_component's known_customer_names guard."""
+    text = (
+        "Tepco workflow and log location\n"
+        "Command\n"
+        "Request\n"
+        "(Outbound)\n"
+        "Logs:\n"
+        "~\\Logs\\logfile.log\n"
+    )
+    sources, _ = extract(
+        text, product="Command Center", source_wiki_page="Sample", known_customer_names=frozenset({"tepco"})
+    )
+    names = {s.name for s in sources}
+    assert "Tepco" not in names
+    assert "Unspecified" in names
+
+
+def test_customer_named_section_unaffected_when_customer_list_not_supplied():
+    """Backward compatible: an empty (default) known_customer_names
+    guards nothing, same behavior as before this phase."""
+    text = (
+        "Tepco workflow and log location\n"
+        "Command\n"
+        "Request\n"
+        "(Outbound)\n"
+        "Logs:\n"
+        "~\\Logs\\logfile.log\n"
+    )
+    sources, _ = extract(text, product="Command Center", source_wiki_page="Sample")
+    names = {s.name for s in sources}
+    assert "Tepco" in names
+
+
 def test_extract_region_scoped_scenarios_are_distinct_records():
     _, scenarios = extract(_SAMPLE_WIKI_TEXT, product="Command Center", source_wiki_page="Sample")
     keys = {(s.technology, s.scenario_type, s.region) for s in scenarios}

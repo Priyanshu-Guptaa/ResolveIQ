@@ -27,6 +27,20 @@ _LIFECYCLE_ACTIONS = [
     ("🚫 Deprecate", "deprecate"),
 ]
 
+_VERIFICATION_URL_SEGMENT = {
+    "historical_investigation": "historical-investigations",
+    "known_bug": "known-bugs",
+}
+"""Object types with a Resolution Verification panel (2026-08-13, Phase
+0) -- deliberately just these two, not a ninth generic tab: verification
+only means something for a type that carries ``resolution_verified*``
+fields at all (see app/domain/evidence.py), and this is a real,
+consequence-bearing action (a CONFIRMED tier becomes visible to every
+future recommendation on this record), not ordinary metadata editing --
+it belongs in its own clearly-labeled panel, not folded into the
+generic Metadata tab's field-agnostic form (which deliberately excludes
+these four fields entirely, see metadata_panel.py)."""
+
 
 def render_knowledge_editor(object_type: str, obj: dict, *, actor: str = "admin") -> None:
     header_cols = st.columns([4, 1])
@@ -51,6 +65,9 @@ def render_knowledge_editor(object_type: str, obj: dict, *, actor: str = "admin"
             st.rerun()
         # api_delete already surfaced the 409 "has dependents" detail via st.error.
 
+    if object_type in _VERIFICATION_URL_SEGMENT:
+        _render_resolution_verification_panel(object_type, obj, actor=actor)
+
     tab_metadata, tab_relationships, tab_history, tab_validation, tab_impact = st.tabs(
         ["📋 Metadata", "🕸️ Relationships", "🕒 History", "✅ Validation", "🎯 Impact"]
     )
@@ -64,3 +81,51 @@ def render_knowledge_editor(object_type: str, obj: dict, *, actor: str = "admin"
         render_validation_summary(object_type, obj["id"])
     with tab_impact:
         render_impact_summary(object_type, obj["id"])
+
+
+def _render_resolution_verification_panel(object_type: str, obj: dict, *, actor: str) -> None:
+    """The dedicated, audit-paired action for
+    ``resolution_verified``/``resolution_verified_by``/
+    ``resolution_verified_at``/``resolution_verification_note`` (2026-08-13,
+    Phase 0) -- see this module's ``_VERIFICATION_URL_SEGMENT`` docstring
+    for why this is separate from the generic Metadata tab. Backed by
+    ``app/api/routers/admin/resolution_verification.py``; never the
+    generic ``PATCH /admin/objects/...`` endpoint, which rejects these
+    four field names outright."""
+    segment = _VERIFICATION_URL_SEGMENT[object_type]
+    is_verified = bool(obj.get("resolution_verified"))
+
+    with st.expander("✅ Resolution Verification", expanded=is_verified):
+        if is_verified:
+            st.success(
+                f"Verified by **{obj.get('resolution_verified_by') or 'unknown'}** "
+                f"on {(obj.get('resolution_verified_at') or '').replace('T', ' ')[:19] or 'an unrecorded date'}."
+            )
+            if obj.get("resolution_verification_note"):
+                st.caption(obj["resolution_verification_note"])
+            st.caption(
+                "This record can reach the CONFIRMED resolution-provenance tier for future recommendations "
+                "while verified."
+            )
+            if st.button("↩️ Remove verification", key=f"unverify_{obj['id']}"):
+                if api_post(f"/admin/{segment}/{obj['id']}/unverify", {"actor": actor}) is not None:
+                    st.success("Verification removed.")
+                    st.rerun()
+        else:
+            st.caption(
+                "Not verified -- this record can still be recommended (Likely/Possible), but can never reach "
+                "the CONFIRMED tier without either this or a real cross-source correlation. Only mark this "
+                "once the resolution has genuinely been confirmed to work, not merely because it looks right."
+            )
+            with st.form(key=f"verify_form_{obj['id']}"):
+                note = st.text_area(
+                    "Verification note (recommended)",
+                    placeholder='e.g. "Confirmed with the customer after applying the fix; issue did not recur."',
+                    key=f"verify_note_{obj['id']}",
+                )
+                submitted = st.form_submit_button("✅ Mark resolution verified", type="primary")
+            if submitted:
+                payload = {"actor": actor, "note": note or None}
+                if api_post(f"/admin/{segment}/{obj['id']}/verify", payload) is not None:
+                    st.success("Marked verified.")
+                    st.rerun()

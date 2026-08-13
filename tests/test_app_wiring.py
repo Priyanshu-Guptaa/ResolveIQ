@@ -27,6 +27,10 @@ def test_app_imports_and_registers_every_admin_router():
     assert "/admin/relationships" in paths
     assert "/admin/relationships/health" in paths
     assert "/admin/relationships/playbooks" in paths
+    assert "/admin/historical-investigations/{investigation_id}/verify" in paths
+    assert "/admin/historical-investigations/{investigation_id}/unverify" in paths
+    assert "/admin/known-bugs/{bug_id}/verify" in paths
+    assert "/admin/known-bugs/{bug_id}/unverify" in paths
 
     # And the pre-existing, non-admin routers are still there too.
     assert "/health" in paths

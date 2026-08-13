@@ -203,6 +203,13 @@ class KnownBugModel(Base):
     affected_components: Mapped[list] = mapped_column(JSON, default=list)
     workaround: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
 
+    # Resolution provenance (2026-08-13) -- see HistoricalInvestigationModel's
+    # identical columns for the full docstring.
+    resolution_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    resolution_verified_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    resolution_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    resolution_verification_note: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
@@ -240,6 +247,18 @@ class HistoricalInvestigationModel(Base):
     next_step: Mapped[str] = mapped_column(Text, default="")
     tags: Mapped[list] = mapped_column(JSON, default=list)
     domain: Mapped[str] = mapped_column(String(100), default="general")
+
+    # Resolution provenance (2026-08-13) -- the ONLY thing (besides real
+    # cross-source correlation, computed at recommendation time) that can
+    # ever earn ResolutionProvenance.CONFIRMED. Never set by any
+    # automated process; added via the existing additive-column
+    # migration (_add_missing_columns), no manual ALTER needed. No admin
+    # UI writes these yet (deliberate -- see the approved design's open
+    # question on access control); this is the data model only.
+    resolution_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    resolution_verified_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    resolution_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    resolution_verification_note: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
@@ -336,6 +355,13 @@ class TechnologyModel(Base):
 
     id: Mapped[str] = mapped_column(String(100), primary_key=True)
     name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    parent_technology_id: Mapped[str | None] = mapped_column(
+        ForeignKey("technologies.id"), nullable=True, default=None, index=True
+    )
+    """"RF Mesh IP" -> "RF Mesh"'s row id -- see Technology.parent_technology_id's
+    docstring (app/domain/lookup_entities.py). Self-referential FK, added
+    via the existing additive-column migration (session.py's
+    _add_missing_columns) -- no manual ALTER needed."""
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
@@ -360,6 +386,82 @@ class VersionModel(Base):
     status: Mapped[str] = mapped_column(String(20), default="published", index=True)
 
     __table_args__ = (Index("ix_versions_product_id", "product_id"),)
+
+
+# =============================================================================
+# Context Dimensions (Chat Assistant foundation, Phase 1 -- 2026-08-12).
+#
+# Customer/Region get the identical governed-lookup shape Product/
+# Technology/Version already established, plus the provenance columns a
+# *controlled, verified* list requires (approved product decision: never
+# infer a customer from a text pattern alone). MetadataClassificationSuggestion
+# is the one genuinely new table this phase needs -- see
+# app/domain/classification.py's module docstring for why it's kept
+# separate from the relationship graph (provisional vs. asserted fact).
+# =============================================================================
+
+
+class CustomerModel(Base):
+    __tablename__ = "customers"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    aliases: Mapped[list] = mapped_column(JSON, default=list)
+    verified: Mapped[bool] = mapped_column(Boolean, default=True)
+    source_type: Mapped[str | None] = mapped_column(String(50), nullable=True, default=None)
+    source_reference: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
+
+
+class RegionModel(Base):
+    __tablename__ = "regions"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    aliases: Mapped[list] = mapped_column(JSON, default=list)
+    source_type: Mapped[str | None] = mapped_column(String(50), nullable=True, default=None)
+    source_reference: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
+
+
+class MetadataClassificationSuggestionModel(Base):
+    """See app/domain/classification.py's module docstring -- a
+    provisional candidate tag, kept separate from the asserted-fact
+    KnowledgeRelationship graph until it's High-confidence (auto-
+    applied) or human-reviewed (Medium)."""
+
+    __tablename__ = "metadata_classification_suggestions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    object_type: Mapped[str] = mapped_column(String(30))
+    object_id: Mapped[str] = mapped_column(String(100))
+    dimension: Mapped[str] = mapped_column(String(30))
+    suggested_value_id: Mapped[str | None] = mapped_column(String(100), nullable=True, default=None)
+    suggested_value_text: Mapped[str] = mapped_column(String(300))
+    confidence_tier: Mapped[str] = mapped_column(String(10))
+    evidence_snippet: Mapped[str] = mapped_column(Text)
+    evidence_rule: Mapped[str] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (
+        Index("ix_classification_suggestions_object", "object_type", "object_id"),
+        Index("ix_classification_suggestions_status", "status"),
+    )
 
 
 class KnowledgeRelationshipModel(Base):

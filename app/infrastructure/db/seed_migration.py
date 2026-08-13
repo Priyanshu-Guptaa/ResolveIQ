@@ -51,7 +51,7 @@ from typing import TYPE_CHECKING, Any
 
 from app.domain.enums import DocumentStatus
 from app.domain.evidence import DocumentationRecord, HistoricalInvestigationRecord, KnownBugRecord
-from app.domain.lookup_entities import Product, Technology
+from app.domain.lookup_entities import Product, Region, Technology
 from app.domain.product_intelligence import ComponentProfile
 from app.domain.sql_studio import QUERY_LIBRARY, QueryTemplate
 from app.infrastructure.db.component_repository import ComponentProfileRepository
@@ -59,7 +59,24 @@ from app.infrastructure.db.knowledge_repository import KnowledgeRepository
 from app.infrastructure.db.sql_template_repository import SqlTemplateRepository
 
 if TYPE_CHECKING:
+    from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository
     from app.infrastructure.db.lookup_repository import LookupRepository
+
+# Real, observed technology-family relationships (Context Dimensions
+# phase, 2026-08-12) -- "RF Mesh IP" and "RF Mesh (DAS implementation)"
+# are both more specific variants of "RF Mesh" in the real, imported Log
+# Intelligence Knowledge Base (85 log sources / 40 scenarios, see
+# [[knowledge-center-wiki-import]]). Hardcoded because this *is* the
+# real, confirmed relationship -- not a guess, and not worth a generic
+# inference mechanism for three known names. Extend this mapping
+# (never delete from it) if a future wiki import surfaces another real
+# variant; the matching code that consumes ``parent_technology_id``
+# (RecommendationEngine._recommend_logs) doesn't care how the edge got
+# there.
+_TECHNOLOGY_PARENTS: dict[str, str] = {
+    "RF Mesh IP": "RF Mesh",
+    "RF Mesh (DAS implementation)": "RF Mesh",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +267,7 @@ def migrate_lookup_entities(
     lookup_repo: LookupRepository,
     component_repo: ComponentProfileRepository,
     knowledge_repo: KnowledgeRepository,
+    log_knowledge_repo: "LogKnowledgeRepository | None" = None,
 ) -> int:
     """Sprint 3, Phase 3.3: seeds Product/Technology from the distinct
     values already sitting in existing free-text columns (component
@@ -259,12 +277,34 @@ def migrate_lookup_entities(
     re-running only creates rows for names that don't exist yet, so it
     never fights an administrator who's already curated these lists
     (Product/Technology Management is a later Administration module;
-    this migration only bootstraps a starting point)."""
+    this migration only bootstraps a starting point).
+
+    Real bug this fixes (Context Dimensions phase, 2026-08-12): the
+    original candidate source for Technology was ``documentation.
+    technology``, a free-text column that is (and, before an admin
+    starts curating it, always will be) almost entirely blank --
+    verified live: 0 of 496 real documents have it set. That left the
+    governed ``technologies`` table empty despite 85 real
+    LogSourceApplication rows and 40 real LogCollectionScenario rows
+    already carrying real technology names. ``log_knowledge_repo`` is
+    now an additional (optional, for existing callers/tests) candidate
+    source pulling from that real data instead.
+
+    Also seeds the real ``parent_technology_id`` hierarchy
+    (``_TECHNOLOGY_PARENTS``) once every named technology exists as a
+    row -- the direct data-level fix for "RF Mesh and Mesh IP are not
+    automatically the same thing." Applied every call (not just when a
+    technology is newly created), so a technology created by an earlier
+    version of this migration (before this fix existed) still gets its
+    parent linked on the next startup, without needing a one-off backfill
+    script."""
     existing_products = {p.name for p in lookup_repo.list_products(active_only=False)}
     existing_technologies = {t.name for t in lookup_repo.list_technologies(active_only=False)}
+    existing_regions = {r.name for r in lookup_repo.list_regions(active_only=False)}
 
     candidate_products: set[str] = set()
     candidate_technologies: set[str] = set()
+    candidate_regions: set[str] = set()
 
     for component in component_repo.list_all(active_only=False):
         if component.product:
@@ -275,6 +315,17 @@ def migrate_lookup_entities(
         if document.technology:
             candidate_technologies.add(document.technology)
 
+    if log_knowledge_repo is not None:
+        for source in log_knowledge_repo.list_log_sources(active_only=False):
+            for tech in source.technology:
+                if tech.strip():
+                    candidate_technologies.add(tech.strip())
+        for scenario in log_knowledge_repo.list_scenarios(active_only=False):
+            if scenario.technology.strip():
+                candidate_technologies.add(scenario.technology.strip())
+            if scenario.region and scenario.region.strip():
+                candidate_regions.add(scenario.region.strip())
+
     created = 0
     for name in sorted(candidate_products - existing_products):
         lookup_repo.save_product(Product(id=str(uuid.uuid4()), name=name, created_by=_MIGRATION_ACTOR, updated_by=_MIGRATION_ACTOR))
@@ -284,9 +335,33 @@ def migrate_lookup_entities(
             Technology(id=str(uuid.uuid4()), name=name, created_by=_MIGRATION_ACTOR, updated_by=_MIGRATION_ACTOR)
         )
         created += 1
+    for name in sorted(candidate_regions - existing_regions):
+        lookup_repo.save_region(Region(id=str(uuid.uuid4()), name=name, created_by=_MIGRATION_ACTOR, updated_by=_MIGRATION_ACTOR))
+        created += 1
 
-    logger.info("Seeded %d product/technology lookup row(s) from existing data", created)
+    created += _apply_technology_hierarchy(lookup_repo)
+
+    logger.info("Seeded %d product/technology/region lookup row(s) from existing data", created)
     return created
+
+
+def _apply_technology_hierarchy(lookup_repo: "LookupRepository") -> int:
+    """Links each known technology variant (``_TECHNOLOGY_PARENTS``) to
+    its real parent, if both rows exist and the link isn't already set.
+    Returns how many links were newly applied this call -- included in
+    ``migrate_lookup_entities``'s returned count for one consistent
+    "how much changed" number, same as every other migration step."""
+    linked = 0
+    for child_name, parent_name in _TECHNOLOGY_PARENTS.items():
+        child = lookup_repo.get_technology_by_name(child_name)
+        parent = lookup_repo.get_technology_by_name(parent_name)
+        if child is None or parent is None or child.parent_technology_id == parent.id:
+            continue
+        child.parent_technology_id = parent.id
+        child.updated_by = _MIGRATION_ACTOR
+        lookup_repo.save_technology(child)
+        linked += 1
+    return linked
 
 
 def migrate_all(
@@ -295,6 +370,7 @@ def migrate_all(
     knowledge_repo: KnowledgeRepository,
     sql_repo: SqlTemplateRepository,
     lookup_repo: "LookupRepository | None" = None,
+    log_knowledge_repo: "LogKnowledgeRepository | None" = None,
     sample_knowledge_dir: Path,
 ) -> dict[str, int]:
     """Runs every migration in dependency order (components first --
@@ -304,7 +380,10 @@ def migrate_all(
     per-row content backfill count (see ``migrate_documentation``).
     Safe to call on every startup. ``lookup_repo`` is optional so
     existing callers/tests that don't need Phase 3.3's Product/
-    Technology seeding keep working unchanged."""
+    Technology seeding keep working unchanged. ``log_knowledge_repo`` is
+    optional for the same reason (Context Dimensions phase) -- without
+    it, Technology/Region seeding falls back to the (largely empty)
+    Documentation-derived candidates only, same as before this phase."""
     report = {
         "component_profiles": migrate_component_profiles(component_repo, sample_knowledge_dir),
     }
@@ -315,6 +394,6 @@ def migrate_all(
     report["documentation"] = migrate_documentation(knowledge_repo, component_repo, sample_knowledge_dir)
     report["sql_templates"] = migrate_sql_templates(sql_repo, component_repo)
     if lookup_repo is not None:
-        report["lookup_entities"] = migrate_lookup_entities(lookup_repo, component_repo, knowledge_repo)
+        report["lookup_entities"] = migrate_lookup_entities(lookup_repo, component_repo, knowledge_repo, log_knowledge_repo)
     logger.info("Knowledge foundation migration complete: %s", report)
     return report

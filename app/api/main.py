@@ -27,6 +27,8 @@ from app.api.routers.admin import knowledge_objects as admin_knowledge_objects
 from app.api.routers.admin import log_knowledge as admin_log_knowledge
 from app.api.routers.admin import task_import as admin_task_import
 from app.api.routers.admin import knowledge_relationships as admin_knowledge_relationships
+from app.api.routers.admin import classification as admin_classification
+from app.api.routers.admin import resolution_verification as admin_resolution_verification
 from app.config import get_settings
 from app.logging_config import configure_logging
 
@@ -70,3 +72,5 @@ app.include_router(admin_knowledge_relationships.router)
 app.include_router(admin_knowledge_objects.router)
 app.include_router(admin_task_import.router)
 app.include_router(admin_log_knowledge.router)
+app.include_router(admin_classification.router)
+app.include_router(admin_resolution_verification.router)

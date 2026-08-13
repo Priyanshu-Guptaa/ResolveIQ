@@ -29,6 +29,7 @@ from app.domain.entities import ExtractedEntity
 from app.domain.enums import EntityType, EvidenceType
 from app.domain.investigation import InvestigationSession
 from app.domain.knowledge_relationships import KnowledgeObjectType, RelationshipType
+from app.domain.provenance import EvidenceKind, EvidenceReference, ProvenanceRecord, ResolutionProvenance
 from app.domain.recommendation import (
     InvestigationStage,
     InvestigationStrategy,
@@ -42,19 +43,22 @@ from app.domain.recommendation import (
     SuggestedSqlItem,
 )
 from app.engines.external_knowledge.ranking import confidence_for_score
+from app.engines.knowledge.applicability import ApplicabilityRanker, RetrievalContext
 from app.engines.knowledge.engine import KnowledgeEngine
+from app.engines.shared.hierarchy import most_specific
 from app.engines.shared.text_cleaning import strip_low_signal_boilerplate
 from app.engines.shared.text_matching import keyword_match_score
 
 if TYPE_CHECKING:
-    from app.domain.evidence import Evidence
-    from app.domain.external_knowledge import ExternalKnowledgeResult
+    from app.domain.evidence import Evidence, HistoricalInvestigationRecord, KnownBugRecord
+    from app.domain.external_knowledge import ExternalKnowledgeResult, ExternalMatch
     from app.domain.log_intelligence_kb import LogCollectionScenario, LogSourceApplication
     from app.engines.external_knowledge.service import ExternalKnowledgeService
     from app.engines.knowledge_relationships.engine import KnowledgeRelationshipEngine
     from app.engines.sql_library.engine import SqlLibraryEngine
     from app.infrastructure.db.component_repository import ComponentProfileRepository
     from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository
+    from app.infrastructure.db.lookup_repository import LookupRepository
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +76,29 @@ _MIN_KEYWORD_WORD_LEN = 4
 """Below this, a single word from a technology/scenario-type name (e.g.
 "IP") is too generic to treat as a meaningful partial-match signal on
 its own."""
+
+_ENGLISH_STOPWORDS = frozenset({
+    "after", "again", "against", "because", "before", "being", "between", "does", "doing",
+    "during", "each", "from", "further", "having", "here", "into", "more", "most", "once",
+    "only", "other", "over", "same", "since", "some", "such", "than", "that", "their", "them",
+    "then", "there", "these", "they", "this", "those", "through", "under", "until", "upon",
+    "very", "were", "when", "where", "which", "while", "will", "with", "within", "without",
+    "would", "your",
+})
+"""Standard, closed-class English function words at/above
+``_MIN_KEYWORD_WORD_LEN`` -- excluded from
+``_known_bug_has_topical_overlap``'s significant-word set (that method's
+own docstring has the full rationale). Not a domain-specific blacklist
+(the kind this codebase has explicitly rejected before, e.g.
+``_match_component``'s fix) -- this is the standard, generic technique
+for excluding words that carry no topical signal in *any* domain, the
+same category of fix as ignoring "the"/"a" in a search index. Found
+necessary live: the bare word "after" -- present in both "GPA...
+commands failed to respond after patching" and "...command queue
+stalls after mesh router firmware v3.4.0..." -- was on its own enough
+to produce a spurious topical-overlap match between two genuinely
+unrelated real investigations, exactly the class of false positive
+this whole check exists to prevent."""
 
 _SOLUTION_CONFIDENCE_FLOOR = 0.4
 """A TFS/Wiki match below this (ranking.py's own "Medium" floor)
@@ -102,6 +129,16 @@ the component-name-in-title check instead). Being wrong here has real
 cost: a false "already collected" could make an engineer skip
 gathering a log that's actually still missing."""
 
+_APPLICABILITY_OVERFETCH_MULTIPLIER = 4
+"""How much wider than ``similarity_top_k`` the local semantic search
+over-fetches before ``ApplicabilityRanker`` re-ranks and truncates back
+down -- see app/engines/knowledge/applicability.py's module docstring
+(Part D's retrieval flow: widen the candidate pool, THEN apply
+applicability, THEN truncate -- never re-rank only the already-
+truncated top_k, which would have nothing left to promote a same-
+customer/same-technology match that vector similarity alone ranked
+6th)."""
+
 _MAX_SNIPPET_CHARS = 600
 """Cap for any historical-match text (resolution, root_cause) surfaced
 directly in a recommendation. Found necessary on real imported
@@ -124,11 +161,28 @@ def _keyword_match_score(keyword: str, context: str) -> float:
     return keyword_match_score(keyword, context, min_word_len=_MIN_KEYWORD_WORD_LEN)
 
 
-def _match_reason(scenario: "LogCollectionScenario", tech_score: float, type_score: float) -> str:
+def _match_reason(
+    scenario: "LogCollectionScenario", tech_score: float, type_score: float, *, demoted_by: str | None = None
+) -> str:
     """Deterministically explains *why this scenario* was selected --
     distinct from each step's own ``explanation`` (its position in the
     message flow). Built entirely from which score components fired;
-    never phrased by an LLM."""
+    never phrased by an LLM.
+
+    ``demoted_by`` is set when this scenario's technology was scored
+    down from a full match specifically because a more specific
+    technology variant (e.g. "RF Mesh IP") also fully matched the same
+    text -- the RF-Mesh-vs-Mesh-IP fix (see
+    ``RecommendationEngine._specificity_demoted_technologies``). Stated
+    honestly rather than folded into the generic "weakly matched"
+    wording, since it's a materially different (and more informative)
+    reason than an ordinary partial keyword match."""
+    if demoted_by:
+        return (
+            f'The investigation specifically mentions "{demoted_by}", a more specific technology than '
+            f'"{scenario.technology}" -- this scenario covers the broader "{scenario.technology}" family, '
+            f'not the specific variant named. Check the "{demoted_by}"-labeled scenario(s) first.'
+        )
     tech_part = f'technology "{scenario.technology}"' if tech_score > 0 else None
     type_part = f'issue type "{scenario.scenario_type}"' if type_score >= _FULL_MATCH_SCORE else None
     matched = [p for p in (tech_part, type_part) if p]
@@ -176,6 +230,40 @@ def _snippet(text: str) -> str:
     if len(text) <= _MAX_SNIPPET_CHARS:
         return text
     return text[:_MAX_SNIPPET_CHARS].rstrip() + "…"
+
+
+@dataclass(frozen=True)
+class _SynthesizedSources:
+    """Real, already-computed internal state from ``_synthesize_recommendation``
+    that Resolution Provenance (2026-08-13) needs -- exposed rather than
+    re-derived a second time (which would risk drifting from the
+    decision logic that actually produced ``RecommendedSolution``).
+    Purely informational: nothing here changes what
+    ``_synthesize_recommendation`` decides, it only names what it
+    already decided. Empty (all None) when nothing cleared the
+    confidence bar at all."""
+
+    correlated_match: "KnowledgeMatch | None" = None
+    """The local Historical Investigation whose ticket tag matched the
+    best TFS case's CRM id -- real cross-source correlation, the only
+    similarity-independent signal that can earn CONFIRMED on its own."""
+    best_tfs: "ExternalMatch | None" = None
+    best_wiki: "ExternalMatch | None" = None
+    best_local: "KnowledgeMatch | None" = None
+    """The top local match that cleared min_similarity_for_root_cause,
+    regardless of whether it had a recorded root cause (i.e. including
+    the title-only fallback case) -- distinct from
+    ``_local_match_for_cause``'s root-cause-derived match, used only to
+    tell POSSIBLE apart from UNKNOWN when no root-cause hypothesis
+    exists at all (see ``_resolve_provenance_tier``)."""
+    best_known_bug: "KnowledgeMatch | None" = None
+    """The top Known Bug match that cleared min_similarity_for_root_cause
+    -- added 2026-08-13 (Phase 0, Chat/Structured Resolution Knowledge
+    architecture, closing the gap flagged in
+    RESOLVEIQ_CHAT_AND_RESOLUTION_ARCHITECTURE.md Section 17/Section 6:
+    "Known Bugs are a second-class resolution source"). Same
+    "regardless of whether it had real resolution content" contract as
+    ``best_local`` -- its ``workaround`` may or may not be populated."""
 
 
 @dataclass(frozen=True)
@@ -253,6 +341,7 @@ class RecommendationEngine:
         relationship_engine: "KnowledgeRelationshipEngine | None" = None,
         sql_library: "SqlLibraryEngine | None" = None,
         external_knowledge: "ExternalKnowledgeService | None" = None,
+        lookup_repo: "LookupRepository | None" = None,
     ) -> None:
         self._knowledge = knowledge_engine
         self._settings = settings
@@ -261,6 +350,18 @@ class RecommendationEngine:
         self._relationships = relationship_engine
         self._sql_library = sql_library
         self._external_knowledge = external_knowledge
+        self._lookup = lookup_repo
+        """None in older call sites/tests -- the RF-Mesh-vs-Mesh-IP
+        specificity fix (``_specificity_demoted_technologies``) simply
+        has no hierarchy to consult in that case and demotes nothing,
+        same graceful-degradation contract as ``_external_knowledge``."""
+        self._applicability = ApplicabilityRanker(relationship_engine, lookup_repo)
+        """Context Dimensions phase (2026-08-12) -- re-ranks local
+        semantic search results by real Customer/Region/Technology
+        applicability before truncating to top_k. Degrades to a no-op
+        (plain truncation) when neither dependency is wired, same
+        contract as every other optional dependency in this
+        constructor."""
         """None in older call sites/tests -- tfs_matches/wiki_matches
         stay None on the resulting Strategy in that case (see
         InvestigationStrategy's docstring for that field). A configured
@@ -281,6 +382,8 @@ class RecommendationEngine:
         # that surfaced this.
         query_text = strip_low_signal_boilerplate(investigation.context_text)
         entities = investigation.merged_entities
+        technology = self._infer_technology(investigation)
+        retrieval_context = self._resolve_retrieval_context(investigation, technology)
 
         similar_investigations: list[KnowledgeMatch] = []
         relevant_docs: list[KnowledgeMatch] = []
@@ -288,9 +391,28 @@ class RecommendationEngine:
 
         if query_text.strip():
             top_k = self._settings.similarity_top_k
-            similar_investigations = self._knowledge.search_historical_investigations(query_text, top_k)
-            relevant_docs = self._knowledge.search_documentation(query_text, top_k)
-            known_bugs = self._knowledge.search_known_bugs(query_text, top_k)
+            overfetch_k = top_k * _APPLICABILITY_OVERFETCH_MULTIPLIER
+            # Applicability-aware retrieval (Context Dimensions phase,
+            # 2026-08-12): over-fetch beyond top_k, let ApplicabilityRanker
+            # adjust for real Customer/Region/Technology applicability,
+            # THEN truncate -- see app/engines/knowledge/applicability.py's
+            # module docstring for why order matters here.
+            similar_investigations = self._applicability.rerank(
+                self._knowledge.search_historical_investigations(query_text, overfetch_k), retrieval_context, top_k=top_k
+            )
+            relevant_docs = self._applicability.rerank(
+                self._knowledge.search_documentation(query_text, overfetch_k), retrieval_context, top_k=top_k
+            )
+            known_bugs = self._applicability.rerank(
+                self._knowledge.search_known_bugs(query_text, overfetch_k), retrieval_context, top_k=top_k
+            )
+            # Resolution Provenance phase (2026-08-13): every match gets a
+            # real "why was this recommended" -- applicability's own
+            # reasons when they fired, a deterministic baseline
+            # otherwise. See _annotate_match_reasons's docstring.
+            similar_investigations = self._annotate_match_reasons(similar_investigations)
+            relevant_docs = self._annotate_match_reasons(relevant_docs)
+            known_bugs = self._annotate_match_reasons(known_bugs)
 
         root_causes = self._build_root_causes(similar_investigations, entities)
         overall_confidence = root_causes[0].confidence if root_causes else 0.0
@@ -307,6 +429,7 @@ class RecommendationEngine:
             recommended_logs=recommended_logs,
             next_action=next_action,
             next_action_rationale=next_action_rationale,
+            technology=technology,
         )
 
         return Recommendation(
@@ -322,6 +445,36 @@ class RecommendationEngine:
             next_best_step=next_action,
             strategy=strategy,
         )
+
+    def _annotate_match_reasons(self, matches: list[KnowledgeMatch]) -> list[KnowledgeMatch]:
+        """Real gap fix (2026-08-13, Resolution Provenance phase,
+        approved item 6): "Historical Investigation recommendations
+        must have an explicit explanation for why they were selected,
+        even when applicability did not contribute." Before this,
+        ``KnowledgeMatch.reason`` was only ever set (via
+        ``metadata["applicability_reasons"]``) when the Phase 1
+        ApplicabilityRanker found a real Customer/Region/Technology
+        signal to boost on -- a match with none of those (the common
+        case for most of the corpus, which isn't yet classified) had
+        no "why" at all beyond a bare score. This never invents a new
+        signal: it restates the real score, plus (for historical
+        investigations/known bugs specifically) whether the match
+        carries a recorded root cause or resolution -- both already
+        sitting in ``metadata`` from ``KnowledgeEngine.index_*``."""
+        annotated: list[KnowledgeMatch] = []
+        for match in matches:
+            applicability_reasons = match.metadata.get("applicability_reasons")
+            if applicability_reasons:
+                reason = "; ".join(applicability_reasons) + f" (also semantically similar, {match.score:.0%})"
+            else:
+                parts = [f"Semantically similar to the investigation's text ({match.score:.0%} similarity)"]
+                if match.metadata.get("root_cause"):
+                    parts.append("carries a recorded root cause")
+                if match.metadata.get("resolution"):
+                    parts.append("carries a recorded resolution")
+                reason = "; ".join(parts)
+            annotated.append(match.model_copy(update={"reason": reason}))
+        return annotated
 
     # --- Root causes -----------------------------------------------------
 
@@ -461,6 +614,21 @@ class RecommendationEngine:
         Now Critical requires the scenario's *issue type* to match too
         -- the log collection for the specific operation described in
         the investigation, not just the general technology area.
+
+        Specificity fix (Context Dimensions phase, 2026-08-12): a bare
+        technology name like "RF Mesh" used to score a full match
+        against text that actually said the more specific "RF Mesh
+        IP" -- ``keyword_match_score``'s word-boundary check is
+        satisfied by the space before "IP", so the shorter name (a
+        strict prefix of the longer one) tied with it instead of
+        losing to it. ``_specificity_demoted_technologies`` now demotes
+        a parent technology's full match to a partial one whenever a
+        real, governed child variant (``Technology.parent_technology_id``)
+        also fully matches the same text -- so a scenario tagged bare
+        "RF Mesh" no longer looks equally "Critical" as one tagged "RF
+        Mesh IP" when the investigation specifically says "RF Mesh
+        IP". See ``_match_reason``'s ``demoted_by`` parameter for the
+        explanation this produces.
         """
         if self._log_knowledge is None:
             return []
@@ -469,29 +637,63 @@ class RecommendationEngine:
             return []
 
         evidence_titles = _evidence_titles(investigation)
+        demoted_technologies = self._specificity_demoted_technologies(context)
 
-        scored: list[tuple[float, float, float, "LogCollectionScenario"]] = []
+        scored: list[tuple[float, float, float, "LogCollectionScenario", str | None]] = []
         for scenario in self._log_knowledge.list_scenarios():
             tech_score = _keyword_match_score(scenario.technology, context)
             if tech_score <= 0:
                 continue
+            demoted_by = demoted_technologies.get(scenario.technology)
+            if demoted_by and tech_score >= _FULL_MATCH_SCORE:
+                tech_score = _PARTIAL_MATCH_SCORE
+            else:
+                demoted_by = None
             type_score = _keyword_match_score(scenario.scenario_type, context)
-            scored.append((tech_score + type_score, tech_score, type_score, scenario))
+            scored.append((tech_score + type_score, tech_score, type_score, scenario, demoted_by))
         scored.sort(key=lambda row: row[0], reverse=True)
 
         items: list[RecommendedLogCollectionItem] = []
-        for _combined, tech_score, type_score, scenario in scored[:_MAX_MATCHED_SCENARIOS]:
+        for _combined, tech_score, type_score, scenario, demoted_by in scored[:_MAX_MATCHED_SCENARIOS]:
             if tech_score >= _FULL_MATCH_SCORE and type_score >= _FULL_MATCH_SCORE:
                 label = _PRIORITY_CRITICAL
             elif tech_score >= _FULL_MATCH_SCORE:
                 label = _PRIORITY_RECOMMENDED
             else:
                 label = _PRIORITY_OPTIONAL
-            reason = _match_reason(scenario, tech_score, type_score)
+            reason = _match_reason(scenario, tech_score, type_score, demoted_by=demoted_by)
             items.extend(self._scenario_items(scenario, label, reason, evidence_titles))
             if len(items) >= _MAX_RECOMMENDED_LOG_ITEMS:
                 break
         return items[:_MAX_RECOMMENDED_LOG_ITEMS]
+
+    def _specificity_demoted_technologies(self, context: str) -> dict[str, str]:
+        """Returns {parent_technology_name: child_technology_name} for
+        every governed technology whose full-phrase match in ``context``
+        should be treated as a broader-family match, not a specific
+        one, because a more specific child (``parent_technology_id``)
+        also fully matches the same text. Empty when no
+        ``LookupRepository`` is wired (older call sites/tests) or no
+        technology in the governed table has a populated hierarchy yet
+        -- never raises, never demotes anything without real evidence
+        that a more specific name is genuinely present in the text."""
+        if self._lookup is None:
+            return {}
+        technologies = self._lookup.list_technologies()
+        by_id = {t.id: t for t in technologies}
+        demoted: dict[str, str] = {}
+        for tech in technologies:
+            if tech.parent_technology_id is None:
+                continue
+            parent = by_id.get(tech.parent_technology_id)
+            if parent is None or parent.name in demoted:
+                continue
+            if (
+                _keyword_match_score(tech.name, context) >= _FULL_MATCH_SCORE
+                and _keyword_match_score(parent.name, context) >= _FULL_MATCH_SCORE
+            ):
+                demoted[parent.name] = tech.name
+        return demoted
 
     def logs_for_technology(
         self, investigation: InvestigationSession, technology: str
@@ -620,21 +822,39 @@ class RecommendationEngine:
         recommended_logs: list[RecommendedLogCollectionItem],
         next_action: str,
         next_action_rationale: str,
+        technology: str | None = None,
     ) -> InvestigationStrategy:
         matched_component = self._match_component(investigation, entities)
         required_evidence = self._required_evidence(investigation, recommended_logs, entities)
         missing_evidence = [item for item in required_evidence if not item.satisfied]
         stage, stage_rationale = self._current_stage(investigation, missing_evidence, root_causes)
         progress, progress_summary = self._progress(stage, required_evidence, missing_evidence)
+        suggested_sql_items = self._suggested_sql_items(matched_component, entities)
 
         tfs_matches = wiki_matches = recommended_solution = None
+        sources = _SynthesizedSources()
         if self._external_knowledge is not None:
             tfs_matches, wiki_matches = self._external_knowledge.gather(
-                investigation, entities, matched_component, self._infer_technology(investigation)
+                investigation, entities, matched_component, technology
             )
-            recommended_solution = self._synthesize_recommendation(
-                root_causes, similar_investigations, tfs_matches, wiki_matches, missing_evidence
+            recommended_solution, sources = self._synthesize_recommendation(
+                root_causes, similar_investigations, tfs_matches, wiki_matches, missing_evidence,
+                known_bugs=known_bugs, investigation_context=investigation.context_text,
             )
+
+        # Resolution Provenance (2026-08-13): always computed, even when
+        # External Knowledge isn't wired -- root-cause/log/SQL evidence
+        # don't depend on TFS/Wiki being configured, and the tier
+        # calculation degrades gracefully (never guesses) when they
+        # aren't present. See _build_provenance_record's docstring.
+        provenance = self._build_provenance_record(
+            root_causes=root_causes,
+            similar_investigations=similar_investigations,
+            recommended_logs=recommended_logs,
+            suggested_sql=suggested_sql_items,
+            recommended_solution=recommended_solution,
+            sources=sources,
+        )
 
         return InvestigationStrategy(
             current_stage=stage,
@@ -646,7 +866,7 @@ class RecommendationEngine:
             required_evidence=required_evidence,
             missing_evidence=missing_evidence,
             ordered_log_collection=recommended_logs,
-            suggested_sql=self._suggested_sql_items(matched_component, entities),
+            suggested_sql=suggested_sql_items,
             matched_component=matched_component,
             historical_investigations=similar_investigations,
             known_bugs=known_bugs,
@@ -655,6 +875,7 @@ class RecommendationEngine:
             wiki_matches=wiki_matches,
             recommended_solution=recommended_solution,
             decision_checkpoint=self._decision_checkpoint(root_causes),
+            provenance=provenance,
         )
 
     def _infer_technology(self, investigation: InvestigationSession) -> str | None:
@@ -670,45 +891,222 @@ class RecommendationEngine:
         Deliberately independent of ``_recommend_logs()``'s own
         technology+issue-type scenario matching (frozen -- "bug fixes
         only" per explicit instruction) rather than reusing its top
-        result: that method breaks combined-score ties by whichever
-        scenario happens to come first in Log Intelligence Knowledge
-        Base iteration order, which is a real, separate quality issue
-        of its own and not something this fix should silently inherit
-        or paper over. This applies the exact same deterministic
-        keyword_match_score used everywhere else in this file directly
-        against the real, distinct technology names in the Knowledge
-        Base, picking whichever single technology name actually scores
-        highest against the investigation's own text -- simpler and
-        answers a narrower question ("which technology name is
-        actually mentioned") than the scenario matcher needs to."""
+        result -- see ``_match_single_technology`` for the actual
+        matching rule."""
         if investigation.technology:
             return investigation.technology
         if self._log_knowledge is None:
             return None
-        context = investigation.context_text
-        best_technology: str | None = None
-        best_key: tuple[float, int] = (0.0, 0)
-        for technology in self.available_log_technologies():
-            score = keyword_match_score(technology, context)
-            # Real bug this fixes: "RF Mesh" and "RF Mesh IP" both score
-            # a full 1.0 against text containing "Technology: RF Mesh
-            # IP" -- keyword_match_score's word-boundary check only
-            # requires a non-word character after the phrase (the space
-            # before "IP" satisfies it), so a shorter technology name
-            # that's a strict prefix of a more specific one ties with
-            # it rather than losing to it. Breaking that tie by mere
-            # iteration order picked the vaguer "RF Mesh" over "RF Mesh
-            # IP" for a real ATCO RF-Mesh-IP investigation, anchoring
-            # the live TFS/Wiki search on the wrong, broader technology
-            # and pulling in genuinely unrelated generic RF-Mesh
-            # tickets. On a tied score, prefer the longer (more
-            # specific) technology name -- it still fully matched, so
-            # it's strictly more informative, never less correct.
-            key = (score, len(technology))
-            if key > best_key:
-                best_key = key
-                best_technology = technology
-        return best_technology
+        return self._match_single_technology(investigation.context_text)
+
+    def _match_single_technology(self, context: str) -> str | None:
+        """Real bug fix (2026-08-13, Final Knowledge-Quality
+        Acceptance Test, Findings #1/#2): the previous version scored
+        every candidate technology and kept the "best" via a ``(score,
+        len(name))`` tuple starting from a ``(0.0, 0)`` sentinel --
+        since any non-empty technology name beats that sentinel even
+        at a real score of 0.0, this fabricated a confident "match"
+        (whichever technology happened to have the single longest
+        name in the whole governed table -- "Tool Data (BCS / HHU)
+        processing" in practice) for *every* investigation that never
+        mentioned any real technology at all. The same length-based
+        tie-break also picked the wrong *sibling* technology on a
+        genuine partial-match tie: "Mesh IP" (no "RF" prefix) ties "RF
+        Mesh", "RF Mesh IP", and "RF Mesh (DAS implementation)" at a
+        shared 0.5 (via the single significant word "Mesh"), and the
+        longest name -- "RF Mesh (DAS implementation)", which has
+        nothing to do with "IP" at all -- always won.
+
+        Fixed rule, generic (no technology names hardcoded anywhere),
+        reusing the real ``Technology.parent_technology_id`` hierarchy
+        via ``app.engines.shared.hierarchy.most_specific`` -- the same
+        mechanism ``_specificity_demoted_technologies`` and the
+        classification engine's ``_best_match`` already use:
+
+        1. A candidate with a score of exactly 0.0 is evidence of
+           *nothing* and is excluded outright -- it can never become
+           "the match" merely for lacking competition.
+        2. Among the candidates tied at the single highest *positive*
+           score, the most specific one wins (a matched child beats a
+           matched parent) -- e.g. text containing "RF Mesh IP" ties
+           "RF Mesh" (1.0, a real prefix match) and "RF Mesh IP" (1.0,
+           the exact phrase); "RF Mesh" is an ancestor of the matched
+           "RF Mesh IP", so it's filtered out, leaving "RF Mesh IP" as
+           the unique, correct answer.
+        3. If more than one candidate remains after that filtering --
+           two genuinely unrelated technologies tied, or (the "Mesh
+           IP" case) two *sibling* technologies neither more specific
+           than the other once their shared parent is filtered out --
+           the evidence is genuinely insufficient to pick one.
+           Returns ``None`` rather than guessing; never a length-based
+           or alphabetical fallback.
+
+        Uses the governed ``technologies`` table (via ``self._lookup``)
+        when available -- it carries the real hierarchy Phase 1
+        populated from this exact Log Intelligence Knowledge Base, so
+        the candidate universe is unchanged, just now hierarchy-aware.
+        Falls back to ``available_log_technologies()``'s flat name list
+        (no hierarchy to resolve a tie with, so any genuine tie stays
+        unresolved) only when no ``LookupRepository`` is wired --
+        graceful degradation for older call sites/tests, same "don't
+        guess" contract either way.
+
+        Evidence threshold (2026-08-13, generic-single-word-overlap
+        fix): scoring uses ``_technology_evidence_score``, not the
+        shared ``keyword_match_score`` directly -- see that method's
+        own docstring for why a generic single-word overlap (e.g.
+        "processing" alone matching "Tool Data (BCS / HHU)
+        processing") must not count as evidence on its own, while
+        still allowing genuinely single-significant-word technology
+        names (e.g. "RF Mesh") to match on that one word.
+        """
+        technologies = self._lookup.list_technologies() if self._lookup is not None else []
+        if technologies:
+            candidates = [(t.name, t.id) for t in technologies]
+            parent_of = {t.id: t.parent_technology_id for t in technologies}
+        else:
+            candidates = [(name, name) for name in self.available_log_technologies()]
+            parent_of = {}
+
+        scores = {id_: self._technology_evidence_score(name, context) for name, id_ in candidates}
+        positive = [(name, id_) for name, id_ in candidates if scores[id_] > 0]
+        if not positive:
+            return None
+
+        best_score = max(scores[id_] for _name, id_ in positive)
+        tied = [(name, id_) for name, id_ in positive if scores[id_] == best_score]
+        if len(tied) == 1:
+            return tied[0][0]
+
+        survivor_ids = most_specific({id_ for _name, id_ in tied}, parent_of)
+        survivors = [name for name, id_ in tied if id_ in survivor_ids]
+        return survivors[0] if len(survivors) == 1 else None
+
+    @staticmethod
+    def _technology_evidence_score(name: str, context: str) -> float:
+        """Real bug fix (2026-08-13): ``_match_single_technology`` used
+        to score candidates via the shared ``keyword_match_score``,
+        whose partial-match fallback accepts *any single* significant
+        (>=4 char) word from a multi-word candidate name -- so
+        "Command processing appears delayed" (nothing but the ordinary
+        English word "processing" in common with the technology's
+        name) was enough to confidently return "Tool Data (BCS / HHU)
+        processing" as the matched technology, even though the far
+        more distinctive words "Tool" and "Data" from that same name
+        never appeared anywhere in the text.
+
+        Generic evidence-coverage rule (no technology names or generic
+        words hardcoded anywhere -- this is a property of how much of
+        any given candidate's *own* name is actually present, computed
+        identically for every candidate):
+
+        1. An exact/full phrase match is always valid evidence
+           (unchanged -- delegates to ``keyword_match_score``).
+        2. Short of that, a partial match is only valid when *every
+           one* of the candidate's own significant words is present in
+           the text -- full coverage of that candidate's identifying
+           vocabulary, not a fragment of it. A candidate whose name
+           has only one significant word to begin with (e.g. "RF
+           Mesh", whose only word >=4 chars is "Mesh") is unaffected:
+           matching its one word is by definition 100% coverage of its
+           own name, so it still counts -- this is what keeps the real
+           RF-Mesh-family specificity/ambiguity resolution
+           (``most_specific``, above) working exactly as before. A
+           candidate with several significant words (e.g. "Tool Data
+           (BCS / HHU) processing" -> {Tool, Data, processing}) now
+           needs all of them, not just one.
+        3. Anything less -- a single word out of several, or no
+           significant words present at all -- scores 0.0: no
+           evidence, excluded outright by the caller's positive-score
+           filter, never "the best we found by default"."""
+        full = keyword_match_score(name, context)
+        if full >= _FULL_MATCH_SCORE:
+            return _FULL_MATCH_SCORE
+        significant_words = [w for w in re.findall(r"[A-Za-z]+", name) if len(w) >= _MIN_KEYWORD_WORD_LEN]
+        if not significant_words:
+            return 0.0
+        if all(re.search(rf"(?<!\w){re.escape(w)}(?!\w)", context, re.IGNORECASE) for w in significant_words):
+            return _PARTIAL_MATCH_SCORE
+        return 0.0
+
+    @staticmethod
+    def _known_bug_has_topical_overlap(known_bug_title: str, investigation_context: str) -> bool:
+        """Real defect fix (2026-08-13, Phase 0 acceptance review,
+        finding #1): ``best_known_bug`` used to be selected on raw
+        semantic similarity score alone (``score >=
+        min_similarity_for_root_cause``) plus a bare "does it have a
+        workaround at all" check -- with no signal comparable to what
+        TFS/Wiki matches get from ``ranking.py``'s multi-signal
+        ``score_candidate()`` (component/technology/title-overlap/
+        entity/customer weights). Demonstrated live against the real
+        corpus: with the Known Bugs table this thin (4 rows, all
+        fictional Sprint-1 seed content, none real), 7 of 10 real
+        investigations tested surfaced a Known Bug driving a LIKELY
+        tier and a quoted "recommended resolution" from embedding
+        proximity alone -- including "IIS worker process crash on
+        multipart uploads over 50MB" at 56% similarity for a generic
+        "network connectivity" investigation with zero actual
+        relevance, and "Kafka client rebalance storm" at 65% for an
+        unrelated TEPCO ticket. A small, thin, generic knowledge source
+        crosses a 0.35 cosine-similarity floor against almost any
+        sufficiently technical-sounding text -- unlike the 728-row real
+        Historical Investigation corpus this same floor was calibrated
+        against, where a genuinely irrelevant top-1 match at that score
+        is rare because there's usually real, on-topic content to win
+        instead.
+
+        This is a real, deterministic sanity check, not a new ranking
+        subsystem: does the investigation's own text actually share at
+        least one real, distinguishing word (>=4 chars, the same
+        significance bar as every other word-level check in this file)
+        with the Known Bug's own title? A genuine match on real content
+        survives (e.g. "queue" shared between "Commands stuck in
+        Pending... queue increasing" and "Collector command queue
+        stalls..."); a same-magnitude score with zero shared vocabulary
+        (the two false positives above) does not. Deliberately "any
+        overlap" rather than ``_technology_evidence_score``'s stricter
+        full-coverage-of-every-significant-word rule -- that rule
+        exists to disambiguate between competing *named* technology
+        candidates (RF Mesh vs RF Mesh IP); this is a plain relevance
+        sanity check on a single already-selected top match, a
+        different problem with a deliberately looser bar."""
+        significant_words = {
+            w.lower()
+            for w in re.findall(r"[A-Za-z]+", known_bug_title)
+            if len(w) >= _MIN_KEYWORD_WORD_LEN and w.lower() not in _ENGLISH_STOPWORDS
+        }
+        if not significant_words:
+            return False
+        context_words = {w.lower() for w in re.findall(r"[A-Za-z]+", investigation_context)}
+        return bool(significant_words & context_words)
+
+    def _resolve_retrieval_context(
+        self, investigation: InvestigationSession, technology: str | None
+    ) -> RetrievalContext:
+        """Builds the ``RetrievalContext`` for one Analyze call --
+        ``investigation.customer`` (free text, engineer-entered) is
+        resolved against the governed, controlled Customer list by
+        exact name/alias match only; a customer name that doesn't
+        match any governed row yields ``customer_id=None`` (unknown,
+        never guessed -- approved product decision #1: never infer a
+        customer, and this specifically means never treating an
+        unmatched free-text value as if it were a real, taggable
+        customer). Region has no InvestigationSession field yet (no
+        Workspace UI captures it today) -- left unresolved rather than
+        inferred from customer or anything else; a real fix is adding
+        that field, not guessing around its absence."""
+        customer_id = customer_name = None
+        if self._lookup is not None and investigation.customer and investigation.customer.strip():
+            customer = self._lookup.get_customer_by_name(investigation.customer.strip())
+            if customer is not None:
+                customer_id, customer_name = customer.id, customer.name
+        return RetrievalContext(
+            customer_id=customer_id,
+            customer_name=customer_name,
+            region_id=None,
+            region_name=None,
+            technology_name=technology,
+        )
 
     def _synthesize_recommendation(
         self,
@@ -717,13 +1115,53 @@ class RecommendationEngine:
         tfs_result: "ExternalKnowledgeResult | None",
         wiki_result: "ExternalKnowledgeResult | None",
         missing_evidence: list[RequiredEvidenceItem],
-    ) -> RecommendedSolution:
-        """Correlates local KB + live TFS + live Wiki into one answer.
-        Deterministic throughout: picks whichever real source(s) clear
-        a confidence bar, quotes/references their actual content, and
-        is honest (``insufficient_evidence=True``, no resolution text)
-        when none do -- never invents a fix. See RecommendedSolution's
-        own docstring for the full source-attribution contract."""
+        known_bugs: list[KnowledgeMatch] | None = None,
+        investigation_context: str = "",
+    ) -> tuple[RecommendedSolution, "_SynthesizedSources"]:
+        """Correlates local KB + live TFS + live Wiki + Known Bugs into
+        one answer. Deterministic throughout: picks whichever real
+        source(s) clear a confidence bar, quotes/references their
+        actual content, and is honest (``insufficient_evidence=True``,
+        no resolution text) when none do -- never invents a fix. See
+        RecommendedSolution's own docstring for the full
+        source-attribution contract.
+
+        ``known_bugs`` (2026-08-13, Phase 0 -- Chat/Structured
+        Resolution Knowledge architecture) is a new, additive keyword
+        parameter -- defaults to ``None``/empty so every pre-existing
+        positional call site (tests included) keeps working unchanged.
+        Closes the gap flagged in
+        RESOLVEIQ_CHAT_AND_RESOLUTION_ARCHITECTURE.md Section 17/
+        Section 6: Known Bugs were structurally present (indexed,
+        searched, shown in ``InvestigationStrategy.known_bugs``) but
+        never actually consulted here, so a strong Known Bug match
+        could never surface as *the* recommended resolution or
+        contribute a real provenance tier -- only TFS/Wiki/local could.
+
+        ``investigation_context`` (2026-08-13, Phase 0 acceptance
+        review, defect #1) -- also new, also additive, also defaults to
+        ``""`` (empty context yields no topical-overlap evidence, so
+        ``best_known_bug`` simply never qualifies for a caller that
+        doesn't supply one -- the same graceful-degradation contract as
+        every other optional dependency in this engine). Required by
+        ``_known_bug_has_topical_overlap`` -- see that method's
+        docstring for the real, live-demonstrated defect this closes:
+        Known Bug selection used to trust raw semantic similarity alone
+        (the exact failure mode this whole engine was built to avoid
+        for every *other* source), which -- given the Known Bugs table
+        is currently only 4 small, generic, fictional Sprint-1 rows --
+        let an entirely unrelated bug's workaround get quoted as *the*
+        recommended resolution and drive a LIKELY tier.
+
+        Returns the ``RecommendedSolution`` alongside a
+        ``_SynthesizedSources`` (2026-08-13, Resolution Provenance
+        phase) -- purely an exposure of internal state this function
+        already computes (``correlated_local``/``best_tfs``/
+        ``best_wiki``/``best_known_bug``), added so
+        ``_build_provenance_record`` doesn't need to re-derive the same
+        cross-source-correlation logic a second time. The decision
+        logic below is completely unchanged from before this field
+        existed."""
         what_to_check = [item.description for item in missing_evidence[:5]] or [
             "Confirm the affected component/technology and gather logs from around the time of the issue."
         ]
@@ -743,16 +1181,26 @@ class RecommendationEngine:
             if wiki_result and wiki_result.available and wiki_result.matches and wiki_result.matches[0].score >= _SOLUTION_CONFIDENCE_FLOOR
             else None
         )
+        best_known_bug = (
+            known_bugs[0]
+            if known_bugs
+            and known_bugs[0].score >= self._settings.min_similarity_for_root_cause
+            and self._known_bug_has_topical_overlap(known_bugs[0].title, investigation_context)
+            else None
+        )
 
-        if not (best_local or best_tfs or best_wiki):
-            return RecommendedSolution(
-                likely_issue="Not enough evidence yet to identify a likely root cause.",
-                rationale="No local historical match, TFS case, or Wiki page currently meets the confidence "
-                "bar -- more evidence is needed before recommending a specific fix.",
-                what_to_check=what_to_check,
-                recommended_resolution=None,
-                insufficient_evidence=True,
-                confidence="Insufficient",
+        if not (best_local or best_tfs or best_wiki or best_known_bug):
+            return (
+                RecommendedSolution(
+                    likely_issue="Not enough evidence yet to identify a likely root cause.",
+                    rationale="No local historical match, TFS case, Wiki page, or Known Bug currently meets the "
+                    "confidence bar -- more evidence is needed before recommending a specific fix.",
+                    what_to_check=what_to_check,
+                    recommended_resolution=None,
+                    insufficient_evidence=True,
+                    confidence="Insufficient",
+                ),
+                _SynthesizedSources(),
             )
 
         # Real cross-source correlation, not a guess: a TFS Bug's own
@@ -859,23 +1307,362 @@ class RecommendationEngine:
             if recommended_resolution is None and page.excerpt:
                 recommended_resolution = f'Per Wiki page "{page.title}": {page.excerpt}'
 
+        # Known Bug (Phase 0, 2026-08-13) -- same "quote real content,
+        # never fabricate" discipline as the three sources above.
+        # workaround/status live in KnowledgeMatch.metadata, populated
+        # by KnowledgeEngine.index_known_bug (see that method).
+        if best_known_bug is not None:
+            workaround = best_known_bug.metadata.get("workaround")
+            bug_status = best_known_bug.metadata.get("status")
+            if likely_issue is None:
+                likely_issue = best_known_bug.title
+            status_note = f" (status: {bug_status})" if bug_status else ""
+            rationale_parts.append(f'a known bug "{best_known_bug.title}"{status_note}')
+            confidence_score = max(confidence_score, best_known_bug.score)
+            if recommended_resolution is None and workaround:
+                recommended_resolution = f'Per known bug "{best_known_bug.title}": {workaround}'
+
         if likely_issue is None:
             likely_issue = "Multiple weak signals found -- no single source clearly explains the issue yet."
 
-        return RecommendedSolution(
-            likely_issue=likely_issue,
-            rationale="Based on " + " and ".join(rationale_parts) + ".",
-            what_to_check=what_to_check,
-            recommended_resolution=recommended_resolution,
-            insufficient_evidence=recommended_resolution is None,
-            confidence=confidence_for_score(confidence_score) if recommended_resolution else "Low",
-            source_local=local_contributed,
-            source_tfs=best_tfs is not None,
-            source_wiki=best_wiki is not None,
-            supporting_tfs_id=best_tfs.tfs_case.tfs_id if best_tfs else None,
-            supporting_tfs_url=best_tfs.tfs_case.url if best_tfs else None,
-            supporting_wiki_title=best_wiki.wiki_page.title if best_wiki else None,
-            supporting_wiki_url=best_wiki.wiki_page.url if best_wiki else None,
+        return (
+            RecommendedSolution(
+                likely_issue=likely_issue,
+                rationale="Based on " + " and ".join(rationale_parts) + ".",
+                what_to_check=what_to_check,
+                recommended_resolution=recommended_resolution,
+                insufficient_evidence=recommended_resolution is None,
+                confidence=confidence_for_score(confidence_score) if recommended_resolution else "Low",
+                source_local=local_contributed,
+                source_tfs=best_tfs is not None,
+                source_wiki=best_wiki is not None,
+                source_known_bug=best_known_bug is not None,
+                supporting_tfs_id=best_tfs.tfs_case.tfs_id if best_tfs else None,
+                supporting_tfs_url=best_tfs.tfs_case.url if best_tfs else None,
+                supporting_wiki_title=best_wiki.wiki_page.title if best_wiki else None,
+                supporting_wiki_url=best_wiki.wiki_page.url if best_wiki else None,
+                supporting_known_bug_id=best_known_bug.record_id if best_known_bug else None,
+                supporting_known_bug_title=best_known_bug.title if best_known_bug else None,
+            ),
+            _SynthesizedSources(
+                correlated_match=correlated_local,
+                best_tfs=best_tfs,
+                best_wiki=best_wiki,
+                best_local=best_local,
+                best_known_bug=best_known_bug,
+            ),
+        )
+
+    # --- Resolution Provenance (2026-08-13) ---------------------------------
+    #
+    # Everything below wraps output _build_root_causes/_synthesize_recommendation/
+    # _recommend_logs/_suggested_sql_items already produced into a uniform,
+    # traceable EvidenceReference shape, and computes the Confirmed/Likely/
+    # Possible/Unknown tier via a deterministic rule that never lets a
+    # similarity score alone reach Confirmed. No new retrieval, no new
+    # matching, no LLM -- see app/domain/provenance.py's module docstring.
+
+    def _local_match_for_cause(
+        self, cause: RootCauseHypothesis, similar_investigations: list[KnowledgeMatch]
+    ) -> "KnowledgeMatch | None":
+        """The specific similar_investigations entry backing one
+        RootCauseHypothesis, found the exact same way
+        _synthesize_recommendation's own correlated_match already does
+        (root_cause snippet equality) -- reused here rather than a new
+        mechanism, applied per-cause so a second root-cause hypothesis
+        (also historical-investigation-derived) resolves to its own
+        real match, not silently reuses the first one's."""
+        if not cause.rationale.startswith("Matches historical investigation"):
+            return None
+        for match in similar_investigations[:2]:
+            root_cause_text = match.metadata.get("root_cause")
+            if root_cause_text and _snippet(root_cause_text) == cause.description:
+                return match
+        return None
+
+    def _root_cause_evidence(
+        self, root_causes: list[RootCauseHypothesis], similar_investigations: list[KnowledgeMatch]
+    ) -> list[EvidenceReference]:
+        """Answers "what evidence supports the proposed root cause" --
+        one EvidenceReference per hypothesis _build_root_causes already
+        produced, typed by where it actually came from (a real
+        historical investigation vs. an entity heuristic with no
+        governed record behind it)."""
+        evidence: list[EvidenceReference] = []
+        for cause in root_causes[:2]:
+            local_match = self._local_match_for_cause(cause, similar_investigations)
+            if local_match is not None:
+                evidence.append(
+                    EvidenceReference(
+                        kind=EvidenceKind.HISTORICAL_INVESTIGATION,
+                        source_id=local_match.record_id,
+                        title=local_match.title,
+                        score=local_match.score,
+                        reason=cause.rationale,
+                        contributes_to=["root_cause"],
+                    )
+                )
+            else:
+                evidence.append(
+                    EvidenceReference(
+                        kind=EvidenceKind.ENTITY_HEURISTIC,
+                        source_id=cause.description,
+                        title=cause.description,
+                        score=cause.confidence,
+                        reason=cause.rationale,
+                        contributes_to=["root_cause"],
+                    )
+                )
+        return evidence
+
+    def _resolution_evidence(
+        self,
+        recommended_solution: "RecommendedSolution | None",
+        sources: "_SynthesizedSources",
+        primary_local_match: "KnowledgeMatch | None",
+    ) -> list[EvidenceReference]:
+        """Answers "what evidence supports the proposed resolution" --
+        closes the real gap from the approved design (§2, question 7):
+        TFS/Wiki already had structured supporting-reference fields on
+        RecommendedSolution; the local historical-investigation source
+        did not. All three are now uniformly represented."""
+        if recommended_solution is None:
+            return []
+        evidence: list[EvidenceReference] = []
+        if recommended_solution.source_local and primary_local_match is not None:
+            reason = (
+                "Backs the synthesized resolution text."
+                if recommended_solution.recommended_resolution
+                else "Backs the likely issue -- no confirmed root cause or resolution on file for this record."
+            )
+            evidence.append(
+                EvidenceReference(
+                    kind=EvidenceKind.HISTORICAL_INVESTIGATION,
+                    source_id=primary_local_match.record_id,
+                    title=primary_local_match.title,
+                    score=primary_local_match.score,
+                    reason=reason,
+                    contributes_to=["resolution"],
+                )
+            )
+        if recommended_solution.source_tfs and sources.best_tfs is not None:
+            case = sources.best_tfs.tfs_case
+            evidence.append(
+                EvidenceReference(
+                    kind=EvidenceKind.TFS_CASE,
+                    source_id=str(case.tfs_id),
+                    title=case.title,
+                    url=case.url,
+                    score=sources.best_tfs.score,
+                    reason="; ".join(sources.best_tfs.match_reasons) or f"TFS-{case.tfs_id} ({case.state}).",
+                    contributes_to=["resolution"],
+                )
+            )
+        if recommended_solution.source_wiki and sources.best_wiki is not None:
+            page = sources.best_wiki.wiki_page
+            evidence.append(
+                EvidenceReference(
+                    kind=EvidenceKind.WIKI_PAGE,
+                    source_id=page.page_id,
+                    title=page.title,
+                    url=page.url,
+                    score=sources.best_wiki.score,
+                    reason="; ".join(sources.best_wiki.match_reasons) or f'Wiki page "{page.title}".',
+                    contributes_to=["resolution"],
+                )
+            )
+        if recommended_solution.source_known_bug and sources.best_known_bug is not None:
+            reason = (
+                "Backs the synthesized resolution text."
+                if recommended_solution.recommended_resolution
+                else "Backs the likely issue -- no recorded workaround on file for this known bug."
+            )
+            evidence.append(
+                EvidenceReference(
+                    kind=EvidenceKind.KNOWN_BUG,
+                    source_id=sources.best_known_bug.record_id,
+                    title=sources.best_known_bug.title,
+                    score=sources.best_known_bug.score,
+                    reason=reason,
+                    contributes_to=["resolution"],
+                )
+            )
+        return evidence
+
+    def _verified_local_record(
+        self, primary_local_match: "KnowledgeMatch | None"
+    ) -> "HistoricalInvestigationRecord | None":
+        """Fetches the full, real HistoricalInvestigationRecord fresh
+        from the repository (via KnowledgeEngine.get_historical_investigation
+        -- already an existing public method, not a new lookup path) so
+        its resolution_verified flag is authoritative rather than
+        trusting Chroma's own (search-relevance-oriented, potentially
+        stale) metadata. Returns None unless the record both exists and
+        is genuinely marked verified -- an unverified or missing record
+        is never treated as evidence of anything."""
+        if primary_local_match is None:
+            return None
+        record = self._knowledge.get_historical_investigation(primary_local_match.record_id)
+        if record is not None and record.resolution_verified:
+            return record
+        return None
+
+    def _verified_known_bug_record(self, best_known_bug: "KnowledgeMatch | None") -> "KnownBugRecord | None":
+        """The Known Bug analogue of ``_verified_local_record`` --
+        added 2026-08-13, Phase 0. Same discipline: fetches fresh from
+        the repository (never trusts Chroma's own metadata for this),
+        returns None unless the record both exists and is genuinely
+        marked verified."""
+        if best_known_bug is None:
+            return None
+        record = self._knowledge.get_known_bug(best_known_bug.record_id)
+        if record is not None and record.resolution_verified:
+            return record
+        return None
+
+    def _resolve_provenance_tier(
+        self,
+        *,
+        recommended_solution: "RecommendedSolution | None",
+        sources: "_SynthesizedSources",
+        root_causes: list[RootCauseHypothesis],
+        similar_investigations: list[KnowledgeMatch],
+    ) -> tuple[ResolutionProvenance, str]:
+        """The approved rule, exactly: Confirmed only from real
+        cross-source correlation or explicit human verification --
+        never from a similarity score alone, however high. See
+        app/domain/provenance.py's ResolutionProvenance docstring for
+        the full rule; this is its one implementation."""
+        primary_local_match = self._local_match_for_cause(root_causes[0], similar_investigations) if root_causes else None
+
+        if sources.correlated_match is not None and sources.best_tfs is not None:
+            return (
+                ResolutionProvenance.CONFIRMED,
+                f'Cross-source correlation: TFS-{sources.best_tfs.tfs_case.tfs_id} and local historical '
+                f'investigation "{sources.correlated_match.title}" reference the same real-world case '
+                f"(matching ticket/CRM reference) -- not a similarity score, two independent systems agreeing.",
+            )
+
+        verified_record = self._verified_local_record(primary_local_match)
+        if verified_record is not None:
+            note = f" -- {verified_record.resolution_verification_note}" if verified_record.resolution_verification_note else ""
+            when = verified_record.resolution_verified_at.isoformat() if verified_record.resolution_verified_at else "an unrecorded date"
+            return (
+                ResolutionProvenance.CONFIRMED,
+                f'Explicitly verified by {verified_record.resolution_verified_by or "an administrator"} on {when}{note}.',
+            )
+
+        verified_bug = self._verified_known_bug_record(sources.best_known_bug)
+        if verified_bug is not None:
+            note = f" -- {verified_bug.resolution_verification_note}" if verified_bug.resolution_verification_note else ""
+            when = verified_bug.resolution_verified_at.isoformat() if verified_bug.resolution_verified_at else "an unrecorded date"
+            return (
+                ResolutionProvenance.CONFIRMED,
+                f'Explicitly verified by {verified_bug.resolution_verified_by or "an administrator"} on {when}{note} '
+                f'(known bug "{verified_bug.title}").',
+            )
+
+        if (
+            primary_local_match is not None
+            and primary_local_match.score >= self._settings.min_similarity_for_root_cause
+            and primary_local_match.metadata.get("root_cause")
+        ):
+            return (
+                ResolutionProvenance.LIKELY,
+                f'Single local historical match ("{primary_local_match.title}", {primary_local_match.score:.0%} '
+                f"similarity) with a recorded root cause -- no independent corroborating source.",
+            )
+        if sources.best_tfs is not None and sources.best_tfs.confidence == "High" and sources.best_tfs.tfs_case.resolution_text:
+            return (
+                ResolutionProvenance.LIKELY,
+                f"High-confidence TFS match (TFS-{sources.best_tfs.tfs_case.tfs_id}) with real resolution "
+                f"text -- no independent corroborating source.",
+            )
+        if sources.best_wiki is not None and sources.best_wiki.confidence == "High" and sources.best_wiki.wiki_page.excerpt:
+            return (
+                ResolutionProvenance.LIKELY,
+                f'High-confidence Wiki match ("{sources.best_wiki.wiki_page.title}") with real guidance '
+                f"content -- no independent corroborating source.",
+            )
+        if sources.best_known_bug is not None and sources.best_known_bug.metadata.get("workaround"):
+            return (
+                ResolutionProvenance.LIKELY,
+                f'Single known-bug match ("{sources.best_known_bug.title}", {sources.best_known_bug.score:.0%} '
+                f"similarity) with a recorded workaround -- no independent corroborating source.",
+            )
+
+        insufficient = recommended_solution is None or recommended_solution.insufficient_evidence
+        has_any_evidence = (
+            primary_local_match is not None
+            or sources.best_local is not None
+            or sources.best_tfs is not None
+            or sources.best_wiki is not None
+            or sources.best_known_bug is not None
+        )
+        if insufficient and not has_any_evidence:
+            return ResolutionProvenance.UNKNOWN, "No source currently meets the confidence bar to support a root cause or resolution."
+
+        return (
+            ResolutionProvenance.POSSIBLE,
+            "Evidence exists but doesn't reach a single strong, corroborated source -- treat as a hypothesis "
+            "to verify, not a confirmed or likely resolution.",
+        )
+
+    def _build_provenance_record(
+        self,
+        *,
+        root_causes: list[RootCauseHypothesis],
+        similar_investigations: list[KnowledgeMatch],
+        recommended_logs: list[RecommendedLogCollectionItem],
+        suggested_sql: list[SuggestedSqlItem],
+        recommended_solution: "RecommendedSolution | None",
+        sources: "_SynthesizedSources",
+    ) -> ProvenanceRecord:
+        """The single entry point: wraps every already-computed
+        recommendation into a traceable EvidenceReference and resolves
+        the resolution's trust tier. Always returns a real
+        ProvenanceRecord -- never None -- so a future consumer (the
+        Investigation Workspace today, a Chat Assistant later) can
+        always ask "why" and get a real, structured answer, even for a
+        brand-new investigation with nothing in it yet (empty evidence
+        lists, tier UNKNOWN)."""
+        primary_local_match = self._local_match_for_cause(root_causes[0], similar_investigations) if root_causes else None
+
+        log_evidence = [
+            EvidenceReference(
+                kind=EvidenceKind.LOG_COLLECTION_STEP,
+                source_id=item.scenario_id,
+                title=f"{item.component_name} ({item.scenario_technology} / {item.scenario_type})",
+                reason=item.match_reason,
+                contributes_to=["log_recommendation"],
+            )
+            for item in recommended_logs
+        ]
+        sql_evidence = [
+            EvidenceReference(
+                kind=EvidenceKind.SQL_TEMPLATE if item.source == "sql_library" else EvidenceKind.ENTITY_HEURISTIC,
+                source_id=item.template_id or item.title,
+                title=item.title,
+                reason=item.match_reason,
+                contributes_to=["sql_recommendation"],
+            )
+            for item in suggested_sql
+        ]
+
+        tier, rationale = self._resolve_provenance_tier(
+            recommended_solution=recommended_solution,
+            sources=sources,
+            root_causes=root_causes,
+            similar_investigations=similar_investigations,
+        )
+
+        return ProvenanceRecord(
+            root_cause_evidence=self._root_cause_evidence(root_causes, similar_investigations),
+            resolution_evidence=self._resolution_evidence(recommended_solution, sources, primary_local_match),
+            log_recommendation_evidence=log_evidence,
+            sql_recommendation_evidence=sql_evidence,
+            resolution_provenance=tier,
+            provenance_rationale=rationale,
         )
 
     def _match_component(
@@ -889,7 +1676,24 @@ class RecommendationEngine:
         possible signal (1.0, real extracted data, not a guess); a
         keyword match against the investigation's own text is the
         fallback. Ties keep the first-encountered (registry order)
-        component, consistent with every other tie-break in this file."""
+        component, consistent with every other tie-break in this file.
+
+        Real bug fix (2026-08-13, Final Knowledge-Quality Acceptance
+        Test, Finding #3): this used to also accept a *partial* match
+        -- a single significant word (>=4 chars) from a multi-word
+        component name appearing anywhere in the text -- as "weakly
+        matched" evidence, and still returned it as *the* matched
+        component with no floor. Component names are ordinary English
+        words far more often than technology names are ("Device Hub",
+        "Network Hub", ...), so mentioning "network" in passing was
+        enough to confidently claim "Network Hub" was matched. Fixed
+        generically, not with a blacklist of generic words: a partial
+        (single-word) match is no longer accepted as component-
+        matching evidence at all -- only a real match on the
+        component's *complete* name (or an exact extracted entity
+        value, handled above) counts. This is a stricter version of
+        the exact same ``keyword_match_score`` rule already used
+        throughout this file, not a second matching mechanism."""
         if self._components is None:
             return None
         components = self._components.list_all()
@@ -915,12 +1719,12 @@ class RecommendationEngine:
                 )
             else:
                 score = _keyword_match_score(name, context)
-                if score >= _FULL_MATCH_SCORE:
-                    reason = f'Matched because the investigation text mentions "{component.name}" by name.'
-                elif score > 0:
-                    reason = f'Weakly matched: the investigation text mentions a keyword related to "{component.name}".'
-                else:
+                if score < _FULL_MATCH_SCORE:
+                    # A partial, single-generic-word match is not
+                    # sufficiently distinctive evidence on its own --
+                    # see this method's docstring.
                     continue
+                reason = f'Matched because the investigation text mentions "{component.name}" by name.'
             if best is None or score > best.confidence:
                 best = MatchedComponent(
                     component_id=component.id, component_name=component.name, confidence=score, match_reason=reason
@@ -1009,7 +1813,19 @@ class RecommendationEngine:
         matching logic invented. Falls back to the existing
         entity-heuristic snippets only when no component matched or no
         template links to it, so a suggestion is still available for
-        the (also pre-existing) fallback path."""
+        the (also pre-existing) fallback path.
+
+        Real gap fix (2026-08-13, Resolution Provenance phase, approved
+        item 7): every item now carries ``match_reason`` -- why *this
+        investigation* got *this* suggestion, distinct from
+        ``explanation`` (the template's own static description of what
+        the query does, unchanged). Iterates ``_ENTITY_HEURISTICS``
+        directly for the fallback branch (rather than calling
+        ``_suggest_sql``, which only returns bare SQL strings and loses
+        which heuristic/entity produced each one) so the reason can
+        name the real entity that triggered it; ``_suggest_sql`` itself
+        is untouched and still backs the legacy flat
+        ``Recommendation.suggested_sql`` field exactly as before."""
         items: list[SuggestedSqlItem] = []
         if matched_component is not None and self._sql_library is not None:
             for template in self._sql_library.list_templates():
@@ -1021,14 +1837,31 @@ class RecommendationEngine:
                             explanation=template.explanation,
                             source="sql_library",
                             template_id=template.id,
+                            match_reason=(
+                                f'Linked to the matched component "{matched_component.component_name}" via this '
+                                f"SQL template's related_components."
+                            ),
                         )
                     )
         if items:
             return items
-        return [
-            SuggestedSqlItem(title="Suggested query", sql_text=sql_text, source="entity_heuristic")
-            for sql_text in self._suggest_sql(entities)
-        ]
+
+        entity_by_type = {e.entity_type: e for e in entities}
+        fallback_items: list[SuggestedSqlItem] = []
+        for heuristic in _ENTITY_HEURISTICS:
+            entity = entity_by_type.get(heuristic.entity_type)
+            if entity is not None and heuristic.suggested_sql:
+                fallback_items.append(
+                    SuggestedSqlItem(
+                        title="Suggested query",
+                        sql_text=heuristic.suggested_sql.format(value=entity.value),
+                        source="entity_heuristic",
+                        match_reason=(
+                            f'Investigation evidence contains a {heuristic.entity_type.value} entity ("{entity.value}").'
+                        ),
+                    )
+                )
+        return fallback_items
 
     @staticmethod
     def _decision_checkpoint(root_causes: list[RootCauseHypothesis]) -> str | None:

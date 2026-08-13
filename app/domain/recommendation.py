@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.domain.enums import KnowledgeCollection
 from app.domain.external_knowledge import ExternalKnowledgeResult
+from app.domain.provenance import ProvenanceRecord
 
 
 class KnowledgeMatch(BaseModel):
@@ -20,6 +21,16 @@ class KnowledgeMatch(BaseModel):
     score: float = Field(ge=0.0, le=1.0)
     """Similarity score normalized to [0, 1], 1.0 = exact match."""
     metadata: dict = Field(default_factory=dict)
+    reason: str = ""
+    """Deterministic, human-readable "why was this recommended" --
+    added 2026-08-13 (Resolution Provenance phase) to close a real gap:
+    TFS/Wiki matches and log recommendations already carried a reason,
+    this didn't. Reuses ``metadata["applicability_reasons"]`` when the
+    Phase 1 applicability ranker fired; otherwise a deterministic
+    baseline built from the score and whether the match carries a
+    recorded root_cause/resolution -- see
+    ``RecommendationEngine._annotate_match_reasons``. Never blank for a
+    match returned inside an ``InvestigationStrategy``."""
 
 
 class RootCauseHypothesis(BaseModel):
@@ -143,6 +154,14 @@ class SuggestedSqlItem(BaseModel):
     template_id: str | None = None
     """Set for source == "sql_library" -- the real QueryTemplate id, so
     the UI can link to SQL Studio instead of duplicating its content."""
+    match_reason: str = ""
+    """Why *this investigation* got *this* SQL suggestion -- added
+    2026-08-13 (Resolution Provenance phase) to close a real gap:
+    ``explanation`` above is the template's own static description of
+    what the query does, not why it was matched here. For
+    source="sql_library": which matched component linked it, via the
+    template's real ``related_components``. For source="entity_heuristic":
+    which extracted entity triggered it. Never blank."""
 
 
 class MatchedComponent(BaseModel):
@@ -196,10 +215,20 @@ class RecommendedSolution(BaseModel):
     source_local: bool = False
     source_tfs: bool = False
     source_wiki: bool = False
+    source_known_bug: bool = False
+    """Added 2026-08-13 (Phase 0 -- Chat/Structured Resolution Knowledge
+    architecture, closing the gap flagged in
+    RESOLVEIQ_CHAT_AND_RESOLUTION_ARCHITECTURE.md Section 17/Section 6):
+    Known Bugs are now a fourth candidate resolution source, alongside
+    local historical investigations, TFS, and Wiki -- same discipline,
+    same honesty contract (only True when a real Known Bug match
+    actually contributed)."""
     supporting_tfs_id: int | None = None
     supporting_tfs_url: str | None = None
     supporting_wiki_title: str | None = None
     supporting_wiki_url: str | None = None
+    supporting_known_bug_id: str | None = None
+    supporting_known_bug_title: str | None = None
 
 
 class InvestigationStrategy(BaseModel):
@@ -267,6 +296,16 @@ class InvestigationStrategy(BaseModel):
     """The specific thing to verify/decide next -- built from how many
     root-cause candidates exist (distinguish between them if >1, confirm
     the one if exactly 1, None if there's nothing yet to decide between)."""
+    provenance: ProvenanceRecord = Field(default_factory=ProvenanceRecord)
+    """Resolution Provenance (2026-08-13) -- the structured "why" behind
+    every recommendation in this strategy, and the Confirmed/Likely/
+    Possible/Unknown trust tier for the resolution specifically (never
+    derived from a similarity score alone -- see
+    ``RecommendationEngine._resolve_provenance_tier``). Always
+    populated, even for a brand-new investigation with no evidence yet
+    (empty evidence lists, tier UNKNOWN) -- same "one consistent
+    hierarchy regardless of investigation state" discipline as the rest
+    of this model."""
 
 
 class Recommendation(BaseModel):

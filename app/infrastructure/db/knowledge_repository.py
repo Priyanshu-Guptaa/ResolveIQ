@@ -136,6 +136,10 @@ class SqlAlchemyKnowledgeRepository:
             model.bug_status = record.bug_status
             model.affected_components = record.affected_components
             model.workaround = record.workaround
+            model.resolution_verified = record.resolution_verified
+            model.resolution_verified_by = record.resolution_verified_by
+            model.resolution_verified_at = record.resolution_verified_at
+            model.resolution_verification_note = record.resolution_verification_note
             model.created_at = record.created_at
             model.updated_at = record.updated_at
             model.created_by = record.created_by
@@ -191,6 +195,10 @@ class SqlAlchemyKnowledgeRepository:
             model.next_step = record.next_step
             model.tags = record.tags
             model.domain = record.domain
+            model.resolution_verified = record.resolution_verified
+            model.resolution_verified_by = record.resolution_verified_by
+            model.resolution_verified_at = record.resolution_verified_at
+            model.resolution_verification_note = record.resolution_verification_note
             model.created_at = record.created_at
             model.updated_at = record.updated_at
             model.created_by = record.created_by
@@ -461,6 +469,10 @@ def _known_bug_to_domain(model: KnownBugModel, related_components: list[str]) ->
         affected_components=model.affected_components,
         workaround=model.workaround,
         related_components=related_components,
+        resolution_verified=model.resolution_verified,
+        resolution_verified_by=model.resolution_verified_by,
+        resolution_verified_at=model.resolution_verified_at,
+        resolution_verification_note=model.resolution_verification_note,
         created_at=model.created_at,
         updated_at=model.updated_at,
         created_by=model.created_by,
@@ -483,6 +495,10 @@ def _historical_investigation_to_domain(
         tags=model.tags,
         domain=model.domain,
         related_components=related_components,
+        resolution_verified=model.resolution_verified,
+        resolution_verified_by=model.resolution_verified_by,
+        resolution_verified_at=model.resolution_verified_at,
+        resolution_verification_note=model.resolution_verification_note,
         created_at=model.created_at,
         updated_at=model.updated_at,
         created_by=model.created_by,

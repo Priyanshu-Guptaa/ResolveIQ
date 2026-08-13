@@ -26,6 +26,25 @@ from components.object_status_badge import object_status_badge_html
 
 _GOVERNANCE_FIELDS = {"id", "status", "created_at", "updated_at", "created_by", "updated_by", "is_active"}
 
+_RESOLUTION_VERIFICATION_FIELDS = {
+    "resolution_verified",
+    "resolution_verified_by",
+    "resolution_verified_at",
+    "resolution_verification_note",
+}
+"""Excluded from this generic form (2026-08-13, Phase 0) -- the
+approved Resolution Provenance design explicitly required no
+unrestricted UI control for these fields. Without this exclusion, this
+component's own "every non-governance field becomes an editable input"
+genericness would have rendered a bare, unpaired checkbox for
+``resolution_verified`` with no forced actor/note -- exactly the risk
+that requirement exists to prevent. The real, audit-paired action lives
+in ``components/knowledge_editor.py``'s dedicated Resolution
+Verification panel (Historical Investigation / Known Bug only), backed
+by ``/admin/.../verify``, not this generic PATCH form -- the API layer
+(``app/api/routers/admin/knowledge_objects.py``) enforces the same
+boundary server-side, so this is defense in depth, not the only guard."""
+
 
 def render_metadata_panel(obj: dict, *, object_type: str, actor: str = "admin") -> None:
     cols = st.columns([2, 2, 2, 1])
@@ -36,7 +55,7 @@ def render_metadata_panel(obj: dict, *, object_type: str, actor: str = "admin") 
 
     st.divider()
     st.markdown("##### Fields")
-    editable = {k: v for k, v in obj.items() if k not in _GOVERNANCE_FIELDS}
+    editable = {k: v for k, v in obj.items() if k not in _GOVERNANCE_FIELDS and k not in _RESOLUTION_VERIFICATION_FIELDS}
     with st.form(key=f"metadata_form_{object_type}_{obj['id']}"):
         new_values: dict = {}
         for field_name, value in editable.items():
