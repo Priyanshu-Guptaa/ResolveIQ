@@ -499,3 +499,99 @@ def test_classification_scan_counts_investigations_and_known_bugs(engine_bundle)
     # (none, in this fixture's fresh DB) -- proves both new loops in
     # run() actually execute and advance the shared counter.
     assert summary.documents_scanned >= 2
+
+
+# --- list_pending_with_context (2026-08-14, Phase 5 UI improvement) --------
+# Read-only presentation enrichment (real object title + re-derived real
+# mention count) for the Classification Review UI. Purely additive --
+# list_pending()/run()/accept()/reject() and every confidence/status rule
+# above are unchanged; these tests only cover the new method.
+
+
+def test_list_pending_with_context_resolves_real_document_title(engine_bundle):
+    lookup_repo = engine_bundle["lookup_repo"]
+    lookup_repo.save_technology(Technology(id=str(uuid.uuid4()), name="RF Mesh IP"))
+    doc = _save_document(
+        engine_bundle["knowledge_repo"], title="Real Document Title",
+        content="RF Mesh IP is discussed here. RF Mesh IP appears twice.",
+    )
+
+    engine_bundle["classification_engine"].run(actor="test")
+    views = engine_bundle["classification_engine"].list_pending_with_context()
+
+    assert views, "expected a Medium-confidence pending suggestion from a body-repeated mention"
+    match = next(v for v in views if v.object_id == doc.id)
+    assert match.object_title == "Real Document Title"
+
+
+def test_list_pending_with_context_mention_count_matches_real_body(engine_bundle):
+    lookup_repo = engine_bundle["lookup_repo"]
+    lookup_repo.save_technology(Technology(id=str(uuid.uuid4()), name="RF Mesh IP"))
+    doc = _save_document(
+        engine_bundle["knowledge_repo"], title="Doc",
+        content="RF Mesh IP one. RF Mesh IP two. RF Mesh IP three.",
+    )
+
+    engine_bundle["classification_engine"].run(actor="test")
+    views = engine_bundle["classification_engine"].list_pending_with_context()
+
+    match = next(v for v in views if v.object_id == doc.id)
+    assert match.mention_count == 3
+
+
+def test_list_pending_with_context_historical_investigation_title(engine_bundle):
+    lookup_repo = engine_bundle["lookup_repo"]
+    customer = Customer(id=str(uuid.uuid4()), name="TEPCO")
+    lookup_repo.save_customer(customer)
+    investigation = _save_historical_investigation(
+        engine_bundle["knowledge_repo"], title="A Real Investigation Title",
+        description="Unrelated body mentioning TEPCO twice: TEPCO issue, TEPCO again.",
+    )
+
+    engine_bundle["classification_engine"].run(actor="test")
+    views = engine_bundle["classification_engine"].list_pending_with_context()
+
+    match = next(v for v in views if v.object_id == investigation.id)
+    assert match.object_title == "A Real Investigation Title"
+
+
+def test_list_pending_with_context_title_none_when_object_missing(engine_bundle):
+    """Never fabricates a title -- an orphaned suggestion (object
+    deleted since it was created) shows object_title=None, exactly the
+    'unavailable' signal the UI relies on, never a guessed name."""
+    from datetime import datetime, timezone
+
+    from app.domain.classification import MetadataClassificationSuggestion
+
+    orphan = MetadataClassificationSuggestion(
+        object_type=KnowledgeObjectType.DOCUMENT.value, object_id="does-not-exist",
+        dimension=ClassificationDimension.TECHNOLOGY, suggested_value_id="tech-x",
+        suggested_value_text="RF Mesh IP", confidence_tier=ConfidenceTier.MEDIUM,
+        evidence_snippet="x", evidence_rule="body_repeated_mention", status=SuggestionStatus.PENDING,
+    )
+    engine_bundle["classification_repo"].save(orphan)
+
+    views = engine_bundle["classification_engine"].list_pending_with_context()
+
+    match = next(v for v in views if v.id == orphan.id)
+    assert match.object_title is None
+
+
+def test_list_pending_with_context_never_changes_status_or_confidence(engine_bundle):
+    """Purely additive -- the enriched view's status/confidence/evidence
+    are byte-identical to what list_pending() itself returns."""
+    lookup_repo = engine_bundle["lookup_repo"]
+    lookup_repo.save_technology(Technology(id=str(uuid.uuid4()), name="RF Mesh IP"))
+    _save_document(engine_bundle["knowledge_repo"], title="Doc", content="RF Mesh IP twice. RF Mesh IP again.")
+
+    engine_bundle["classification_engine"].run(actor="test")
+    plain = {s.id: s for s in engine_bundle["classification_engine"].list_pending()}
+    enriched = {v.id: v for v in engine_bundle["classification_engine"].list_pending_with_context()}
+
+    assert set(plain) == set(enriched)
+    for suggestion_id, suggestion in plain.items():
+        view = enriched[suggestion_id]
+        assert view.status == suggestion.status
+        assert view.confidence_tier == suggestion.confidence_tier
+        assert view.evidence_snippet == suggestion.evidence_snippet
+        assert view.evidence_rule == suggestion.evidence_rule

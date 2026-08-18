@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.api.dependencies import get_document_classification_engine
-from app.domain.classification import ClassificationRunSummary, MetadataClassificationSuggestion
+from app.domain.classification import ClassificationRunSummary, MetadataClassificationSuggestion, PendingSuggestionView
 from app.engines.knowledge.classification import DocumentClassificationEngine
 
 router = APIRouter(prefix="/admin/classification", tags=["admin-classification"])
@@ -41,12 +41,16 @@ def run_classification(
     return engine.run(actor=request.actor, limit=request.limit)
 
 
-@router.get("/pending", response_model=list[MetadataClassificationSuggestion])
+@router.get("/pending", response_model=list[PendingSuggestionView])
 def list_pending_suggestions(
     engine: DocumentClassificationEngine = Depends(get_document_classification_engine),
-) -> list[MetadataClassificationSuggestion]:
-    """Medium-confidence suggestions awaiting human review."""
-    return engine.list_pending()
+) -> list[PendingSuggestionView]:
+    """Medium-confidence suggestions awaiting human review, enriched
+    with each one's real object title and a re-derived real mention
+    count (2026-08-14, Phase 5 UI improvement -- see
+    ``DocumentClassificationEngine.list_pending_with_context``'s own
+    docstring: read-only, presentation-only, never a new matching rule)."""
+    return engine.list_pending_with_context()
 
 
 @router.post("/{suggestion_id}/accept", response_model=MetadataClassificationSuggestion)
