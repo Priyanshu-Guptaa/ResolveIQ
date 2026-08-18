@@ -124,6 +124,36 @@ class MetadataClassificationSuggestion(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class PendingSuggestionView(MetadataClassificationSuggestion):
+    """A read-only presentation enrichment of one pending suggestion for
+    the Classification Review UI (2026-08-14, Phase 5 UI improvement --
+    "make the 413-item backlog realistically reviewable"). Every field
+    inherited from ``MetadataClassificationSuggestion`` is untouched;
+    the two fields added here are resolved fresh at request time by
+    ``DocumentClassificationEngine.list_pending_with_context()`` and are
+    never stored, never a new fact the engine asserts, and never feed
+    back into ``confidence_tier``/``status`` -- purely additional
+    context for a human already looking at a real suggestion."""
+
+    object_title: str | None = None
+    """The real title/name of the underlying object (``DocumentationRecord.
+    title`` / ``HistoricalInvestigationRecord.title`` / ``KnownBugRecord.
+    title``), fetched fresh from the existing repository -- never
+    derived from the evidence snippet, never invented. ``None`` only
+    when the underlying object could no longer be found (e.g. deleted
+    since the suggestion was created); the UI must show the raw
+    ``object_id`` and say so explicitly in that case, never fabricate a
+    title."""
+    mention_count: int | None = None
+    """Re-derived by re-running the exact same, unmodified body-mention-
+    counting primitive ``DocumentClassificationEngine.run()`` itself
+    already uses to decide MEDIUM vs. LOW -- computed fresh for
+    display, never stored, never a new matching rule, and never
+    influences ``confidence_tier``/``status``. ``None`` only if the
+    underlying object or its governed candidate lookup couldn't be
+    resolved."""
+
+
 class ClassificationRunSummary(BaseModel):
     """What an admin sees after running classification over a batch of
     documents -- same "what happened" reporting discipline as

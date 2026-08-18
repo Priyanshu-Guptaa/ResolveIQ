@@ -52,8 +52,6 @@ none of those carry a parent id at all.
 from __future__ import annotations
 
 import logging
-import re
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from app.domain.classification import (
@@ -61,11 +59,16 @@ from app.domain.classification import (
     ClassificationRunSummary,
     ConfidenceTier,
     MetadataClassificationSuggestion,
+    PendingSuggestionView,
     SuggestionStatus,
 )
 from app.domain.knowledge_relationships import KnowledgeObjectType, RelationshipType
-from app.engines.shared.hierarchy import most_specific
-from app.engines.shared.text_matching import FULL_MATCH_SCORE, keyword_match_score
+from app.engines.shared.governed_text_matching import (
+    GovernedCandidate as _Candidate,
+    full_phrase_match as _title_match,
+    mention_count as _body_mention_count,
+    most_specific_candidates as _most_specific_candidates,
+)
 
 if TYPE_CHECKING:
     from app.domain.evidence import DocumentationRecord, HistoricalInvestigationRecord, KnownBugRecord
@@ -79,14 +82,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MEDIUM_MIN_BODY_MENTIONS = 2
-_SNIPPET_WINDOW = 60
-_MIN_CANDIDATE_NAME_LEN = 3
-"""Below this, a governed name is too likely to false-positive as an
-incidental substring/short-word match to trust for classification at
-all -- same floor discipline as
-``RecommendationEngine._MIN_COMPONENT_NAME_LEN_FOR_COLLECTED_MATCH``,
-lowered slightly (3 not 4) so real short real names in this corpus
-("NMS", "EIC") aren't excluded."""
 _CONTENT_SCAN_CHARS = 20_000
 """Caps how much of a document's body is scanned for repeated mentions
 -- perf safety net, same discipline as
@@ -94,74 +89,16 @@ _CONTENT_SCAN_CHARS = 20_000
 this document-level, if it exists at all, shows up well within the
 first 20K characters."""
 
-
-@dataclass(frozen=True)
-class _Candidate:
-    id: str
-    canonical_name: str
-    match_names: tuple[str, ...]
-    """canonical_name plus any aliases -- what's actually checked
-    against title/body text."""
-    parent_id: str | None = None
-    """The candidate's parent in a real governed hierarchy (today:
-    ``Technology.parent_technology_id``), or None -- either because
-    this candidate has no parent, or because this dimension has no
-    hierarchy concept at all (Customer/Region/Product/Component).
-    Consumed by ``_best_match`` via ``most_specific`` to prefer a more
-    specific matched candidate over a matched ancestor of it."""
-
-
-def _title_match(candidate: "_Candidate", title: str) -> str | None:
-    """Returns the matched name (longest first, so a more specific
-    alias/name wins over a shorter coincidental one) or None."""
-    if not title:
-        return None
-    for name in sorted(candidate.match_names, key=len, reverse=True):
-        if len(name.strip()) < _MIN_CANDIDATE_NAME_LEN:
-            continue
-        if keyword_match_score(name, title) >= FULL_MATCH_SCORE:
-            return name
-    return None
-
-
-def _body_mention_count(candidate: "_Candidate", body: str) -> tuple[int, str | None, str]:
-    """Returns (mention_count, matched_name, first_snippet) using the
-    longest matching name found."""
-    best_name: str | None = None
-    best_count = 0
-    best_snippet = ""
-    for name in sorted(candidate.match_names, key=len, reverse=True):
-        cleaned = name.strip()
-        if len(cleaned) < _MIN_CANDIDATE_NAME_LEN:
-            continue
-        pattern = re.compile(rf"(?<!\w){re.escape(cleaned)}(?!\w)", re.IGNORECASE)
-        matches = list(pattern.finditer(body))
-        if len(matches) > best_count:
-            best_count = len(matches)
-            best_name = name
-            first = matches[0]
-            lo = max(0, first.start() - _SNIPPET_WINDOW)
-            hi = min(len(body), first.end() + _SNIPPET_WINDOW)
-            prefix = "..." if lo > 0 else ""
-            suffix = "..." if hi < len(body) else ""
-            best_snippet = f"{prefix}{body[lo:hi].strip()}{suffix}"
-    return best_count, best_name, best_snippet
-
-
-def _most_specific_candidates(matched: list["_Candidate"], universe: list["_Candidate"]) -> list["_Candidate"]:
-    """Filters ``matched`` down to the most specific entries via
-    ``app.engines.shared.hierarchy.most_specific``, using every
-    candidate in ``universe`` (not just the matched ones) to resolve
-    parent ids -- an ancestor several levels up that didn't itself
-    match still needs to be walked through for a hierarchy deeper than
-    one level. Preserves ``matched``'s original relative order (already
-    alphabetical, from ``list_technologies()``/etc.) so the final
-    selection stays fully deterministic without a second sort."""
-    if len(matched) <= 1:
-        return matched
-    parent_of = {c.id: c.parent_id for c in universe}
-    survivor_ids = most_specific({c.id for c in matched}, parent_of)
-    return [c for c in matched if c.id in survivor_ids]
+# _Candidate (-> GovernedCandidate), _title_match (-> full_phrase_match),
+# _body_mention_count (-> mention_count), and _most_specific_candidates
+# (-> most_specific_candidates) used to be defined here. Extracted
+# 2026-08-14 (Phase 2 Query Understanding) to
+# ``app.engines.shared.governed_text_matching`` so Query Understanding's
+# entity extraction can reuse the exact same matching mechanics instead
+# of a second copy -- see that module's docstring. Behavior unchanged;
+# imported above under their original private names so the rest of this
+# file (and ``_best_match`` below, which stays classification-specific)
+# needed no further edits.
 
 
 def _best_match(
@@ -504,6 +441,75 @@ class DocumentClassificationEngine:
 
     def list_pending(self) -> list[MetadataClassificationSuggestion]:
         return self._suggestions.list_by_status(SuggestionStatus.PENDING)
+
+    def list_pending_with_context(self) -> list[PendingSuggestionView]:
+        """``list_pending()`` enriched with each suggestion's real
+        object title and a re-derived real mention count -- the
+        Classification Review UI's "make 413 items reviewable" fix
+        (2026-08-14, Phase 5 UI improvement). Read-only, presentation
+        only: never writes anything, never changes a suggestion's
+        confidence/status, never introduces a new matching rule --
+        title comes straight from the real, existing record; mention
+        count is computed by calling the exact same, unmodified
+        ``_body_mention_count`` (``governed_text_matching.mention_count``)
+        primitive ``run()`` itself already uses, applied once more here
+        purely so a reviewer can see the same evidence-strength signal
+        the engine already used to decide MEDIUM vs. LOW.
+
+        Objects and governed candidate lookups are fetched once per
+        distinct (object_type, object_id) / dimension, not once per
+        suggestion -- several suggestions commonly share the same
+        object (the real backlog has documents with up to 4 pending
+        suggestions each)."""
+        suggestions = self.list_pending()
+        if not suggestions:
+            return []
+
+        match_names_by_dim: dict[ClassificationDimension, dict[str, tuple[str, ...]]] = {
+            ClassificationDimension.CUSTOMER: {c.id: (c.name, *c.aliases) for c in self._lookup.list_customers()},
+            ClassificationDimension.REGION: {r.id: (r.name, *r.aliases) for r in self._lookup.list_regions()},
+            ClassificationDimension.TECHNOLOGY: {t.id: (t.name,) for t in self._lookup.list_technologies()},
+            ClassificationDimension.PRODUCT: {p.id: (p.name,) for p in self._lookup.list_products()},
+            ClassificationDimension.COMPONENT: {c.id: (c.name,) for c in self._components.list_all()},
+        }
+
+        object_cache: dict[tuple[str, str], object] = {}
+        views: list[PendingSuggestionView] = []
+        for suggestion in suggestions:
+            cache_key = (suggestion.object_type, suggestion.object_id)
+            if cache_key not in object_cache:
+                object_cache[cache_key] = self._fetch_object(suggestion.object_type, suggestion.object_id)
+            obj = object_cache[cache_key]
+
+            title = getattr(obj, "title", None) if obj is not None else None
+
+            mentions: int | None = None
+            if obj is not None and suggestion.suggested_value_id is not None:
+                match_names = match_names_by_dim.get(suggestion.dimension, {}).get(suggestion.suggested_value_id)
+                if match_names:
+                    candidate = _Candidate(
+                        id=suggestion.suggested_value_id, canonical_name=suggestion.suggested_value_text, match_names=match_names
+                    )
+                    body = self._object_body(obj, suggestion.object_type)
+                    count, _matched_name, _snippet = _body_mention_count(candidate, body)
+                    mentions = count
+
+            views.append(PendingSuggestionView(**suggestion.model_dump(), object_title=title, mention_count=mentions))
+        return views
+
+    def _fetch_object(self, object_type: str, object_id: str):
+        if object_type == KnowledgeObjectType.DOCUMENT.value:
+            return self._knowledge.get_documentation(object_id)
+        if object_type == KnowledgeObjectType.HISTORICAL_INVESTIGATION.value:
+            return self._knowledge.get_historical_investigation(object_id)
+        if object_type == KnowledgeObjectType.KNOWN_BUG.value:
+            return self._knowledge.get_known_bug(object_id)
+        return None
+
+    def _object_body(self, obj, object_type: str) -> str:
+        if object_type == KnowledgeObjectType.DOCUMENT.value:
+            return (obj.content or "")[:_CONTENT_SCAN_CHARS]
+        return (obj.description or "")[:_CONTENT_SCAN_CHARS]
 
     def accept(self, suggestion_id: str, *, actor: str | None = None) -> MetadataClassificationSuggestion:
         """Applies a Medium-confidence suggestion exactly as the
