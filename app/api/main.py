@@ -14,6 +14,7 @@ from fastapi import FastAPI
 
 from app.api.dependencies import get_knowledge_engine, run_knowledge_foundation_migration
 from app.api.routers import (
+    chat,
     dashboard,
     health,
     investigations,
@@ -61,6 +62,7 @@ app = FastAPI(
 )
 
 app.include_router(health.router)
+app.include_router(chat.router)
 app.include_router(investigations.router)
 app.include_router(dashboard.router)
 app.include_router(settings_router.router)

@@ -103,6 +103,18 @@ class KnowledgeObjectWriteRequest(BaseModel):
     actor: str | None = None
 
 
+class CreateChatSessionRequest(BaseModel):
+    """2026-08-14, Phase 4. ``investigation_id`` is optional -- standalone
+    and investigation-scoped chat are both real, supported paths (see
+    ``ConversationStateEngine.create_session``)."""
+
+    investigation_id: str | None = None
+
+
+class ChatMessageRequest(BaseModel):
+    message: str = Field(min_length=1)
+
+
 class InvestigationSummary(BaseModel):
     """Lightweight shape for the investigation list view."""
 

@@ -8,7 +8,8 @@ from pydantic import BaseModel, Field
 
 from app.domain.enums import KnowledgeCollection
 from app.domain.external_knowledge import ExternalKnowledgeResult
-from app.domain.provenance import ProvenanceRecord
+from app.domain.provenance import ProvenanceRecord, ValidationStep
+from app.domain.structured_resolution import StructuredResolution
 
 
 class KnowledgeMatch(BaseModel):
@@ -229,6 +230,11 @@ class RecommendedSolution(BaseModel):
     supporting_wiki_url: str | None = None
     supporting_known_bug_id: str | None = None
     supporting_known_bug_title: str | None = None
+    validation_steps: list[ValidationStep] = Field(default_factory=list)
+    """Added 2026-08-14, Phase 1 -- see ``ValidationStep``'s own
+    docstring for the "instruct vs. already-done" distinction this
+    maintains. Empty (not fabricated) when the winning source carries
+    no real next-step/verification content."""
 
 
 class InvestigationStrategy(BaseModel):
@@ -306,6 +312,17 @@ class InvestigationStrategy(BaseModel):
     (empty evidence lists, tier UNKNOWN) -- same "one consistent
     hierarchy regardless of investigation state" discipline as the rest
     of this model."""
+    structured_resolution: StructuredResolution | None = None
+    """Structured Resolution Knowledge (2026-08-14, Phase 1) -- the
+    same evidence this strategy already computed, reassembled into the
+    Problem/Symptoms/Applicability/Root-Cause/Evidence/Resolution/
+    Validation/Related/Confidence shape a future Chat Assistant will
+    consume directly. A pure projection, computed by
+    ``RecommendationEngine._build_structured_resolution`` right
+    alongside ``provenance`` -- never a second source of truth. None
+    only when ``self._relationships`` isn't wired in this build (the
+    same graceful-degradation contract as every other optional
+    dependency in this engine)."""
 
 
 class Recommendation(BaseModel):

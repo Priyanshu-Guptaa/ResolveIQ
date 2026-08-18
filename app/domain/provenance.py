@@ -109,6 +109,63 @@ class EvidenceReference(BaseModel):
     cause and the resolution)."""
 
 
+class ValidationStep(BaseModel):
+    """Knowledge describing how an engineer can verify whether a
+    proposed resolution actually applies -- added 2026-08-14, Phase 1
+    (Structured Resolution Knowledge). Deliberately just an
+    ``instruction`` (imperative/descriptive text) plus real source
+    attribution -- there is no ``completed``/``executed``/``verified``
+    field anywhere on this model, and that absence is the design: this
+    object can only ever say "here is how to check," never "this was
+    checked." The two are fundamentally different claims (per the
+    approved design), and the *only* place ResolveIQ ever asserts the
+    second one is the existing, separate, human-driven
+    ``resolution_verified`` flag on ``HistoricalInvestigationRecord``/
+    ``KnownBugRecord`` (which drives the CONFIRMED provenance tier) --
+    never this model. Not an execution engine: nothing here runs a
+    check, calls a script, or queries a live system; it is text a human
+    reads and then, separately, acts on.
+
+    Lives here (not in ``app.domain.recommendation``, where
+    ``RecommendedSolution`` -- its only other consumer -- is defined)
+    specifically so both ``recommendation.py`` and
+    ``structured_resolution.py`` can depend on it without a circular
+    import between those two modules -- this is the same "base layer
+    both higher modules import from" role ``EvidenceKind``/
+    ``EvidenceReference`` already play."""
+
+    instruction: str
+    """What to check/do to confirm the resolution worked -- quoted
+    verbatim from a real source field when one exists (today, only
+    ``HistoricalInvestigationRecord.next_step`` -- see
+    ``RecommendationEngine._synthesize_recommendation``), never
+    fabricated. Left as an empty list on ``RecommendedSolution`` (not a
+    placeholder instruction) when no source provides one -- true for
+    Known-Bug-, TFS-, and Wiki-sourced resolutions today, since none of
+    those carry an equivalent field yet."""
+    expected_result: str | None = None
+    """What a result confirming the hypothesis looks like, when the
+    source states one explicitly -- None (never guessed) otherwise."""
+    disproving_result: str | None = None
+    """What a result *disproving* the hypothesis looks like -- the
+    explicit counterpart ``expected_result`` needed (added 2026-08-14,
+    same phase, per the approved design's requirement that a
+    ValidationStep answer both "what would confirm this" and "what
+    would disprove it"). Same discipline as every other field here:
+    None, not guessed, since the one real source this phase draws from
+    (``HistoricalInvestigationRecord.next_step``) is a single free-text
+    instruction that doesn't itself separate a confirming outcome from
+    a disproving one -- inventing that split from unstructured text
+    would be exactly the kind of fabrication this whole model exists to
+    avoid. The field exists so a future, richer source (e.g. a
+    ``ReleaseNoteEntry`` or a more structured Known Bug workaround) can
+    populate it without a schema change; it is honestly unpopulated
+    today."""
+    source: EvidenceKind
+    source_id: str
+    source_title: str
+
+
 class ProvenanceRecord(BaseModel):
     """The full, structured "why" behind one InvestigationStrategy --
     answers every one of the 8 provenance questions in one traceable
