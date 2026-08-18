@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, String, Table, Text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Table, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -580,3 +580,57 @@ class LogCollectionScenarioModel(Base):
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     status: Mapped[str] = mapped_column(String(20), default="published", index=True)
+
+
+# =============================================================================
+# Conversation State (2026-08-14, Phase 3 -- RESOLVEIQ_CHAT_AND_RESOLUTION_
+# ARCHITECTURE.md §11). Two new tables, same repository pattern as
+# investigations/evidence above -- ConversationSlots/ParsedQuery/
+# ReferenceResolution are stored as JSON blobs (same "not every nested
+# shape needs its own table" discipline EvidenceModel already established
+# for extracted_entities/log_events), never as a second copy of any real
+# knowledge-corpus record: only ids/names/slots are persisted here, never
+# a matched document's/investigation's own content.
+# =============================================================================
+
+
+class ChatSessionModel(Base):
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    investigation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("investigations.id"), nullable=True, index=True, default=None
+    )
+    """Set only when this session was opened from inside an
+    Investigation Workspace -- None for a standalone chat session, a
+    real, supported path (see ChatSession's domain docstring)."""
+    slots: Mapped[dict] = mapped_column(JSON, default=dict)
+    """Serialized ConversationSlots -- ids/names/confidence/origin per
+    dimension, plus ticket_references/last_focus/last_referenced_*.
+    Never a copy of matched-record content."""
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class ChatMessageModel(Base):
+    __tablename__ = "chat_messages"
+    __table_args__ = (UniqueConstraint("session_id", "sequence", name="uq_chat_messages_session_sequence"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    """1-based, strictly increasing per session -- the real chronological
+    ordering key, assigned by the repository (ChatRepository.next_sequence),
+    never the caller's wall-clock time."""
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text, default="")
+    parsed_query: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    """Serialized ParsedQuery (Phase 2, unmodified) -- user turns only.
+    Never a copy of any matched knowledge-corpus record; only what
+    Query Understanding extracted from this message's own text."""
+    reference_resolution: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    """Serialized ReferenceResolution -- populated only when this
+    message's text contained a recognized deictic cue."""
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

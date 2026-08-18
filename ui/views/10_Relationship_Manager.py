@@ -17,7 +17,7 @@ from components.object_picker import render_object_picker
 from components.object_types import TYPE_LABELS as _TYPE_LABELS
 from theme import inject_theme
 
-RELATIONSHIP_TYPES = ["related_to", "documents", "fixes", "requires", "uses", "applies_to"]
+RELATIONSHIP_TYPES = ["related_to", "documents", "fixes", "requires", "uses", "applies_to", "supersedes"]
 
 inject_theme()
 st.title("🕸️ Relationship Manager")

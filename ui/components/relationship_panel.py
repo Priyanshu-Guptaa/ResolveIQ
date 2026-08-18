@@ -12,7 +12,7 @@ from api_client import api_delete, api_get
 
 from components.object_types import TYPE_LABELS
 
-_RELATIONSHIP_TYPES = ["related_to", "documents", "fixes", "requires", "uses", "applies_to"]
+_RELATIONSHIP_TYPES = ["related_to", "documents", "fixes", "requires", "uses", "applies_to", "supersedes"]
 
 
 def _ref_line(ref: dict) -> str:

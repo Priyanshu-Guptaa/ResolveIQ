@@ -76,6 +76,19 @@ class RelationshipType(str, Enum):
     Component's activity gets logged. Additive only, created at import
     time via deterministic name matching against the full live
     Component Registry -- never merges the two entities."""
+    SUPERSEDES = "supersedes"
+    """A -> B: A is the newer, correct replacement for B's knowledge
+    (e.g. a later release note says a Known Bug's workaround is
+    obsolete). Added 2026-08-14, Phase 1 (Structured Resolution
+    Knowledge, conflict-resolution ordering). Requires zero schema
+    change -- ``knowledge_relationships.relationship_type`` is already a
+    plain string column with no DB-level enum constraint -- and needs
+    no new admin UI: the existing generic Relationship Editor
+    (``ui/views/10_Relationship_Manager.py``) already creates any
+    relationship type between any two objects; only its own hardcoded
+    dropdown list needed this value added. Always an explicit human
+    judgment call (same discipline as ``resolution_verified``) -- never
+    inferred from text similarity."""
 
 
 class KnowledgeObjectRef(BaseModel):

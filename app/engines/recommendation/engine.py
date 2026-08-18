@@ -29,7 +29,7 @@ from app.domain.entities import ExtractedEntity
 from app.domain.enums import EntityType, EvidenceType
 from app.domain.investigation import InvestigationSession
 from app.domain.knowledge_relationships import KnowledgeObjectType, RelationshipType
-from app.domain.provenance import EvidenceKind, EvidenceReference, ProvenanceRecord, ResolutionProvenance
+from app.domain.provenance import EvidenceKind, EvidenceReference, ProvenanceRecord, ResolutionProvenance, ValidationStep
 from app.domain.recommendation import (
     InvestigationStage,
     InvestigationStrategy,
@@ -42,12 +42,15 @@ from app.domain.recommendation import (
     RootCauseHypothesis,
     SuggestedSqlItem,
 )
+from app.domain.structured_resolution import ApplicabilitySummary, ResolutionCandidate, StructuredResolution
 from app.engines.external_knowledge.ranking import confidence_for_score
 from app.engines.knowledge.applicability import ApplicabilityRanker, RetrievalContext
 from app.engines.knowledge.engine import KnowledgeEngine
+from app.engines.knowledge_relationships.engine import KnowledgeObjectNotFoundError
 from app.engines.shared.hierarchy import most_specific
+from app.engines.structured_resolution.engine import applicability_for_object, order_resolution_candidates
 from app.engines.shared.text_cleaning import strip_low_signal_boilerplate
-from app.engines.shared.text_matching import keyword_match_score
+from app.engines.shared.text_matching import evidence_coverage_match_score, keyword_match_score
 
 if TYPE_CHECKING:
     from app.domain.evidence import Evidence, HistoricalInvestigationRecord, KnownBugRecord
@@ -856,6 +859,21 @@ class RecommendationEngine:
             sources=sources,
         )
 
+        # Structured Resolution Knowledge (2026-08-14, Phase 1) --
+        # always attempted right alongside provenance, same "computed
+        # fresh every call" discipline; returns None gracefully when
+        # self._relationships isn't wired.
+        structured_resolution = self._build_structured_resolution(
+            investigation=investigation,
+            root_causes=root_causes,
+            similar_investigations=similar_investigations,
+            matched_component=matched_component,
+            technology=technology,
+            recommended_solution=recommended_solution,
+            sources=sources,
+            provenance=provenance,
+        )
+
         return InvestigationStrategy(
             current_stage=stage,
             stage_rationale=stage_rationale,
@@ -876,6 +894,7 @@ class RecommendationEngine:
             recommended_solution=recommended_solution,
             decision_checkpoint=self._decision_checkpoint(root_causes),
             provenance=provenance,
+            structured_resolution=structured_resolution,
         )
 
     def _infer_technology(self, investigation: InvestigationSession) -> str | None:
@@ -984,50 +1003,16 @@ class RecommendationEngine:
 
     @staticmethod
     def _technology_evidence_score(name: str, context: str) -> float:
-        """Real bug fix (2026-08-13): ``_match_single_technology`` used
-        to score candidates via the shared ``keyword_match_score``,
-        whose partial-match fallback accepts *any single* significant
-        (>=4 char) word from a multi-word candidate name -- so
-        "Command processing appears delayed" (nothing but the ordinary
-        English word "processing" in common with the technology's
-        name) was enough to confidently return "Tool Data (BCS / HHU)
-        processing" as the matched technology, even though the far
-        more distinctive words "Tool" and "Data" from that same name
-        never appeared anywhere in the text.
-
-        Generic evidence-coverage rule (no technology names or generic
-        words hardcoded anywhere -- this is a property of how much of
-        any given candidate's *own* name is actually present, computed
-        identically for every candidate):
-
-        1. An exact/full phrase match is always valid evidence
-           (unchanged -- delegates to ``keyword_match_score``).
-        2. Short of that, a partial match is only valid when *every
-           one* of the candidate's own significant words is present in
-           the text -- full coverage of that candidate's identifying
-           vocabulary, not a fragment of it. A candidate whose name
-           has only one significant word to begin with (e.g. "RF
-           Mesh", whose only word >=4 chars is "Mesh") is unaffected:
-           matching its one word is by definition 100% coverage of its
-           own name, so it still counts -- this is what keeps the real
-           RF-Mesh-family specificity/ambiguity resolution
-           (``most_specific``, above) working exactly as before. A
-           candidate with several significant words (e.g. "Tool Data
-           (BCS / HHU) processing" -> {Tool, Data, processing}) now
-           needs all of them, not just one.
-        3. Anything less -- a single word out of several, or no
-           significant words present at all -- scores 0.0: no
-           evidence, excluded outright by the caller's positive-score
-           filter, never "the best we found by default"."""
-        full = keyword_match_score(name, context)
-        if full >= _FULL_MATCH_SCORE:
-            return _FULL_MATCH_SCORE
-        significant_words = [w for w in re.findall(r"[A-Za-z]+", name) if len(w) >= _MIN_KEYWORD_WORD_LEN]
-        if not significant_words:
-            return 0.0
-        if all(re.search(rf"(?<!\w){re.escape(w)}(?!\w)", context, re.IGNORECASE) for w in significant_words):
-            return _PARTIAL_MATCH_SCORE
-        return 0.0
+        """Thin re-export -- the real implementation moved
+        (2026-08-14, Phase 2 Query Understanding) to
+        ``app.engines.shared.text_matching.evidence_coverage_match_score``
+        so Query Understanding's Technology extraction reuses the exact
+        same, already-fixed evidence-coverage rule instead of a second
+        copy -- see that function's docstring for the full rule and the
+        2026-08-13 bug it fixes. Kept as a method here (not just an
+        import alias) so every existing call site in this file is
+        unchanged."""
+        return evidence_coverage_match_score(name, context, min_word_len=_MIN_KEYWORD_WORD_LEN)
 
     @staticmethod
     def _known_bug_has_topical_overlap(known_bug_title: str, investigation_context: str) -> bool:
@@ -1223,6 +1208,13 @@ class RecommendationEngine:
         likely_issue: str | None = None
         recommended_resolution: str | None = None
         confidence_score = 0.0
+        validation_steps: list[ValidationStep] = []
+        """Phase 1 (2026-08-14) -- populated only from a real source
+        field, never fabricated. Today the only real source is
+        HistoricalInvestigationRecord.next_step (via correlated_match's
+        own indexed metadata, below); TFS/Wiki/Known Bug have no
+        equivalent field yet -- a real, documented gap, not an
+        oversight (see ValidationStep's own docstring)."""
 
         # Prefer the already-computed root-cause hierarchy over deriving
         # "likely issue" from best_local directly: _build_root_causes()
@@ -1289,6 +1281,16 @@ class RecommendationEngine:
             local_resolution = correlated_match.metadata.get("resolution")
             if local_resolution:
                 recommended_resolution = f"Based on a similar past case: {_snippet(local_resolution)}"
+            next_step_text = correlated_match.metadata.get("next_step")
+            if next_step_text:
+                validation_steps.append(
+                    ValidationStep(
+                        instruction=_snippet(next_step_text),
+                        source=EvidenceKind.HISTORICAL_INVESTIGATION,
+                        source_id=correlated_match.record_id,
+                        source_title=correlated_match.title,
+                    )
+                )
 
         if best_tfs is not None:
             case = best_tfs.tfs_case
@@ -1343,6 +1345,7 @@ class RecommendationEngine:
                 supporting_wiki_url=best_wiki.wiki_page.url if best_wiki else None,
                 supporting_known_bug_id=best_known_bug.record_id if best_known_bug else None,
                 supporting_known_bug_title=best_known_bug.title if best_known_bug else None,
+                validation_steps=validation_steps,
             ),
             _SynthesizedSources(
                 correlated_match=correlated_local,
@@ -1663,6 +1666,209 @@ class RecommendationEngine:
             sql_recommendation_evidence=sql_evidence,
             resolution_provenance=tier,
             provenance_rationale=rationale,
+        )
+
+    # --- Structured Resolution Knowledge (2026-08-14, Phase 1) --------------
+    #
+    # A pure read model: every field below is either projected directly
+    # from ProvenanceRecord/RecommendedSolution (already fully computed
+    # by the time this runs) or a small, additional relationship-graph
+    # lookup using the exact same KnowledgeRelationshipEngine dependency
+    # ApplicabilityRanker already relies on. No new retrieval, no new
+    # matching, no new confidence system -- see
+    # app/domain/structured_resolution.py's module docstring.
+
+    def _resolution_candidates(
+        self,
+        recommended_solution: "RecommendedSolution | None",
+        sources: "_SynthesizedSources",
+        primary_local_match: "KnowledgeMatch | None",
+    ) -> list[ResolutionCandidate]:
+        """Every source with real resolution content, each attributed
+        and never silently dropped -- closes the real gap found during
+        this phase's own inspection: today, only one source's text ever
+        survives into ``RecommendedSolution.recommended_resolution``
+        (and, for Local vs. TFS specifically, TFS unconditionally
+        overwrites Local when both qualify, with no record that Local
+        had a different answer -- see this phase's report for the exact
+        finding). This method does not change that existing selection
+        (``is_primary`` faithfully reports which text is *actually* the
+        one already in ``recommended_resolution`` today, by exact string
+        match); it only stops the alternates from disappearing.
+
+        ``primary_local_match`` (not ``sources.correlated_match``, a
+        same-named-but-different variable -- see ``_resolution_evidence``,
+        Phase 0, which already makes this exact distinction) is the
+        local match backing the current root-cause hypothesis;
+        ``sources.correlated_match`` is a separate, TFS-ticket-driven
+        cross-source-correlation signal, used only for the CONFIRMED
+        rule -- reusing it here was a real bug caught by this phase's
+        own tests (see the phase report).
+
+        The four f-string templates below deliberately mirror
+        ``_synthesize_recommendation``'s own templates verbatim (kept in
+        sync manually, not factored into a shared helper) -- extracting
+        a shared helper would mean touching that already-tested,
+        already-stable function for a phase whose explicit brief is "the
+        smallest necessary change"; duplicating four one-line templates
+        is the safer trade-off."""
+        if recommended_solution is None:
+            return []
+        winning_text = recommended_solution.recommended_resolution
+        candidates: list[ResolutionCandidate] = []
+
+        if primary_local_match is not None:
+            local_resolution = primary_local_match.metadata.get("resolution")
+            if local_resolution:
+                text = f"Based on a similar past case: {_snippet(local_resolution)}"
+                candidates.append(
+                    ResolutionCandidate(
+                        text=text,
+                        evidence=EvidenceReference(
+                            kind=EvidenceKind.HISTORICAL_INVESTIGATION,
+                            source_id=primary_local_match.record_id,
+                            title=primary_local_match.title,
+                            score=primary_local_match.score,
+                            reason="The matched historical investigation's own recorded resolution.",
+                            contributes_to=["resolution"],
+                        ),
+                        is_primary=(text == winning_text),
+                    )
+                )
+
+        if sources.best_tfs is not None:
+            case = sources.best_tfs.tfs_case
+            if case.resolution_text:
+                text = f"Based on TFS-{case.tfs_id} ({case.state}): {case.resolution_text}"
+                candidates.append(
+                    ResolutionCandidate(
+                        text=text,
+                        evidence=EvidenceReference(
+                            kind=EvidenceKind.TFS_CASE,
+                            source_id=str(case.tfs_id),
+                            title=case.title,
+                            url=case.url,
+                            score=sources.best_tfs.score,
+                            reason="; ".join(sources.best_tfs.match_reasons) or f"TFS-{case.tfs_id} ({case.state}).",
+                            contributes_to=["resolution"],
+                        ),
+                        is_primary=(text == winning_text),
+                    )
+                )
+
+        if sources.best_wiki is not None:
+            page = sources.best_wiki.wiki_page
+            if page.excerpt:
+                text = f'Per Wiki page "{page.title}": {page.excerpt}'
+                candidates.append(
+                    ResolutionCandidate(
+                        text=text,
+                        evidence=EvidenceReference(
+                            kind=EvidenceKind.WIKI_PAGE,
+                            source_id=page.page_id,
+                            title=page.title,
+                            url=page.url,
+                            score=sources.best_wiki.score,
+                            reason="; ".join(sources.best_wiki.match_reasons) or f'Wiki page "{page.title}".',
+                            contributes_to=["resolution"],
+                        ),
+                        is_primary=(text == winning_text),
+                    )
+                )
+
+        if sources.best_known_bug is not None:
+            workaround = sources.best_known_bug.metadata.get("workaround")
+            if workaround:
+                text = f'Per known bug "{sources.best_known_bug.title}": {workaround}'
+                candidates.append(
+                    ResolutionCandidate(
+                        text=text,
+                        evidence=EvidenceReference(
+                            kind=EvidenceKind.KNOWN_BUG,
+                            source_id=sources.best_known_bug.record_id,
+                            title=sources.best_known_bug.title,
+                            score=sources.best_known_bug.score,
+                            reason="The matched known bug's own recorded workaround.",
+                            contributes_to=["resolution"],
+                        ),
+                        is_primary=(text == winning_text),
+                    )
+                )
+
+        return order_resolution_candidates(candidates)
+
+    def _build_structured_resolution(
+        self,
+        *,
+        investigation: InvestigationSession,
+        root_causes: list[RootCauseHypothesis],
+        similar_investigations: list[KnowledgeMatch],
+        matched_component: MatchedComponent | None,
+        technology: str | None,
+        recommended_solution: "RecommendedSolution | None",
+        sources: "_SynthesizedSources",
+        provenance: ProvenanceRecord,
+    ) -> "StructuredResolution | None":
+        """The investigation-scoped assembly path -- a pure projection
+        of state ``_build_strategy`` (this method's only caller) already
+        computed. None only when ``self._relationships`` isn't wired
+        (same graceful-degradation contract as ``ApplicabilityRanker``
+        and every other optional dependency in this engine)."""
+        if self._relationships is None:
+            return None
+
+        primary_local_match = (
+            self._local_match_for_cause(root_causes[0], similar_investigations) if root_causes else None
+        )
+
+        # Applicability: prefer the real record backing the answer's own
+        # governed tags (consistent with the standalone-record path's
+        # meaning -- "what does this evidence apply to"); fall back to
+        # the investigation's own already-resolved customer/technology
+        # context (RetrievalContext, reused unchanged) when no single
+        # record is pinned down.
+        if primary_local_match is not None:
+            applicability = applicability_for_object(
+                self._relationships, KnowledgeObjectType.HISTORICAL_INVESTIGATION, primary_local_match.record_id
+            )
+        elif sources.best_known_bug is not None:
+            applicability = applicability_for_object(
+                self._relationships, KnowledgeObjectType.KNOWN_BUG, sources.best_known_bug.record_id
+            )
+        else:
+            applicability = ApplicabilitySummary()
+        retrieval_context = self._resolve_retrieval_context(investigation, technology)
+        if not applicability.customer_names and retrieval_context.customer_name:
+            applicability.customer_names = [retrieval_context.customer_name]
+        applicability.technology_name = retrieval_context.technology_name
+        if matched_component is not None:
+            applicability.component_names = [matched_component.component_name]
+
+        related: list[KnowledgeObjectRef] = []
+        if primary_local_match is not None:
+            try:
+                view = self._relationships.get_explorer_view(
+                    KnowledgeObjectType.HISTORICAL_INVESTIGATION, primary_local_match.record_id
+                )
+                related = [ref for group in view.groups for ref in group.objects]
+            except KnowledgeObjectNotFoundError:
+                related = []
+
+        return StructuredResolution(
+            source_kind="investigation",
+            source_id=investigation.id,
+            problem=investigation.title,
+            symptoms=_snippet(investigation.context_text) if investigation.context_text.strip() else "",
+            applicability=applicability,
+            root_cause=root_causes[0].description if root_causes else None,
+            root_cause_evidence=provenance.root_cause_evidence,
+            resolution_candidates=self._resolution_candidates(recommended_solution, sources, primary_local_match),
+            validation_steps=recommended_solution.validation_steps if recommended_solution else [],
+            log_evidence=provenance.log_recommendation_evidence,
+            sql_evidence=provenance.sql_recommendation_evidence,
+            related=related,
+            confidence=provenance.resolution_provenance,
+            confidence_rationale=provenance.provenance_rationale,
         )
 
     def _match_component(

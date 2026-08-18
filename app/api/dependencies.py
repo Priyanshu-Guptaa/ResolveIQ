@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings, get_settings
+from app.engines.chat.conversation_state import ConversationStateEngine
+from app.engines.chat.orchestrator import ChatOrchestrator
 from app.engines.ingestion.engine import IngestionEngine
 from app.engines.ingestion.file_type_registry import FileTypeRegistry
 from app.engines.investigation.engine import InvestigationEngine
@@ -33,6 +35,7 @@ from app.engines.log_intelligence.log_parser import GenericLogParser, LogParser
 from app.engines.log_knowledge.importer import LogWikiImporter
 from app.engines.product_intelligence.component_registry import ComponentRegistry
 from app.engines.product_intelligence.engine import ProductIntelligenceEngine
+from app.engines.query_understanding.engine import QueryUnderstandingEngine
 from app.engines.external_knowledge.service import ExternalKnowledgeService
 from app.engines.external_knowledge.tfs_connector import TfsConnector
 from app.engines.external_knowledge.tfs_rest_client import TfsRestConnector
@@ -41,6 +44,7 @@ from app.engines.external_knowledge.wiki_rest_client import WikiRestConnector
 from app.engines.recommendation.engine import RecommendationEngine
 from app.engines.sql_library.engine import SqlLibraryEngine
 from app.engines.task_import.importer import TaskImporter
+from app.infrastructure.db.chat_repository import ChatRepository, SqlAlchemyChatRepository
 from app.infrastructure.db.classification_repository import ClassificationRepository, SqlAlchemyClassificationRepository
 from app.infrastructure.db.component_repository import ComponentProfileRepository, SqlAlchemyComponentProfileRepository
 from app.infrastructure.db.knowledge_repository import KnowledgeRepository, SqlAlchemyKnowledgeRepository
@@ -328,6 +332,29 @@ def get_product_intelligence_engine() -> ProductIntelligenceEngine:
 
 def get_sql_library_engine() -> SqlLibraryEngine:
     return _sql_library_engine()
+
+
+# --- Chat (2026-08-14, Phase 3 Conversation State + Phase 4 Orchestrator) --
+
+
+@lru_cache
+def _chat_repository() -> ChatRepository:
+    return SqlAlchemyChatRepository(_db_session_factory())
+
+
+@lru_cache
+def _query_understanding_engine() -> QueryUnderstandingEngine:
+    return QueryUnderstandingEngine(_lookup_repository(), _component_profile_repository(), _entity_extractor())
+
+
+def get_conversation_state_engine() -> ConversationStateEngine:
+    return ConversationStateEngine(
+        _chat_repository(), _query_understanding_engine(), _lookup_repository(), _investigation_repository()
+    )
+
+
+def get_chat_orchestrator() -> ChatOrchestrator:
+    return ChatOrchestrator(get_conversation_state_engine(), get_recommendation_engine(), get_investigation_engine())
 
 
 def get_knowledge_management_engine() -> KnowledgeManagementEngine:
