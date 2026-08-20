@@ -13,6 +13,7 @@ itself asserted as the correct "not configured" contract).
 
 from __future__ import annotations
 
+import logging
 import tempfile
 import uuid
 from pathlib import Path
@@ -35,6 +36,7 @@ from app.engines.external_knowledge.service import ExternalKnowledgeService
 from app.engines.investigation.engine import InvestigationEngine, InvestigationNotFoundError
 from app.engines.knowledge.engine import KnowledgeEngine
 from app.engines.knowledge_relationships.engine import KnowledgeRelationshipEngine
+from app.engines.llm.provider import LLMProviderError
 from app.engines.query_understanding.engine import QueryUnderstandingEngine
 from app.engines.recommendation.engine import RecommendationEngine
 from app.infrastructure.db.chat_repository import SqlAlchemyChatRepository
@@ -80,6 +82,26 @@ class _NoOpWikiConnector:
 
     def search(self, **kwargs):  # pragma: no cover -- never reached, not configured
         return []
+
+
+class FakeLLMProvider:
+    """Same shape/idiom as FakeTfsConnector/FakeWikiConnector above --
+    hand-written Protocol-satisfying fake, no unittest.mock. Used only
+    by the Chat Assistant Phase 1 (LLM/Ollama integration) tests below;
+    never touches HTTP or a real Ollama instance."""
+
+    def __init__(self, *, configured=True, response="", raise_error=False):
+        self._configured = configured
+        self._response = response
+        self._raise_error = raise_error
+
+    def is_configured(self) -> bool:
+        return self._configured
+
+    def generate(self, prompt: str, *, system_prompt: str | None = None) -> str:
+        if self._raise_error:
+            raise LLMProviderError("simulated failure")
+        return self._response
 
 
 class ConfigurableFakeKnowledgeStore:
@@ -546,3 +568,93 @@ def test_api_empty_message_returns_400(api_client):
 def test_api_get_nonexistent_session_returns_404(api_client):
     response = api_client.get("/chat/sessions/does-not-exist")
     assert response.status_code == 404
+
+
+# --- E. LLM provider integration (Chat Assistant Phase 1 -- Qwen 4B/Ollama) -
+# FakeLLMProvider only -- no real Ollama, no HTTP, no port 11434. These tests
+# prove ChatOrchestrator depends on the LLMProvider abstraction (never on
+# OllamaProvider/httpx directly) and that the existing, unchanged
+# _compose_answer() remains the deterministic fallback in every case the
+# LLM path doesn't/can't handle.
+
+
+def _orchestrator_with_llm(bundle, llm_provider) -> ChatOrchestrator:
+    """A second ChatOrchestrator sharing the same real engines/state as
+    bundle['orchestrator'], differing only in the injected LLM
+    provider -- proves the constructor's new parameter is additive and
+    doesn't disturb anything else already wired by the fixture."""
+    return ChatOrchestrator(bundle["state_engine"], bundle["rec_engine"], bundle["investigation_engine"], llm_provider)
+
+
+def test_llm_success_becomes_answer_text_with_no_follow_up(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(configured=True, response="Generated grounded answer.")
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "RF Mesh IP command timeout.")
+
+    assert response.answer_text == "Generated grounded answer."
+    assert response.follow_up_question is None
+    # Still the same real, unchanged evidence -- the LLM path never bypasses
+    # or alters what RecommendationEngine/StructuredResolutionEngine already
+    # computed; it only supplies the final answer_text wording.
+    assert response.structured_resolution is not None
+    assert response.structured_resolution.resolution_candidates[0].evidence.source_id == record.id
+
+
+def test_llm_failure_falls_back_to_deterministic_compose_answer(bundle, caplog):
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(configured=True, raise_error=True)
+    orchestrator_llm = _orchestrator_with_llm(bundle, llm)
+    orchestrator_plain = bundle["orchestrator"]  # no LLM wired at all -- the known-good deterministic baseline
+
+    session_llm = orchestrator_llm.create_session()
+    session_plain = orchestrator_plain.create_session()
+
+    caplog.set_level(logging.WARNING, logger="app.engines.chat.orchestrator")
+    response_llm = orchestrator_llm.handle_message(session_llm.id, "RF Mesh IP command timeout.")
+    response_plain = orchestrator_plain.handle_message(session_plain.id, "RF Mesh IP command timeout.")
+
+    # The LLM failure is completely invisible to the end result -- same
+    # deterministic answer_text as the plain, no-LLM path, no 500, no
+    # exception raised out of handle_message().
+    assert response_llm.answer_text == response_plain.answer_text
+    assert response_llm.resolution_provenance == ResolutionProvenance.LIKELY
+    assert "LLM generation failed, falling back to deterministic answer" in caplog.text
+
+
+def test_llm_provider_not_configured_falls_back_without_using_its_response(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(configured=False, response="should never be returned")
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "RF Mesh IP command timeout.")
+
+    assert response.answer_text != "should never be returned"
+    assert "likely related to" in response.answer_text
+
+
+def test_no_llm_provider_preserves_existing_deterministic_behavior(bundle):
+    """C. LLM disabled/not injected -- bundle['orchestrator'] is
+    constructed the exact same way every pre-Phase-1 test in this file
+    already constructs it (no llm_provider argument at all), proving
+    the new constructor parameter is purely additive."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "RF Mesh IP command timeout.")
+
+    assert "likely related to" in response.answer_text
+    assert response.resolution_provenance == ResolutionProvenance.LIKELY

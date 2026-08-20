@@ -102,6 +102,29 @@ class Settings(BaseSettings):
     """Optional -- scopes Wiki search to one space (e.g. "CC") when
     set; searches all spaces the token can read when unset."""
 
+    # --- LLM Gateway: local Ollama/Qwen provider (Chat Assistant Phase 1) ---
+    # Kill switch defaults to False, same idiom as external_knowledge_enabled
+    # -- a fresh checkout or a build with no Ollama installed runs with zero
+    # behavior change: ChatOrchestrator falls back to its existing
+    # deterministic _compose_answer() unconditionally.
+    llm_enabled: bool = False
+    """False (default): ChatOrchestrator never attempts LLM generation --
+    behavior is byte-identical to the pre-Phase-1 deterministic path."""
+    ollama_base_url: str = "http://localhost:11434"
+    """Where the local Ollama daemon is reachable. No environment-specific
+    value hardcoded beyond this documented local default."""
+    ollama_model: str = "qwen3:4b"
+    """PROVISIONAL / UNVERIFIED LOCALLY -- Ollama is not installed on the
+    machine this was implemented on, so this tag has not been checked
+    against a real `ollama list`. Fully overridable via
+    RESOLVEIQ_OLLAMA_MODEL; must be verified (or corrected) the first time
+    this runs against a real Ollama instance."""
+    ollama_timeout_seconds: float = 60.0
+    """Placeholder, not empirically measured (unlike
+    external_knowledge_timeout_seconds's own docstring, which cites real
+    measured TFS latency) -- local LLM inference latency on the target
+    machine is unknown and needs benchmarking once Ollama is installed."""
+
     @property
     def sqlite_url(self) -> str:
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)

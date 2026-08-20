@@ -29,6 +29,8 @@ from app.engines.knowledge_management.engine import KnowledgeManagementEngine
 from app.engines.knowledge_object_framework.adapters import KnowledgeObjectAdapter, build_adapters
 from app.engines.knowledge_object_framework.service import KnowledgeObjectService
 from app.engines.knowledge_relationships.engine import KnowledgeRelationshipEngine
+from app.engines.llm.ollama_provider import OllamaProvider
+from app.engines.llm.provider import LLMProvider
 from app.engines.log_intelligence.engine import LogIntelligenceEngine
 from app.engines.log_intelligence.entity_extractor import EntityExtractor, RegexEntityExtractor
 from app.engines.log_intelligence.log_parser import GenericLogParser, LogParser
@@ -353,8 +355,26 @@ def get_conversation_state_engine() -> ConversationStateEngine:
     )
 
 
+@lru_cache
+def _llm_provider() -> LLMProvider:
+    """Reused across requests (not constructed per call) -- same
+    reasoning as _tfs_connector()/_wiki_connector(): a persistent
+    httpx.Client benefits from connection reuse, same as TFS's own
+    persistent NTLM session."""
+    settings = get_settings()
+    return OllamaProvider(
+        base_url=settings.ollama_base_url,
+        model=settings.ollama_model,
+        timeout_seconds=settings.ollama_timeout_seconds,
+    )
+
+
 def get_chat_orchestrator() -> ChatOrchestrator:
-    return ChatOrchestrator(get_conversation_state_engine(), get_recommendation_engine(), get_investigation_engine())
+    settings = get_settings()
+    llm = _llm_provider() if settings.llm_enabled else None
+    return ChatOrchestrator(
+        get_conversation_state_engine(), get_recommendation_engine(), get_investigation_engine(), llm
+    )
 
 
 def get_knowledge_management_engine() -> KnowledgeManagementEngine:
@@ -437,5 +457,6 @@ def reset_singletons() -> None:
         _log_wiki_importer,
         _classification_repository,
         _document_classification_engine,
+        _llm_provider,
     ):
         fn.cache_clear()

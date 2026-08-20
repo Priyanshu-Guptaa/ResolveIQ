@@ -35,6 +35,7 @@ the point where that tier becomes user-facing prose.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from app.domain.chat import (
@@ -53,12 +54,18 @@ from app.domain.investigation import InvestigationSession
 from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
 from app.engines.investigation.engine import InvestigationNotFoundError
+from app.engines.llm.prompt_builder import PromptBuilder
+from app.engines.llm.provider import LLMProviderError
 
 if TYPE_CHECKING:
     from app.domain.recommendation import InvestigationStrategy, RecommendedSolution
+    from app.domain.structured_resolution import StructuredResolution
     from app.engines.chat.conversation_state import ConversationStateEngine
     from app.engines.investigation.engine import InvestigationEngine
+    from app.engines.llm.provider import LLMProvider
     from app.engines.recommendation.engine import RecommendationEngine
+
+logger = logging.getLogger(__name__)
 
 
 class ChatSessionNotFoundError(Exception):
@@ -80,10 +87,20 @@ class ChatOrchestrator:
         state_engine: "ConversationStateEngine",
         recommendation_engine: "RecommendationEngine",
         investigation_engine: "InvestigationEngine | None" = None,
+        llm_provider: "LLMProvider | None" = None,
     ) -> None:
         self._state = state_engine
         self._recommend = recommendation_engine
         self._investigations = investigation_engine
+        self._llm = llm_provider
+        """None (default) means the LLM path is never attempted --
+        _generate_answer() falls straight to the existing, unchanged
+        _compose_answer() every time, byte-identical to pre-Phase-1
+        behavior. Set via DI (app/api/dependencies.py) only when
+        Settings.llm_enabled is True."""
+        self._prompt_builder = PromptBuilder()
+        """Stateless -- always constructed, never None, regardless of
+        whether an LLM provider is wired."""
 
     # --- Session lifecycle (thin passthrough to ConversationStateEngine) ----
 
@@ -132,7 +149,7 @@ class ChatOrchestrator:
         recommendation = self._recommend.generate(investigation_for_retrieval)
         strategy = recommendation.strategy
 
-        answer_text, follow_up = self._compose_answer(strategy)
+        answer_text, follow_up = self._generate_answer(text, strategy)
         focus, referenced_investigation_id, referenced_tfs_id = self._derive_focus(strategy)
         self._state.record_assistant_turn(
             session_id,
@@ -261,6 +278,42 @@ class ChatOrchestrator:
                 )
             )
         return synthesized, None
+
+    # --- Answer generation (Chat Assistant Phase 1 -- Qwen 4B/Ollama) ----------
+    # _compose_answer() below (and _compose_answer_without_structured_resolution)
+    # are UNCHANGED -- they remain the deterministic fallback for every case
+    # the LLM path doesn't/can't handle. _generate_answer() is the new single
+    # entry point handle_message() calls instead of _compose_answer() directly;
+    # it only ever *adds* a first attempt in front of the existing behavior,
+    # never replaces or alters it.
+
+    def _generate_answer(self, question: str, strategy: "InvestigationStrategy") -> tuple[str, str | None]:
+        """Tries LLM generation first when a provider is wired, enabled,
+        and there's a real StructuredResolution to ground it in; falls
+        back to the existing, untouched _compose_answer() in every
+        other case -- provider absent/disabled, no structured
+        resolution, or a real LLMProviderError. The deterministic path
+        is always available and is never itself modified by this
+        method."""
+        if self._llm is not None and strategy.structured_resolution is not None and self._llm.is_configured():
+            try:
+                answer_text = self._generate_llm_answer(question, strategy.structured_resolution)
+                return answer_text, None
+            except LLMProviderError as exc:
+                # Environmental/provider failure only (connection, timeout,
+                # HTTP error, malformed/empty response) -- never a bare
+                # `except Exception`, so a real bug in PromptBuilder or here
+                # still surfaces instead of being silently swallowed. Never
+                # exposed to the end user -- the deterministic fallback below
+                # returns a normal, successful answer, exactly like every
+                # other graceful-degradation path in this codebase
+                # (ExternalKnowledgeService, _reconcile_orphaned_columns).
+                logger.warning("LLM generation failed, falling back to deterministic answer: %s", exc)
+        return self._compose_answer(strategy)
+
+    def _generate_llm_answer(self, question: str, structured: "StructuredResolution") -> str:
+        system_prompt, user_prompt = self._prompt_builder.build(question, structured)
+        return self._llm.generate(user_prompt, system_prompt=system_prompt)
 
     # --- Deterministic answer composition (§4) ---------------------------------
 
