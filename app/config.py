@@ -125,6 +125,24 @@ class Settings(BaseSettings):
     measured TFS latency) -- local LLM inference latency on the target
     machine is unknown and needs benchmarking once Ollama is installed."""
 
+    # --- Hybrid Retrieval: BM25 + RRF foundation (Chat Assistant Phase 2) ---
+    # Kill switch defaults to False, same idiom as llm_enabled/
+    # external_knowledge_enabled -- a fresh checkout runs with the existing,
+    # unchanged ChromaKnowledgeStore (pure vector search) until this is
+    # explicitly enabled AND the existing 1,222-record real corpus has been
+    # backfilled into the lexical index (operational step: re-run
+    # KnowledgeEngine.seed_from_directory(force=True) once HybridKnowledgeStore
+    # is wired in -- see app/engines/knowledge/hybrid_store.py).
+    rrf_enabled: bool = False
+    """False (default): _knowledge_store() returns the existing, unmodified
+    ChromaKnowledgeStore exactly as before Phase 2 -- behavior is
+    byte-identical to pre-Phase-2 retrieval."""
+    rrf_k: int = 60
+    """Reciprocal Rank Fusion's own constant -- the literature-standard
+    default (Cormack et al.), robust across very different score
+    distributions between retrievers. See
+    app/engines/knowledge/rank_fusion.py."""
+
     @property
     def sqlite_url(self) -> str:
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)

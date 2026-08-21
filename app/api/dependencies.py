@@ -24,7 +24,9 @@ from app.engines.investigation.engine import InvestigationEngine
 from app.engines.knowledge.classification import DocumentClassificationEngine
 from app.engines.knowledge.embedding_provider import EmbeddingProvider, SentenceTransformerEmbeddingProvider
 from app.engines.knowledge.engine import KnowledgeEngine
+from app.engines.knowledge.hybrid_store import HybridKnowledgeStore
 from app.engines.knowledge.knowledge_store import ChromaKnowledgeStore, KnowledgeStore
+from app.engines.knowledge.lexical_store import LexicalKnowledgeStore
 from app.engines.knowledge_management.engine import KnowledgeManagementEngine
 from app.engines.knowledge_object_framework.adapters import KnowledgeObjectAdapter, build_adapters
 from app.engines.knowledge_object_framework.service import KnowledgeObjectService
@@ -69,9 +71,17 @@ def _embedding_provider() -> EmbeddingProvider:
 
 
 @lru_cache
+def _lexical_knowledge_store() -> LexicalKnowledgeStore:
+    return LexicalKnowledgeStore()
+
+
+@lru_cache
 def _knowledge_store() -> KnowledgeStore:
     settings = get_settings()
-    return ChromaKnowledgeStore(settings.chroma_persist_dir, _embedding_provider())
+    vector_store = ChromaKnowledgeStore(settings.chroma_persist_dir, _embedding_provider())
+    if not settings.rrf_enabled:
+        return vector_store
+    return HybridKnowledgeStore(vector_store, _lexical_knowledge_store(), rrf_k=settings.rrf_k)
 
 
 @lru_cache
@@ -430,6 +440,7 @@ def reset_singletons() -> None:
     for fn in (
         _embedding_provider,
         _knowledge_store,
+        _lexical_knowledge_store,
         _knowledge_engine_singleton,
         _db_session_factory,
         _investigation_repository,

@@ -14,6 +14,11 @@ sentence-transformers==3.3.1
 transformers==4.46.3
 tokenizers==0.20.3
 protobuf<6,>=4.21
+rank_bm25==0.2.2
+# Hybrid Retrieval / RRF (Chat Assistant Phase 2): lexical (BM25) retrieval
+# alongside the existing ChromaDB vector search. Pure Python, no new
+# transitive dependency -- its only requirement (numpy) is already pulled
+# in by chromadb/sentence-transformers.
 streamlit==1.41.1
 requests==2.32.3
 requests-negotiate-sspi==0.5.2
