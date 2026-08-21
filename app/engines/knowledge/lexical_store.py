@@ -20,11 +20,55 @@ collection was marked dirty by an ``upsert()``/``delete()`` -- the same
 large" precedent ``ChromaKnowledgeStore.list_recent()``'s own docstring
 already establishes for exactly this scale.
 
-Tokenization is deliberately simple: lowercase, alphanumeric-run
-extraction (``re.findall(r"[a-z0-9]+", text.lower())``) -- the same
-alnum-run-extraction philosophy already established in
-``app.engines.shared.text_matching``, not a new idiom. No stemming, no
-lemmatization, no query expansion (out of Phase 2 scope by design).
+Tokenization (Phase 2A -- BM25 tokenizer calibration, real-corpus-
+evidence-grounded, see this phase's own approved design) is additive
+on top of the original, deliberately simple base: lowercase,
+alphanumeric-run extraction (``re.findall(r"[a-z0-9]+", text.lower())``)
+-- the same alnum-run-extraction philosophy already established in
+``app.engines.shared.text_matching``, not a new idiom -- PLUS three
+narrow, evidence-backed additions, each of which only ever adds tokens
+on top of that base, never replaces or removes anything the base pass
+already produces:
+
+1. Bounded version-span preservation (``_VERSION_RE``): a real,
+   confirmed corpus gap -- ``SS8.6.1.463``/``v3.4.0``-style version
+   strings otherwise fragment into low-signal single-digit tokens.
+   Bounded (2-4 dot-separated 1-4-digit segments, optional 0-4 letter
+   prefix) specifically because the real corpus also contains garbage
+   digit/dot sequences (raw log/SNMP-OID-shaped data pasted into
+   ServiceNow work notes) that an unbounded rule would try to preserve
+   as one giant, useless token. Known, accepted, disclosed trade-off:
+   an ordinary short decimal number (``0.026``) is structurally
+   identical to a real short version string (``1.9``) and will also
+   match -- not fixable without either losing real required examples
+   or adding semantic knowledge this tokenizer doesn't have.
+2. Additive, per-word-scoped CamelCase splitting (``_WORD_RE`` +
+   ``_CAMEL_BOUNDARY_RE``): another real, confirmed corpus gap --
+   ``CommandTimeout``/``InboundMessageProcessor``-style compound
+   identifiers stay as one opaque token otherwise. Deliberately scoped
+   to each individual word span (never a whole-document re-scan) --
+   an earlier draft of this design re-scanned the whole document and
+   was found, during this phase's own design review, to inflate BM25
+   term frequency for any word that occurs both standalone and inside
+   a compound elsewhere in the same document; the per-word scoping
+   fixes that. Acronym-led forms (``APIResponse``) are deliberately
+   NOT split -- zero real corpus evidence for that exact pattern, and
+   the added complexity/risk of a correct acronym-vs-word boundary
+   rule isn't justified without it.
+3. A new, independently-authored, BM25-specific stopword list
+   (``BM25_STOPWORDS``) -- deliberately NOT a reuse of
+   ``RecommendationEngine._ENGLISH_STOPWORDS`` (built for a different,
+   narrower purpose -- a binary topical-overlap sanity check, not a
+   corpus-wide term-frequency index -- and known to include
+   ``"without"``, a real troubleshooting-relevant negation word this
+   list explicitly excludes). Every troubleshooting-critical word
+   named in this phase's approved design (``not``, ``no``, ``without``,
+   ``failed``, ``failure``, ``missing``, ``unavailable``, ``stuck``,
+   ``timeout``, ``never``, ``unable``, ``down``, ``error``, and their
+   close relatives) is deliberately excluded.
+
+No stemming, no lemmatization, no query expansion (out of scope by
+design, both Phase 2 and this calibration).
 
 Score contract: BM25's own raw scores are unbounded, non-negative
 floats with no natural [0,1] ceiling -- min-max normalized to [0,1]
@@ -59,14 +103,91 @@ exactly, so a record's snippet reads identically regardless of which
 backing store happens to represent it in a fused result."""
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+"""Whole "word" spans in the ORIGINAL, case-preserved text -- used only
+to find individual candidates for CamelCase splitting, one word at a
+time (never a whole-document re-scan -- see module docstring for the
+real term-frequency-inflation bug that scoping avoids)."""
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+"""Zero-width split point at a lowercase/digit -> uppercase transition
+-- deliberately does not handle acronym-led forms (``APIResponse``),
+see module docstring."""
+_VERSION_RE = re.compile(r"\b[a-z]{0,4}\d{1,4}(?:\.\d{1,4}){1,3}\b")
+"""Bounded version-like span: optional short letter prefix, 2-4
+dot-separated 1-4-digit segments. See module docstring for why these
+specific bounds were chosen against real corpus evidence (both real
+version strings and real garbage digit/dot sequences)."""
+
+BM25_STOPWORDS = frozenset({
+    "a", "after", "again", "against", "an", "and", "are", "as", "at",
+    "be", "because", "been", "before", "being", "between", "but", "by",
+    "does", "doing", "during",
+    "each",
+    "for", "from", "further",
+    "having", "here",
+    "i", "if", "in", "into", "is", "it", "its",
+    "more", "most",
+    "of", "on", "once", "only", "or", "other", "over",
+    "same", "since", "so", "some", "such",
+    "than", "that", "the", "their", "them", "then", "there", "these",
+    "they", "this", "those", "through", "to",
+    "under", "until", "upon",
+    "very",
+    "was", "we", "were", "when", "where", "which", "while", "will",
+    "with", "within", "would",
+    "you", "your",
+})
+"""Independently authored for BM25 -- deliberately NOT
+``RecommendationEngine._ENGLISH_STOPWORDS`` (a different mechanism, a
+binary topical-overlap sanity check, not a corpus-wide term-frequency
+index; that list also includes ``"without"``, excluded here as a real
+troubleshooting-relevant negation word). Every troubleshooting-critical
+word from this phase's approved design -- ``not``, ``no``, ``without``,
+``failed``, ``failure``, ``missing``, ``unavailable``, ``stuck``,
+``timeout``, ``never``, ``unable``, ``down``, ``error``, ``fail``,
+``fails``, ``failing``, ``issue``, ``problem``, ``lost``,
+``disconnected``, ``refused``, ``denied``, ``invalid``, ``broken``,
+``absent`` -- is deliberately absent from this set."""
 
 
 def _tokenize(text: str) -> list[str]:
-    """Lowercase, alphanumeric-run extraction -- case-insensitive and
-    punctuation-insensitive by construction (only alnum runs are ever
-    captured). Empty/whitespace text yields an empty token list, never
-    an error."""
-    return _TOKEN_RE.findall(text.lower())
+    """Base alphanumeric-run extraction (case-insensitive,
+    punctuation-insensitive by construction) PLUS bounded version-span
+    preservation PLUS additive, per-word-scoped CamelCase splitting,
+    with the resulting token list filtered against ``BM25_STOPWORDS``.
+    The original, unsplit token is always present -- every addition
+    only ever adds tokens on top of the base pass, never replaces or
+    removes anything it produced. Empty/whitespace text yields an
+    empty token list, never an error. See module docstring for the
+    full rationale behind each addition."""
+    lowered = text.lower()
+
+    # 1. Base pass -- always runs, unconditionally: guarantees every
+    # original, unsplit token (ticket ids, hyphenated compounds, etc.)
+    # is present regardless of anything below.
+    tokens = list(_TOKEN_RE.findall(lowered))
+
+    # 2. Bounded version spans -- read from the lowered (but still
+    # dot-intact) text; each real occurrence contributes exactly one
+    # new token, never overlapping with what the base pass already
+    # produced (the base pass never emits a dotted span).
+    tokens.extend(m.group(0) for m in _VERSION_RE.finditer(lowered))
+
+    # 3. CamelCase -- scoped to each individual word span in the
+    # ORIGINAL, case-preserved text (never a whole-document re-scan,
+    # which would double-count a word that occurs both standalone and
+    # inside a compound elsewhere in the same document). Only adds the
+    # split pieces when a real lowercase/digit->uppercase transition
+    # exists; a word with no such transition (an opaque ticket id, an
+    # acronym-led form, a plain word) contributes nothing extra here.
+    for word_match in _WORD_RE.finditer(text):
+        parts = _CAMEL_BOUNDARY_RE.sub(" ", word_match.group(0)).lower().split()
+        if len(parts) > 1:
+            tokens.extend(parts)
+
+    # 4. Stopwords -- applied last, to the fully assembled list, exact
+    # whole-token match only.
+    return [token for token in tokens if token not in BM25_STOPWORDS]
 
 
 class _LexicalDocument:

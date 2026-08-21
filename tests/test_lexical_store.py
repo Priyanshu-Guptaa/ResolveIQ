@@ -9,7 +9,7 @@ network, no external process).
 from __future__ import annotations
 
 from app.domain.enums import KnowledgeCollection
-from app.engines.knowledge.lexical_store import LexicalKnowledgeStore
+from app.engines.knowledge.lexical_store import BM25_STOPWORDS, LexicalKnowledgeStore, _tokenize
 
 _HI = KnowledgeCollection.HISTORICAL_INVESTIGATIONS
 _DOC = KnowledgeCollection.DOCUMENTATION
@@ -210,3 +210,196 @@ def test_top_k_limits_result_count():
         store.upsert(_HI, f"id-{i}", "mesh gateway timeout", f"Title {i}", {})
     results = store.query(_HI, "mesh gateway timeout", top_k=3)
     assert len(results) == 3
+
+
+# =============================================================================
+# Phase 2A -- BM25 tokenizer calibration (real-corpus-evidence-grounded).
+# Tests _tokenize() directly (pure function, no I/O) as well as through
+# LexicalKnowledgeStore.query() where the retrieval-level effect matters.
+# =============================================================================
+
+# --- Stopwords ---------------------------------------------------------------
+
+
+def test_generic_function_word_is_removed():
+    assert "the" not in _tokenize("the mesh gateway")
+    assert "with" not in _tokenize("connect with the gateway")
+
+
+def test_not_retained():
+    assert "not" in _tokenize("meter did not respond")
+
+
+def test_no_retained():
+    assert "no" in _tokenize("no response from collector")
+
+
+def test_without_retained():
+    assert "without" in _tokenize("meter without response")
+
+
+def test_failed_retained():
+    assert "failed" in _tokenize("command failed to execute")
+
+
+def test_failure_retained():
+    assert "failure" in _tokenize("connection failure detected")
+
+
+def test_missing_retained():
+    assert "missing" in _tokenize("meter number missing in CC")
+
+
+def test_unavailable_retained():
+    assert "unavailable" in _tokenize("service unavailable")
+
+
+def test_stuck_retained():
+    assert "stuck" in _tokenize("meters stuck in discovered status")
+
+
+def test_timeout_retained():
+    assert "timeout" in _tokenize("collector command timeout")
+
+
+def test_error_retained():
+    assert "error" in _tokenize("SQL error occurred")
+
+
+def test_bm25_stopwords_excludes_every_troubleshooting_critical_word():
+    protected = {
+        "not", "no", "without", "failed", "failure", "missing", "unavailable",
+        "stuck", "timeout", "never", "unable", "down", "error", "fail", "fails",
+        "failing", "issue", "problem", "lost", "disconnected", "refused",
+        "denied", "invalid", "broken", "absent",
+    }
+    assert BM25_STOPWORDS.isdisjoint(protected)
+
+
+def test_bm25_stopwords_is_independent_of_recommendation_engine_list():
+    # BM25_STOPWORDS must be independently authored, not an import/alias of
+    # RecommendationEngine._ENGLISH_STOPWORDS -- concretely proven by the one
+    # real, deliberate divergence: "without" is in that list, not in this one.
+    assert "without" not in BM25_STOPWORDS
+
+
+# --- CamelCase ----------------------------------------------------------------
+
+
+def test_camelcase_command_timeout_splits_and_retains_original():
+    tokens = _tokenize("CommandTimeout")
+    assert "commandtimeout" in tokens
+    assert "command" in tokens
+    assert "timeout" in tokens
+
+
+def test_camelcase_null_pointer_exception_splits_and_retains_original():
+    tokens = _tokenize("NullPointerException")
+    assert "nullpointerexception" in tokens
+    assert {"null", "pointer", "exception"} <= set(tokens)
+
+
+def test_camelcase_inbound_message_processor_splits_and_retains_original():
+    tokens = _tokenize("InboundMessageProcessor")
+    assert "inboundmessageprocessor" in tokens
+    assert {"inbound", "message", "processor"} <= set(tokens)
+
+
+def test_camelcase_original_unsplit_token_always_present():
+    # Explicit, dedicated assertion on the preservation guarantee itself --
+    # not merely incidental to the split tests above.
+    for word in ("CommandTimeout", "NullPointerException", "APIResponse", "CSTASK0078039"):
+        assert word.lower() in _tokenize(word)
+
+
+def test_acronym_led_camelcase_is_not_split():
+    # Deliberate scope decision (Phase 2A approved design): no real corpus
+    # evidence for this exact pattern; the simple boundary rule naturally
+    # leaves it whole with no special-casing needed.
+    assert _tokenize("APIResponse") == ["apiresponse"]
+    assert _tokenize("HTTPClient") == ["httpclient"]
+    assert _tokenize("SQLServer") == ["sqlserver"]
+
+
+# --- Versions ------------------------------------------------------------------
+
+
+def test_version_v3_4_0_preserved_as_whole_token():
+    tokens = _tokenize("v3.4.0")
+    assert "v3.4.0" in tokens
+
+
+def test_version_ss8_6_1_463_preserved_as_whole_token():
+    tokens = _tokenize("SS8.6.1.463")
+    assert "ss8.6.1.463" in tokens
+
+
+def test_version_1_8_2_preserved_as_whole_token():
+    tokens = _tokenize("1.8.2")
+    assert "1.8.2" in tokens
+
+
+def test_version_fragments_still_present_alongside_whole_token():
+    # Additive guarantee: the whole-span token never replaces the
+    # already-existing fragment-level tokens.
+    tokens = _tokenize("SS8.6.1.463")
+    assert tokens == ["ss8", "6", "1", "463", "ss8.6.1.463"]
+
+
+def test_ordinary_decimal_also_matches_version_pattern_documented_tradeoff():
+    # Honest, documented ambiguity (Phase 2A approved design): a plain
+    # decimal metric is structurally identical to a short real version
+    # string (e.g. "1.9") -- not fixable without losing real required
+    # examples or adding semantic knowledge this tokenizer doesn't have.
+    tokens = _tokenize("0.026")
+    assert "0.026" in tokens
+
+
+def test_long_garbage_digit_sequence_does_not_preserve_the_full_span():
+    garbage = "0.0.0.0.0.1.301.0.0.0.0.0.0.0.0.0.108.0"
+    tokens = _tokenize(garbage)
+    assert garbage not in tokens
+    assert all(len(t) <= 20 for t in tokens)
+
+
+# --- Existing behavior (regression guard) --------------------------------------
+
+
+def test_ticket_identifier_remains_single_token_unaffected_by_camelcase_or_version_rules():
+    assert _tokenize("CSTASK0078039") == ["cstask0078039"]
+
+
+def test_hyphenated_terms_unaffected():
+    assert _tokenize("Wi-Sun") == ["wi", "sun"]
+    assert _tokenize("order-service") == ["order", "service"]
+    assert _tokenize("checkout-api") == ["checkout", "api"]
+
+
+def test_case_insensitivity_still_holds():
+    assert _tokenize("MESH gateway") == _tokenize("mesh GATEWAY")
+
+
+def test_punctuation_still_handled():
+    assert _tokenize("Command Request (Outbound)") == ["command", "request", "outbound"]
+
+
+# --- Determinism -----------------------------------------------------------------
+
+
+def test_tokenize_is_deterministic_across_repeated_calls():
+    text = "TEPCO RF Mesh IP CommandTimeout on collector SS8.6.1.463, ticket CSTASK0078039."
+    assert _tokenize(text) == _tokenize(text)
+
+
+# --- Frequency (the mandatory regression test) ------------------------------------
+
+
+def test_camelcase_split_does_not_double_count_a_separately_occurring_standalone_word():
+    text = "CommandTimeout error. The operation experienced a timeout."
+    tokens = _tokenize(text)
+    assert tokens.count("timeout") == 2  # once from CommandTimeout, once standalone -- never three
+
+
+def test_naturally_repeated_word_frequency_is_preserved():
+    tokens = _tokenize("timeout timeout")
+    assert tokens.count("timeout") == 2
