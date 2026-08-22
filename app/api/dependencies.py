@@ -81,7 +81,15 @@ def _knowledge_store() -> KnowledgeStore:
     vector_store = ChromaKnowledgeStore(settings.chroma_persist_dir, _embedding_provider())
     if not settings.rrf_enabled:
         return vector_store
-    return HybridKnowledgeStore(vector_store, _lexical_knowledge_store(), rrf_k=settings.rrf_k)
+    return HybridKnowledgeStore(
+        vector_store,
+        _lexical_knowledge_store(),
+        rrf_k=settings.rrf_k,
+        fusion_mode=settings.hybrid_fusion_mode,
+        vector_weight=settings.hybrid_vector_weight,
+        lexical_weight=settings.hybrid_lexical_weight,
+        identifier_protection_enabled=settings.identifier_protection_enabled,
+    )
 
 
 @lru_cache
@@ -376,6 +384,7 @@ def _llm_provider() -> LLMProvider:
         base_url=settings.ollama_base_url,
         model=settings.ollama_model,
         timeout_seconds=settings.ollama_timeout_seconds,
+        num_predict=settings.ollama_num_predict,
     )
 
 

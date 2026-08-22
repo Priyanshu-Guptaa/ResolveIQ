@@ -15,6 +15,7 @@ import json
 import httpx
 import pytest
 
+from app.config import Settings
 from app.engines.llm.ollama_provider import OllamaProvider
 from app.engines.llm.provider import LLMProviderError
 
@@ -24,6 +25,7 @@ def _provider(transport: httpx.MockTransport, **overrides) -> OllamaProvider:
         base_url=overrides.pop("base_url", "http://localhost:11434"),
         model=overrides.pop("model", "qwen3:4b"),
         timeout_seconds=overrides.pop("timeout_seconds", 5.0),
+        num_predict=overrides.pop("num_predict", 0),
     )
     # Swap in a mocked transport on the same reusable httpx.Client the
     # provider already constructed -- keeps __init__'s real client-reuse
@@ -193,3 +195,95 @@ def test_whitespace_only_response_raises_llm_provider_error():
     provider = _provider(httpx.MockTransport(handler))
     with pytest.raises(LLMProviderError, match="empty response"):
         provider.generate("question")
+
+
+# --- J. num_predict cap (Chat Assistant Phase 3E) -----------------------------
+#
+# Phase 3D real-Ollama investigation proved num_predict bounds Qwen's TOTAL
+# generated tokens (reasoning included) -- see ollama_provider.py's own
+# "num_predict CAP" docstring section. These tests cover the request-
+# construction contract only; the empty-content-after-truncation failure
+# mode is already covered by test_empty_response_raises_llm_provider_error
+# above -- no new error-handling code exists to test separately.
+
+
+def test_num_predict_positive_value_is_sent_in_options():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"message": {"content": "answer"}})
+
+    provider = _provider(httpx.MockTransport(handler), num_predict=2048)
+    provider.generate("question")
+
+    assert captured["body"]["options"]["num_predict"] == 2048
+
+
+def test_num_predict_zero_sends_no_options_key():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"message": {"content": "answer"}})
+
+    provider = _provider(httpx.MockTransport(handler), num_predict=0)
+    provider.generate("question")
+
+    assert "options" not in captured["body"]
+
+
+def test_num_predict_arbitrary_positive_value_transmitted_exactly():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"message": {"content": "answer"}})
+
+    provider = _provider(httpx.MockTransport(handler), num_predict=512)
+    provider.generate("question")
+
+    assert captured["body"]["options"]["num_predict"] == 512
+
+
+def test_num_predict_default_constructor_value_sends_no_options_key():
+    # OllamaProvider's own default (num_predict not passed at all) must
+    # remain the same "no cap" behavior as explicit 0 -- byte-identical
+    # to every pre-Phase-3E caller/test that never mentions this parameter.
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"message": {"content": "answer"}})
+
+    provider = OllamaProvider(base_url="http://localhost:11434", model="qwen3:4b", timeout_seconds=5.0)
+    provider._client = httpx.Client(transport=httpx.MockTransport(handler), timeout=provider._client.timeout)
+    provider.generate("question")
+
+    assert "options" not in captured["body"]
+
+
+def test_num_predict_cap_truncation_still_raises_via_existing_empty_response_check():
+    # Simulates exactly what Phase 3D's real num_predict=50 probe
+    # observed: done_reason="length" with an empty message.content.
+    # No new error-handling code exists for this -- it must be caught by
+    # the same, unmodified "Ollama returned an empty response" check
+    # every other empty-content case already goes through.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": {"content": ""}, "done_reason": "length"})
+
+    provider = _provider(httpx.MockTransport(handler), num_predict=50)
+    with pytest.raises(LLMProviderError, match="empty response"):
+        provider.generate("question")
+
+
+def test_settings_negative_ollama_num_predict_raises_validation_error():
+    # A Settings-level test, deliberately placed here (not a new file) --
+    # Phase 3E's approved scope is exactly the four files this change
+    # touches; ollama_num_predict's own fail-fast validator lives in
+    # app/config.py, next to _validate_hybrid_fusion_weights's identical
+    # "prefer failing fast" idiom.
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError, match="ollama_num_predict"):
+        Settings(ollama_num_predict=-1)

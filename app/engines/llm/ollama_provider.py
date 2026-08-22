@@ -19,6 +19,21 @@ avoidable latency).
 
 No streaming in Phase 1 -- ``stream: false`` is sent explicitly on
 every request.
+
+=== num_predict CAP (Chat Assistant Phase 3E) ===
+Phase 3D's real-Ollama investigation proved ``options.num_predict``
+bounds Qwen's TOTAL generated tokens, reasoning included -- a
+``num_predict=50`` probe produced ``done_reason="length"`` with an
+EMPTY final answer (cut off mid-reasoning), not a short-but-complete
+one. When ``num_predict > 0``, this class sends
+``{"options": {"num_predict": num_predict}}``; when it is exactly
+``0`` (the sentinel for "no cap," matching ``Settings.ollama_num_predict``'s
+own contract), no ``options`` key is sent at all -- byte-identical to
+this class's pre-Phase-3E request shape. This does not change timeout
+handling, error handling, or response parsing in any way: a
+cap-truncated empty response is already caught by this class's
+existing "Ollama returned an empty response" check below -- no new
+failure-handling code was needed.
 """
 
 from __future__ import annotations
@@ -38,9 +53,10 @@ class OllamaProvider:
     inheritance, same as every other Protocol-satisfying class in this
     codebase."""
 
-    def __init__(self, *, base_url: str, model: str, timeout_seconds: float) -> None:
+    def __init__(self, *, base_url: str, model: str, timeout_seconds: float, num_predict: int = 0) -> None:
         self._base_url = base_url.rstrip("/") if base_url else ""
         self._model = model
+        self._num_predict = num_predict
         self._client = httpx.Client(timeout=timeout_seconds)
 
     def is_configured(self) -> bool:
@@ -58,11 +74,15 @@ class OllamaProvider:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
+        payload: dict = {"model": self._model, "messages": messages, "stream": False}
+        if self._num_predict > 0:
+            # See module docstring's "num_predict CAP" section -- 0 is
+            # the explicit "no cap" sentinel, byte-identical to every
+            # pre-Phase-3E request when left at that default.
+            payload["options"] = {"num_predict": self._num_predict}
+
         try:
-            response = self._client.post(
-                f"{self._base_url}/api/chat",
-                json={"model": self._model, "messages": messages, "stream": False},
-            )
+            response = self._client.post(f"{self._base_url}/api/chat", json=payload)
             response.raise_for_status()
         except httpx.ConnectError as exc:
             raise LLMProviderError(

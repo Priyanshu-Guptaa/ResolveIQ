@@ -123,11 +123,50 @@ class Settings(BaseSettings):
     against a real `ollama list`. Fully overridable via
     RESOLVEIQ_OLLAMA_MODEL; must be verified (or corrected) the first time
     this runs against a real Ollama instance."""
-    ollama_timeout_seconds: float = 60.0
-    """Placeholder, not empirically measured (unlike
-    external_knowledge_timeout_seconds's own docstring, which cites real
-    measured TFS latency) -- local LLM inference latency on the target
-    machine is unknown and needs benchmarking once Ollama is installed."""
+    ollama_timeout_seconds: float = 300.0
+    """Empirically measured (Phase 3/3A real-Ollama validation, real
+    qwen3:4b on this hardware, default/thinking-enabled generation --
+    the only viable mode, see Phase 3A's own report for why `think:
+    false` was tested and rejected): prompt evaluation and model
+    loading are negligible (<0.1s each, confirmed via Ollama's own
+    `prompt_eval_duration`/`load_duration`); the real cost is token
+    generation at a measured ~7-9 tokens/sec CPU-bound throughput.
+    Real structured-resolution prompts completed successfully in
+    124-177s across multiple runs, but also produced multiple
+    timeouts at 180s and one run exceeding 300s outright -- reasoning
+    length is stochastic, not fixed, so no timeout eliminates fallback
+    entirely. 300s was chosen to cover the observed successful range
+    with real margin while still bounding worst-case wait time;
+    occasional fallback for outlier-length reasoning is expected,
+    graceful degradation (see ChatOrchestrator._generate_answer()),
+    not a bug to chase away by raising this further."""
+    ollama_num_predict: int = 2048
+    """Empirically measured (Phase 3D real-Ollama investigation): Ollama's
+    ``options.num_predict`` bounds TOTAL generated tokens INCLUDING Qwen's
+    reasoning, not just the visible answer -- directly proven by a real
+    ``num_predict=50`` probe that produced ``done_reason="length"`` with
+    an EMPTY final answer, cut off mid-reasoning, never an abbreviated-
+    but-complete one. Real structured-resolution prompts were observed
+    generating 1209-1934 total tokens to completion; 2048 is the
+    smallest value from that investigation's evaluated candidate set
+    that clears every one of those real, completed samples. This does
+    NOT guarantee completion before ``ollama_timeout_seconds`` -- at the
+    measured worst-case ~7 tokens/sec throughput, 2048 tokens alone is
+    ~293s, leaving only slim margin under the current 300s timeout, and
+    at least one real observed generation exceeded even 1934 tokens
+    without a captured upper bound. ``0`` disables the cap entirely
+    (no ``options`` key is sent at all -- see ``OllamaProvider``),
+    restoring the original, pre-Phase-3D unbounded-generation behavior."""
+
+    @model_validator(mode="after")
+    def _validate_ollama_num_predict(self) -> "Settings":
+        """Fail fast, same idiom as ``_validate_hybrid_fusion_weights`` --
+        a negative token budget is nonsensical, never silently clamped."""
+        if self.ollama_num_predict < 0:
+            raise ValueError(
+                f"ollama_num_predict must be >= 0 (0 disables the cap) -- got {self.ollama_num_predict!r}"
+            )
+        return self
 
     # --- Hybrid Retrieval: BM25 + RRF foundation (Chat Assistant Phase 2) ---
     # Kill switch defaults to False, same idiom as llm_enabled/
