@@ -9,12 +9,16 @@ dependency injection instead of monkeypatching env vars).
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -142,6 +146,106 @@ class Settings(BaseSettings):
     default (Cormack et al.), robust across very different score
     distributions between retrievers. See
     app/engines/knowledge/rank_fusion.py."""
+
+    # --- Hybrid Retrieval calibration (Chat Assistant Phase 2C) -------------
+    # Phase 2C (read-only investigation) found current RRF fusion
+    # structurally vulnerable to a rank-based tie-break artifact at the
+    # real production overfetch depth (20): a record with two mediocre
+    # signals can out-accumulate a record with one perfect signal (a
+    # ticket ID or exact identifier found only by BM25). Weighted score
+    # fusion was the only tested calibration strategy immune to this --
+    # see PHASE 2C — RRF CALIBRATION REPORT, Section 14. Both settings
+    # below are completely inert unless BOTH ``rrf_enabled=True`` AND
+    # ``hybrid_fusion_mode="score"`` -- neither is true by default, so a
+    # fresh checkout's behavior is unaffected by this phase.
+    hybrid_fusion_mode: Literal["rrf", "score"] = "rrf"
+    """Which algorithm HybridKnowledgeStore uses to combine vector +
+    lexical candidates when ``rrf_enabled=True``. "rrf" (default)
+    preserves the exact Phase 2 behavior. "score" is Phase 2C's
+    recommended calibration (weighted linear combination of the real
+    vector/lexical scores) -- not yet enabled by default pending the
+    natural-language-query validation gap the Phase 2C report explicitly
+    left open."""
+    hybrid_vector_weight: float = 0.25
+    """Weight given to the real vector (cosine similarity) score under
+    ``hybrid_fusion_mode="score"``. Phase 2C's recommended value --
+    see that report's Section 5 (6/6 ground-truth top-1, MRR 1.00)."""
+    hybrid_lexical_weight: float = 0.75
+    """Weight given to the real lexical (BM25, already normalized to
+    [0,1] by LexicalKnowledgeStore) score under
+    ``hybrid_fusion_mode="score"``. Phase 2C's recommended value --
+    see that report's Section 5."""
+
+    # --- Exact-Identifier Protection (Chat Assistant Phase 2D) --------------
+    # Kill switch defaults to False, same idiom as every other Phase 2/2C
+    # flag -- inert unless BOTH rrf_enabled=True AND this is explicitly
+    # True, so a fresh checkout's behavior is unaffected. See
+    # app/engines/knowledge/identifier_protection.py and PHASE 2D — EXACT
+    # IDENTIFIER PROTECTION DESIGN. Deliberately no configurable boost
+    # weight -- the +0.30 adjustment is a fixed, evidence-derived
+    # constant (IDENTIFIER_PROTECTION_BOOST in that module), not a new
+    # tuning knob.
+    identifier_protection_enabled: bool = False
+    """False (default): HybridKnowledgeStore.query() never applies the
+    exact-identifier boost -- behavior is byte-identical to
+    pre-Phase-2D retrieval."""
+
+    @model_validator(mode="after")
+    def _validate_hybrid_fusion_weights(self) -> "Settings":
+        """Fail fast on a nonsensical weight configuration rather than
+        silently normalizing it away -- see Phase 2C implementation
+        Section 5's explicit "prefer failing fast" instruction. Only
+        checked here (not deferred to first query) so a misconfigured
+        ``.env`` is caught at startup, not at an engineer's first
+        Analyze click."""
+        if self.hybrid_vector_weight < 0 or self.hybrid_lexical_weight < 0:
+            raise ValueError(
+                "hybrid_vector_weight and hybrid_lexical_weight must both be >= 0 "
+                f"(got vector={self.hybrid_vector_weight!r}, lexical={self.hybrid_lexical_weight!r})"
+            )
+        if self.hybrid_vector_weight + self.hybrid_lexical_weight <= 0:
+            raise ValueError(
+                "hybrid_vector_weight + hybrid_lexical_weight must be > 0 -- "
+                "at least one retrieval signal must carry weight"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _warn_identifier_protection_under_rrf(self) -> "Settings":
+        """Observability only (Phase 2E — RRF / Identifier Protection
+        Compatibility Review, Option A) -- deliberately a WARNING, never
+        a ``raise``: the combination below is not invalid, only
+        limited. Never modifies either setting, never blocks
+        construction, never changes retrieval behavior.
+
+        Phase 2E's real-corpus investigation found that a lexical-only
+        candidate's ``KnowledgeMatch.score`` is intentionally
+        materialized as ``0.0`` under ``hybrid_fusion_mode="rrf"`` (see
+        ``HybridKnowledgeStore``'s own CRITICAL SCORE CONTRACT) --
+        Phase 2D's identifier-protection boost is a small, bounded
+        addition on top of whatever score fusion already produced, not
+        a substitute for it, so ``0.0 + IDENTIFIER_PROTECTION_BOOST``
+        is frequently still far below a genuinely unrelated but
+        vector-similar competitor's real cosine score (Phase 2E
+        measured real competitors at ~0.6-0.73 against a boosted
+        ~0.3-0.4). A ``both``-sourced candidate (e.g. a known bug
+        found by both retrievers) is NOT affected by this and still
+        benefits from protection under RRF -- which is exactly why
+        this is a warning, not a hard failure: the combination has
+        real, partial value, just not a reliable fix for lexical-only
+        exact identifiers. ``hybrid_fusion_mode="score"`` remains the
+        recommended pairing whenever identifier protection is
+        enabled."""
+        if self.identifier_protection_enabled and self.hybrid_fusion_mode == "rrf":
+            logger.warning(
+                "identifier_protection_enabled=True with hybrid_fusion_mode='rrf': exact identifier "
+                "protection is not reliably effective for lexical-only candidates in this mode, because "
+                "RRF intentionally materializes a lexical-only KnowledgeMatch.score as 0.0 before the "
+                "protection boost is applied -- a genuinely unrelated vector-similar candidate routinely "
+                "outscores it even after boosting. hybrid_fusion_mode='score' is the recommended pairing "
+                "when identifier protection is enabled; both-sourced candidates still benefit under 'rrf'."
+            )
+        return self
 
     @property
     def sqlite_url(self) -> str:
