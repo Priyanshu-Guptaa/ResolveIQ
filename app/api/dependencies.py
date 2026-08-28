@@ -17,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings, get_settings
 from app.engines.chat.conversation_state import ConversationStateEngine
+from app.engines.chat.enhancement import ChatEnhancementService
 from app.engines.chat.orchestrator import ChatOrchestrator
 from app.engines.ingestion.engine import IngestionEngine
 from app.engines.ingestion.file_type_registry import FileTypeRegistry
@@ -388,11 +389,37 @@ def _llm_provider() -> LLMProvider:
     )
 
 
+@lru_cache
+def _chat_enhancement_service() -> ChatEnhancementService:
+    """Chat Assistant Phase 37 -- a process-lifetime singleton, same
+    ``lru_cache`` idiom as ``_llm_provider()`` above, and for the same
+    reason: ``get_chat_orchestrator()`` constructs a fresh
+    ``ChatOrchestrator`` on every request, but a job submitted while
+    handling one request must remain pollable from a later request's
+    own, different orchestrator instance -- the service, not the
+    orchestrator, must own the thread pool and job registry."""
+    settings = get_settings()
+    return ChatEnhancementService(
+        max_concurrent=settings.llm_max_concurrent_jobs,
+        max_queued=settings.llm_enhancement_max_queued,
+    )
+
+
+def get_chat_enhancement_service() -> ChatEnhancementService:
+    return _chat_enhancement_service()
+
+
 def get_chat_orchestrator() -> ChatOrchestrator:
     settings = get_settings()
     llm = _llm_provider() if settings.llm_enabled else None
+    enhancement_service = _chat_enhancement_service() if settings.llm_async_enabled else None
     return ChatOrchestrator(
-        get_conversation_state_engine(), get_recommendation_engine(), get_investigation_engine(), llm
+        get_conversation_state_engine(),
+        get_recommendation_engine(),
+        get_investigation_engine(),
+        llm,
+        enhancement_service,
+        settings.llm_async_enabled,
     )
 
 

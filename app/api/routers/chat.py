@@ -10,9 +10,10 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app.api.dependencies import get_chat_orchestrator
-from app.api.schemas import ChatMessageRequest, CreateChatSessionRequest
+from app.api.dependencies import get_chat_enhancement_service, get_chat_orchestrator
+from app.api.schemas import ChatEnhancementResponse, ChatMessageRequest, CreateChatSessionRequest
 from app.domain.chat import ChatMessage, ChatResponse, ChatSession
+from app.engines.chat.enhancement import ChatEnhancementService
 from app.engines.chat.orchestrator import ChatOrchestrator, ChatSessionNotFoundError, EmptyMessageError
 from app.engines.investigation.engine import InvestigationNotFoundError
 
@@ -69,3 +70,21 @@ def post_chat_message(
     except Exception as exc:  # noqa: BLE001 -- never leak an internal stack trace to the client
         logger.exception("Chat message handling failed for session %s", session_id)
         raise HTTPException(status_code=500, detail="Internal error while processing the chat message.") from exc
+
+
+@router.get("/enhancements/{job_id}", response_model=ChatEnhancementResponse)
+def get_chat_enhancement(
+    job_id: str,
+    service: ChatEnhancementService = Depends(get_chat_enhancement_service),
+) -> ChatEnhancementResponse:
+    """Chat Assistant Phase 37 -- polls one asynchronous LLM enhancement
+    job (see ``ChatResponse.enhancement``). 404 for an unknown OR
+    already-expired job id (see ``ChatEnhancementService``'s TTL-based
+    purge) -- indistinguishable from the caller's point of view, since
+    neither case has anything left to report; the deterministic answer
+    already delivered in the original ``ChatResponse`` remains valid
+    either way."""
+    job = service.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"No such enhancement job: {job_id}")
+    return ChatEnhancementResponse(job_id=job.id, status=job.status, answer_text=job.answer_text, error=job.error)

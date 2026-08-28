@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING
 from app.domain.chat import (
     ChatAmbiguity,
     ChatAmbiguityKind,
+    ChatEnhancementRef,
     ChatMessage,
     ChatResponse,
     ChatSession,
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
     from app.domain.recommendation import InvestigationStrategy, RecommendedSolution
     from app.domain.structured_resolution import StructuredResolution
     from app.engines.chat.conversation_state import ConversationStateEngine
+    from app.engines.chat.enhancement import ChatEnhancementService
     from app.engines.investigation.engine import InvestigationEngine
     from app.engines.llm.provider import LLMProvider
     from app.engines.recommendation.engine import RecommendationEngine
@@ -167,6 +169,8 @@ class ChatOrchestrator:
         recommendation_engine: "RecommendationEngine",
         investigation_engine: "InvestigationEngine | None" = None,
         llm_provider: "LLMProvider | None" = None,
+        enhancement_service: "ChatEnhancementService | None" = None,
+        async_enabled: bool = False,
     ) -> None:
         self._state = state_engine
         self._recommend = recommendation_engine
@@ -180,6 +184,20 @@ class ChatOrchestrator:
         self._prompt_builder = PromptBuilder()
         """Stateless -- always constructed, never None, regardless of
         whether an LLM provider is wired."""
+        self._enhancement_service = enhancement_service
+        self._async_enabled = async_enabled
+        """Chat Assistant Phase 37 -- both default to None/False, the
+        same "purely additive" contract every LLM-related parameter on
+        this constructor has had since Phase 1: with either left at its
+        default, handle_message() calls the existing, unchanged
+        _generate_answer() synchronously exactly as every prior phase
+        has, and no ChatResponse.enhancement is ever set. Only when
+        BOTH async_enabled is True AND a real llm_provider/
+        enhancement_service are wired (Settings.llm_enabled AND
+        Settings.llm_async_enabled, see app/api/dependencies.py) does
+        handle_message() return the deterministic answer immediately
+        and schedule LLM generation as a background job instead --
+        see _should_enhance_asynchronously()."""
 
     # --- Session lifecycle (thin passthrough to ConversationStateEngine) ----
 
@@ -242,7 +260,42 @@ class ChatOrchestrator:
         fact block ``PromptBuilder`` may render alongside whatever
         ``RecommendationEngine`` already decided."""
 
-        answer_text, follow_up = self._generate_answer(text, strategy, log_observations)
+        enhancement_ref: ChatEnhancementRef | None = None
+        if self._should_enhance_asynchronously(strategy):
+            # Chat Assistant Phase 37 -- DETERMINISTIC ANSWER FIRST. The
+            # entire knowledge pipeline above (retrieval, ranking,
+            # StructuredResolution) already ran exactly once, synchronously,
+            # deterministically -- it is never re-run for the async path.
+            # The deterministic answer is composed and returned to the
+            # caller in THIS call, never waiting on Ollama; the LLM
+            # enhancement (if any) is scheduled as a background job and
+            # polled separately (GET /chat/enhancements/{job_id}). See
+            # _finalize_llm_answer for what that job actually runs -- the
+            # exact same _attempt_llm_answer safety-validated decision the
+            # synchronous path below uses, never a second, divergent
+            # implementation.
+            (
+                answer_text,
+                follow_up,
+                sanitized_question,
+                had_scope,
+                had_troubleshooting,
+                structured_for_job,
+            ) = self._compose_deterministic_answer(text, strategy)
+            if not ((had_scope or had_troubleshooting) and not sanitized_question):
+                # Something non-scope/non-troubleshooting remains to ask
+                # the LLM -- otherwise there is nothing for a job to
+                # attempt (mirrors _generate_answer's own bypass exactly).
+                job = self._enhancement_service.submit(  # type: ignore[union-attr]  -- guarded by _should_enhance_asynchronously
+                    session_id,
+                    lambda sq=sanitized_question, st=structured_for_job, lo=log_observations, hs=had_scope, ht=had_troubleshooting: self._finalize_llm_answer(  # noqa: E501
+                        sq, st, lo, hs, ht
+                    ),
+                )
+                enhancement_ref = ChatEnhancementRef(job_id=job.id, status=job.status)
+        else:
+            answer_text, follow_up = self._generate_answer(text, strategy, log_observations)
+
         focus, referenced_investigation_id, referenced_tfs_id = self._derive_focus(strategy)
         self._state.record_assistant_turn(
             session_id,
@@ -269,6 +322,7 @@ class ChatOrchestrator:
             tfs_matches=strategy.tfs_matches,
             wiki_matches=strategy.wiki_matches,
             investigation_id=response_investigation_id,
+            enhancement=enhancement_ref,
         )
 
     # --- Ambiguity (a small, new, deterministic rule -- see class docstring) -
@@ -447,13 +501,7 @@ class ChatOrchestrator:
         troubleshooting-clause logic above, since it is a supplementary
         data section, not a fact that changes which sub-questions the
         LLM is permitted to see."""
-        sanitized_question, had_scope = split_out_scope_clause(question)
-        structured = strategy.structured_resolution
-
-        checks_available = bool(available_checks(structured)) if structured is not None else False
-        had_troubleshooting = False
-        if not checks_available:
-            sanitized_question, had_troubleshooting = split_out_troubleshooting_clause(sanitized_question)
+        sanitized_question, had_scope, had_troubleshooting, structured = self._prepare_question(question, strategy)
 
         if (had_scope or had_troubleshooting) and not sanitized_question:
             # Nothing non-scope/non-troubleshooting is left to ask the
@@ -464,33 +512,8 @@ class ChatOrchestrator:
 
         if self._llm is not None and structured is not None and self._llm.is_configured():
             try:
-                answer_text = self._generate_llm_answer(sanitized_question, structured, log_observations)
-                if contains_unsupported_scope_expansion(answer_text):
-                    # Chat Assistant Phase 35B -- deterministic post-
-                    # generation gate, checked on the RAW LLM text
-                    # before any deterministic statement is appended
-                    # (see contains_unsupported_scope_expansion's own
-                    # docstring for why the ordering matters). Phase 35's
-                    # real-call validation found qwen2.5:3b will, on a
-                    # normal (non-scope) multi-part question, sometimes
-                    # spontaneously volunteer an unsupported claim like
-                    # "occurred before with other customers in the APAC
-                    # region" -- with no scope question anywhere in the
-                    # input for Phase 31's clause-removal mechanism to
-                    # act on, since none was asked. There is no clause to
-                    # remove here; the claim appears inside the answer to
-                    # a real, necessary question. Rejecting the whole LLM
-                    # answer and falling back to the existing, unchanged
-                    # deterministic path -- never rewriting it into a new
-                    # claim -- is the same "prevent, don't just instruct"
-                    # principle already proven necessary for the explicit-
-                    # question version of this exact problem (Phases
-                    # 27-30's four straight failed prompt-only attempts).
-                    logger.warning(
-                        "LLM answer contained an unsupported customer-scope expansion claim; "
-                        "falling back to deterministic answer."
-                    )
-                else:
+                answer_text = self._attempt_llm_answer(sanitized_question, structured, log_observations)
+                if answer_text is not None:
                     answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
                     return answer_text, None
             except LLMProviderError as exc:
@@ -506,6 +529,150 @@ class ChatOrchestrator:
         answer_text, follow_up = self._compose_answer(strategy)
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
         return answer_text, follow_up
+
+    def _prepare_question(
+        self, question: str, strategy: "InvestigationStrategy"
+    ) -> tuple[str, bool, bool, "StructuredResolution | None"]:
+        """Chat Assistant Phase 37 -- extracted, unchanged in behavior,
+        from what used to be the start of ``_generate_answer`` (Phases
+        31/32's scope/troubleshooting clause-splitting), so BOTH the
+        existing synchronous path and the new asynchronous enhancement
+        path (``_should_enhance_asynchronously``/``handle_message``)
+        make this exact same deterministic decision instead of a second,
+        divergent implementation. Returns
+        ``(sanitized_question, had_scope, had_troubleshooting, structured)``."""
+        sanitized_question, had_scope = split_out_scope_clause(question)
+        structured = strategy.structured_resolution
+        checks_available = bool(available_checks(structured)) if structured is not None else False
+        had_troubleshooting = False
+        if not checks_available:
+            sanitized_question, had_troubleshooting = split_out_troubleshooting_clause(sanitized_question)
+        return sanitized_question, had_scope, had_troubleshooting, structured
+
+    def _attempt_llm_answer(
+        self,
+        question: str,
+        structured: "StructuredResolution",
+        log_observations: "LogObservationSummary | None",
+    ) -> str | None:
+        """Chat Assistant Phase 37 -- the single, centralized "try the
+        LLM and validate its output" decision, extracted unchanged from
+        ``_generate_answer`` so it can be shared by BOTH the existing
+        synchronous path and the new asynchronous enhancement path
+        (``_finalize_llm_answer``) -- never duplicated, never a second,
+        potentially-diverging safety check.
+
+        Returns the validated answer text on success. Returns ``None``
+        specifically when generation succeeded but the RAW output failed
+        Phase 35B's customer-scope-expansion gate
+        (``contains_unsupported_scope_expansion`` -- checked here, on
+        the raw text, before any deterministic statement is appended,
+        exactly as Phase 35B established) -- the caller's job in either
+        case is to fall back to the deterministic answer, never to
+        rewrite the rejected text into a new claim. Raises
+        ``LLMProviderError`` (unchanged, from ``_generate_llm_answer``/
+        ``OllamaProvider``) for a genuine provider failure -- connection,
+        timeout, empty response, malformed response -- which every
+        caller must also treat as "fall back to the deterministic
+        answer," exactly as this project always has."""
+        answer_text = self._generate_llm_answer(question, structured, log_observations)
+        if contains_unsupported_scope_expansion(answer_text):
+            # Chat Assistant Phase 35B -- deterministic post-generation
+            # gate, checked on the RAW LLM text before any deterministic
+            # statement is appended (see
+            # contains_unsupported_scope_expansion's own docstring for
+            # why the ordering matters). Phase 35's real-call validation
+            # found qwen2.5:3b will, on a normal (non-scope) multi-part
+            # question, sometimes spontaneously volunteer an unsupported
+            # claim like "occurred before with other customers in the
+            # APAC region" -- with no scope question anywhere in the
+            # input for Phase 31's clause-removal mechanism to act on,
+            # since none was asked. There is no clause to remove here;
+            # the claim appears inside the answer to a real, necessary
+            # question. Rejecting the whole LLM answer and falling back
+            # to the existing, unchanged deterministic path -- never
+            # rewriting it into a new claim -- is the same "prevent,
+            # don't just instruct" principle already proven necessary
+            # for the explicit-question version of this exact problem
+            # (Phases 27-30's four straight failed prompt-only attempts).
+            logger.warning(
+                "LLM answer contained an unsupported customer-scope expansion claim; "
+                "falling back to deterministic answer."
+            )
+            return None
+        return answer_text
+
+    def _compose_deterministic_answer(
+        self, question: str, strategy: "InvestigationStrategy"
+    ) -> tuple[str, str | None, str, bool, bool, "StructuredResolution | None"]:
+        """Chat Assistant Phase 37 -- composes the same deterministic
+        answer ``_generate_answer``'s own fallback branch would (real
+        root cause/resolution/confidence, plus scope/no-checks
+        deterministic statements when the question asked for them),
+        without ever attempting the LLM. This is what
+        ``handle_message`` returns IMMEDIATELY on the asynchronous path
+        -- never waiting on Ollama -- and it is exactly what the
+        synchronous path already falls back to on any LLM failure/
+        rejection, so an asynchronous user's initial answer is never
+        weaker than a synchronous user's worst case.
+
+        Returns ``(answer_text, follow_up, sanitized_question, had_scope,
+        had_troubleshooting, structured)`` -- the last four are handed
+        straight to ``_finalize_llm_answer`` if an enhancement job is
+        scheduled, so that job makes the identical clause-splitting
+        decision this answer was already built from, never a second,
+        possibly-different one."""
+        sanitized_question, had_scope, had_troubleshooting, structured = self._prepare_question(question, strategy)
+        answer_text, follow_up = self._compose_answer(strategy)
+        answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
+        return answer_text, follow_up, sanitized_question, had_scope, had_troubleshooting, structured
+
+    def _finalize_llm_answer(
+        self,
+        question: str,
+        structured: "StructuredResolution | None",
+        log_observations: "LogObservationSummary | None",
+        had_scope: bool,
+        had_troubleshooting: bool,
+    ) -> str | None:
+        """Chat Assistant Phase 37 -- the exact work an asynchronous
+        enhancement job runs (see
+        ``app.engines.chat.enhancement.ChatEnhancementService.submit``'s
+        ``work`` callable contract). Calls ``_attempt_llm_answer`` --
+        the SAME centralized, safety-validated decision the synchronous
+        path uses, never a second implementation -- and, only on
+        success, appends the same deterministic statements the
+        synchronous path would, so a completed enhancement reads
+        identically to how a synchronous LLM answer always has.
+        Returns ``None`` (meaning "no safe enhancement available," which
+        ``ChatEnhancementService`` reports as REJECTED) when the answer
+        was unsafe; lets ``LLMProviderError`` propagate so that service
+        can classify it as FAILED or TIMED_OUT instead."""
+        if structured is None:  # pragma: no cover -- guarded by _should_enhance_asynchronously before a job is ever submitted
+            return None
+        answer_text = self._attempt_llm_answer(question, structured, log_observations)
+        if answer_text is None:
+            return None
+        return self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
+
+    def _should_enhance_asynchronously(self, strategy: "InvestigationStrategy") -> bool:
+        """Chat Assistant Phase 37 -- True only when every precondition
+        for a safe, worthwhile background LLM job is met: async mode is
+        on, a real provider is wired and configured, the enhancement
+        service singleton is wired, and there is a real
+        ``StructuredResolution`` to ground the enhancement in. False in
+        every configuration this project has run to date (``async_enabled``
+        defaults to False, and ``Settings.llm_async_enabled`` defaults to
+        False) -- ``handle_message`` then takes the existing, unchanged
+        synchronous ``_generate_answer`` path, byte-identical to every
+        prior phase."""
+        return (
+            self._async_enabled
+            and self._llm is not None
+            and self._llm.is_configured()
+            and self._enhancement_service is not None
+            and strategy.structured_resolution is not None
+        )
 
     @staticmethod
     def _append_scope_statement(answer_text: str, structured: "StructuredResolution") -> str:

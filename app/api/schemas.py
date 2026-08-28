@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.domain.chat import EnhancementStatus
 from app.domain.investigation import ActivityItem, DashboardStats
 from app.domain.knowledge_relationships import KnowledgeObjectType, RelationshipType
 from app.domain.recommendation import KnowledgeMatch
@@ -113,6 +114,21 @@ class CreateChatSessionRequest(BaseModel):
 
 class ChatMessageRequest(BaseModel):
     message: str = Field(min_length=1)
+
+
+class ChatEnhancementResponse(BaseModel):
+    """Chat Assistant Phase 37 -- the poll response for
+    ``GET /chat/enhancements/{job_id}``. ``answer_text`` is populated
+    only when ``status == completed``, meaning it already passed every
+    existing safety validator (Rule 8/9/10/11, the customer-scope-
+    expansion gate) -- see ``app.engines.chat.enhancement.
+    ChatEnhancementJob``, this is a thin, display-only re-shaping of
+    that dataclass's public fields, never a second source of truth."""
+
+    job_id: str
+    status: EnhancementStatus
+    answer_text: str | None = None
+    error: str | None = None
 
 
 class InvestigationSummary(BaseModel):

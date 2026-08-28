@@ -273,6 +273,35 @@ class ChatAmbiguity(BaseModel):
     ``ReferenceResolution.candidates`` -- never invented."""
 
 
+class EnhancementStatus(str, Enum):
+    """The lifecycle of one asynchronous LLM enhancement job (Chat
+    Assistant Phase 37) -- see
+    ``app.engines.chat.enhancement.ChatEnhancementService`` for the
+    full state machine and why each terminal state exists."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    REJECTED = "rejected"
+    TIMED_OUT = "timed_out"
+
+
+class ChatEnhancementRef(BaseModel):
+    """A pointer to an in-flight or finished LLM enhancement job,
+    attached to ``ChatResponse.enhancement`` -- never the enhanced
+    answer text itself (that is only ever returned by polling
+    ``GET /chat/enhancements/{job_id}``, and only once it has passed
+    every existing safety validator; see ``ChatEnhancementJob``).
+    ``None`` on ``ChatResponse`` whenever no enhancement was scheduled
+    -- always the case while ``Settings.llm_enabled`` or
+    ``Settings.llm_async_enabled`` is ``False``, which is every
+    configuration this project has run to date."""
+
+    job_id: str
+    status: EnhancementStatus
+
+
 class ChatResponse(BaseModel):
     """The Chat Orchestrator's structured answer to one user message.
     Deliberately not a single string -- the UI renders ``answer_text``
@@ -334,3 +363,13 @@ class ChatResponse(BaseModel):
     session is investigation-scoped -- never a synthesized/throwaway
     session id (a standalone chat's synthesized InvestigationSession is
     never persisted and never given an id a caller could look up)."""
+
+    enhancement: ChatEnhancementRef | None = None
+    """Chat Assistant Phase 37 -- set only when an LLM enhancement job
+    was actually scheduled (``Settings.llm_enabled`` AND
+    ``Settings.llm_async_enabled`` both True). ``answer_text`` above is
+    ALWAYS the complete, valid, deterministic-or-already-LLM-validated
+    answer regardless of this field -- ``enhancement`` never means "the
+    real answer is still coming"; it means "a possibly-better phrasing
+    may become available later via ``GET /chat/enhancements/{job_id}``,
+    but what you already have is already correct.\""""

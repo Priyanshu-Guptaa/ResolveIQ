@@ -176,6 +176,41 @@ class Settings(BaseSettings):
     without a captured upper bound. ``0`` disables the cap entirely
     (no ``options`` key is sent at all -- see ``OllamaProvider``),
     restoring the original, pre-Phase-3D unbounded-generation behavior."""
+    llm_async_enabled: bool = False
+    """Chat Assistant Phase 37 -- when True (and only when
+    ``llm_enabled`` is ALSO True), ``ChatOrchestrator.handle_message()``
+    returns the deterministic answer immediately and schedules LLM
+    generation as a background enhancement job (see
+    ``app.engines.chat.enhancement``) instead of blocking the request on
+    Ollama. Defaults to False so this phase's work is purely additive:
+    with the default ``Settings`` (``llm_enabled=False``), behavior is
+    byte-identical to every prior phase; even with ``llm_enabled=True``
+    and this still False, behavior is the existing Phase 1-35B
+    synchronous path, completely unchanged. Deliberately independent of
+    ``llm_enabled`` -- production behavior must never depend on this
+    flag while ``llm_enabled`` is False, and it is not: this flag alone,
+    with ``llm_enabled`` at its own default, changes nothing. A future
+    production enablement can turn both flags on together as one
+    deliberate step."""
+    llm_max_concurrent_jobs: int = 1
+    """Chat Assistant Phase 37 -- the maximum number of LLM enhancement
+    jobs allowed to run at once when ``llm_async_enabled`` is True.
+    qwen2.5:3b was directly measured (Phase 35, a real ``ollama ps``
+    during real calls) running at 100% CPU with no GPU/iGPU acceleration
+    active on this hardware -- a second concurrent generation would only
+    contend for the same CPU cycles Ollama is already using, not add
+    real throughput, so 1 is the conservative, evidence-based starting
+    value, not an arbitrary guess. Raise this only once a real
+    environment (e.g. genuine GPU acceleration, or multiple Ollama
+    instances) has been measured to actually benefit from it."""
+    llm_enhancement_max_queued: int = 1
+    """Chat Assistant Phase 37 -- how many further enhancement jobs may
+    wait beyond the ``llm_max_concurrent_jobs`` already running before a
+    new one is REJECTED outright (see
+    ``app.engines.chat.enhancement.ChatEnhancementService``). Always
+    small and finite by design -- the queue must never grow unbounded,
+    and a rejected enhancement never blocks or degrades the request:
+    the deterministic answer is returned regardless."""
 
     @model_validator(mode="after")
     def _validate_ollama_num_predict(self) -> "Settings":
