@@ -63,6 +63,57 @@ class FlowStep(BaseModel):
     events: list[LogSearchHit] = Field(default_factory=list)
 
 
+class LogEventCount(BaseModel):
+    """One (label, count) pair -- either an OBSERVED FACT (a direct
+    tally, e.g. a severity level) or a DETERMINISTIC OBSERVATION (a
+    computed pattern, e.g. how many times one exception type recurred).
+    See ``LogObservationSummary``'s docstring for the distinction."""
+
+    label: str
+    count: int
+
+
+class LogObservationSummary(BaseModel):
+    """Chat Assistant Phase 33 -- a deterministic, provenance-preserving
+    summary of already-parsed ``LOG_FILE`` evidence, safe to place in an
+    LLM prompt because it is a strict allowlist transform: every field
+    is either a direct count or an already-recognized entity value (see
+    ``app.engines.log_intelligence.entity_extractor``'s closed pattern
+    registry), never a raw log line or arbitrary free text copied
+    through. Building this is the ``DETERMINISTIC PARSER -> COMPACT
+    STRUCTURED EVIDENCE`` step of the architecture this phase
+    implements -- see ``LogIntelligenceEngine.summarize_observations``.
+
+    Deliberately contains ONLY two of this project's four evidence
+    categories (see that method's docstring for all four):
+
+    - OBSERVED FACT: ``level_counts`` (a direct tally of severities
+      actually present in the parsed events).
+    - DETERMINISTIC OBSERVATION: ``top_exceptions`` (a computed
+      frequency count of recognized exception/error-code entities).
+
+    It never contains a HYPOTHESIS or a TROUBLESHOOTING CHECK -- this
+    project's Phase 25/32 Rule 9 guarantee (only an already-computed
+    ``resolution_candidates``/``validation_steps`` entry may become an
+    "available check") is preserved by construction: nothing here ever
+    populates those fields, so log evidence can never make a
+    troubleshooting action evidence-backed on its own, no matter how
+    strongly a log's own text is worded (Rule 10 in
+    ``app.engines.llm.prompt_builder`` reinforces this at the prompt
+    level, but the real guarantee is architectural -- this summary
+    object simply has no field a fabricated check could occupy)."""
+
+    source_evidence_ids: list[str] = Field(default_factory=list)
+    """Which LOG_FILE evidence items this summary was computed from --
+    provenance, traceable back to real, already-persisted Evidence rows."""
+    analyzed_file_count: int = 0
+    total_events: int = 0
+    level_counts: list[LogEventCount] = Field(default_factory=list)
+    top_exceptions: list[LogEventCount] = Field(default_factory=list)
+    earliest_timestamp: datetime | None = None
+    latest_timestamp: datetime | None = None
+
+
 class CommandFlow(BaseModel):
     """The reconstructed flow for one correlating value (a Command Log
     ID, Meter Number, or Endpoint ID actually found in this

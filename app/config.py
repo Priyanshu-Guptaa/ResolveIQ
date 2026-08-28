@@ -117,12 +117,31 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     """Where the local Ollama daemon is reachable. No environment-specific
     value hardcoded beyond this documented local default."""
-    ollama_model: str = "qwen3:4b"
-    """PROVISIONAL / UNVERIFIED LOCALLY -- Ollama is not installed on the
-    machine this was implemented on, so this tag has not been checked
-    against a real `ollama list`. Fully overridable via
-    RESOLVEIQ_OLLAMA_MODEL; must be verified (or corrected) the first time
-    this runs against a real Ollama instance."""
+    ollama_model: str = "qwen2.5:3b"
+    """Chat Assistant Phase 21 -- switched from ``qwen3:4b``. Phase 11's
+    40-call real statistical baseline measured qwen3:4b at 32.5% success
+    (95% CI [20.1%, 48.0%]), with 60% of calls hitting the
+    ``ollama_num_predict`` cap empty-handed -- a structural property of
+    its "thinking" reasoning phase (Phase 7 proved ``think=false`` does
+    not suppress it in this Ollama build), not fixable by prompt
+    engineering (Phases 9-10 each tried, neither moved the ceiling).
+    ``qwen2.5:3b`` has no documented or observed thinking capability
+    (confirmed via ``ollama show`` -- capabilities are exactly
+    ``completion``, ``tools``, no ``thinking``) and, on the identical
+    fixtures, real-tested at 100% completion (Phase 13: 40/40; Phase 19:
+    40/40 after Rule 8) with 40-100x lower latency (single-digit seconds
+    vs. qwen3:4b's ~208-221s mean/median). Phase 19 additionally found
+    (and Phase 22's structured applicability block, see
+    ``_APPLICABILITY_HEADER``/``_applicability_block`` in
+    ``app/engines/llm/prompt_builder.py``, specifically addresses -- a
+    60-call real-model stress test found the rigid per-field format
+    reaches 100% unknown-customer safety, vs. 70% for Phase 21's
+    free-prose guard) a
+    narrow fabrication risk on "which customer is affected"-style
+    questions when applicability is empty. Fully overridable via
+    RESOLVEIQ_OLLAMA_MODEL. Reverting to ``qwen3:4b`` is a one-line
+    change here -- no other file depends on which model tag is
+    configured (``OllamaProvider`` is fully model-agnostic)."""
     ollama_timeout_seconds: float = 300.0
     """Empirically measured (Phase 3/3A real-Ollama validation, real
     qwen3:4b on this hardware, default/thinking-enabled generation --
