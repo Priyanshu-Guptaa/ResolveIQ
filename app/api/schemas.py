@@ -131,6 +131,21 @@ class ChatEnhancementResponse(BaseModel):
     error: str | None = None
 
 
+class ChatLogUploadResponse(BaseModel):
+    """Chat Assistant Phase 39 -- the response for
+    ``POST /chat/sessions/{session_id}/logs``. Deliberately never
+    includes ``raw_content``, ``log_events``, or ``extracted_entities``
+    -- only enough for the UI to confirm what was attached. The full
+    structured observations reach the answer through the existing,
+    unmodified ``LogIntelligenceEngine.summarize_observations()`` path,
+    not through this response."""
+
+    title: str
+    event_count: int
+    entity_count: int
+    warnings: list[str] = Field(default_factory=list)
+
+
 class InvestigationSummary(BaseModel):
     """Lightweight shape for the investigation list view."""
 

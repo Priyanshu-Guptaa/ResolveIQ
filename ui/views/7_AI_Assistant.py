@@ -77,6 +77,7 @@ if st.session_state.get("chat_session_key") != session_key:
     st.session_state["chat_session_key"] = session_key
     st.session_state["chat_session_id"] = session["id"]
     st.session_state.pop("chat_last_response", None)
+    st.session_state.pop("chat_attached_log", None)
 
 chat_session_id = st.session_state["chat_session_id"]
 
@@ -85,7 +86,36 @@ for msg in messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-user_text = st.chat_input('Ask a question, e.g. "Has this happened before?"')
+# Chat Assistant Phase 39 -- chat-side log upload. Mirrors the
+# Investigation Workspace's own upload pattern (files= via api_post);
+# the uploaded content flows through the existing, unmodified
+# LogIntelligenceEngine, never a second parser. Restricted to the four
+# plain-text log formats the chat-upload endpoint accepts.
+with st.expander("📎 Attach a log file", expanded=False):
+    uploaded_log = st.file_uploader(
+        "Upload a log (.log, .txt, .csv, .json)",
+        type=["log", "txt", "csv", "json"],
+        key="chat_log_uploader",
+    )
+    if uploaded_log and st.button("Attach log", key="chat_log_attach_btn"):
+        with st.spinner("Analyzing log..."):
+            result = api_post(
+                f"/chat/sessions/{chat_session_id}/logs",
+                files=[("file", (uploaded_log.name, uploaded_log.getvalue()))],
+                timeout=120,
+            )
+        if result is not None:
+            st.session_state["chat_attached_log"] = result
+            entity_word = "entity" if result["entity_count"] == 1 else "entities"
+            st.success(f"Attached **{result['title']}** -- {result['event_count']} event(s), {result['entity_count']} recognized {entity_word}.")
+            for warning in result.get("warnings") or []:
+                st.caption(f"⚠️ {warning}")
+
+attached_log = st.session_state.get("chat_attached_log")
+if attached_log:
+    st.caption(f"📎 Log attached to this conversation: **{attached_log['title']}**")
+
+user_text = st.chat_input('Ask a question, e.g. "Has this happened before?" or "Analyze this log"')
 if user_text:
     with st.chat_message("user"):
         st.write(user_text)

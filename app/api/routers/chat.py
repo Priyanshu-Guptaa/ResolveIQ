@@ -8,14 +8,20 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
-from app.api.dependencies import get_chat_enhancement_service, get_chat_orchestrator
-from app.api.schemas import ChatEnhancementResponse, ChatMessageRequest, CreateChatSessionRequest
+from app.api.dependencies import (
+    get_chat_enhancement_service,
+    get_chat_log_upload_service,
+    get_chat_orchestrator,
+    get_investigation_engine,
+)
+from app.api.schemas import ChatEnhancementResponse, ChatLogUploadResponse, ChatMessageRequest, CreateChatSessionRequest
 from app.domain.chat import ChatMessage, ChatResponse, ChatSession
 from app.engines.chat.enhancement import ChatEnhancementService
+from app.engines.chat.log_upload import ChatLogUploadError, ChatLogUploadService, validate_log_upload
 from app.engines.chat.orchestrator import ChatOrchestrator, ChatSessionNotFoundError, EmptyMessageError
-from app.engines.investigation.engine import InvestigationNotFoundError
+from app.engines.investigation.engine import InvestigationEngine, InvestigationNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +76,67 @@ def post_chat_message(
     except Exception as exc:  # noqa: BLE001 -- never leak an internal stack trace to the client
         logger.exception("Chat message handling failed for session %s", session_id)
         raise HTTPException(status_code=500, detail="Internal error while processing the chat message.") from exc
+
+
+@router.post("/sessions/{session_id}/logs", response_model=ChatLogUploadResponse, status_code=201)
+async def upload_chat_log(
+    session_id: str,
+    file: UploadFile = File(...),
+    orchestrator: ChatOrchestrator = Depends(get_chat_orchestrator),
+    investigation_engine: InvestigationEngine = Depends(get_investigation_engine),
+    log_upload_service: ChatLogUploadService = Depends(get_chat_log_upload_service),
+) -> ChatLogUploadResponse:
+    """Chat Assistant Phase 39 -- USER UPLOADS LOG THROUGH CHAT. The
+    uploaded content is DATA, never an instruction: it is handed
+    unmodified to the existing Evidence Ingestion Pipeline and the
+    existing ``LogIntelligenceEngine`` -- never executed, never
+    interpolated into a prompt or filesystem path, never persisted to
+    disk. Two paths, both reusing existing, unmodified engines:
+
+    * Investigation-scoped session -> ``InvestigationEngine.
+      add_file_evidence`` (the exact same call the Investigation
+      Workspace's own upload button already makes), so the log becomes
+      real, persisted evidence on that investigation.
+    * Standalone session -> ``ChatLogUploadService`` (Phase 39, new --
+      see ``app/engines/chat/log_upload.py``), an in-memory, per-session
+      registry, since a standalone chat session has no real, persisted
+      investigation to attach evidence to.
+
+    Either way, ``ChatOrchestrator._resolve_investigation_for_
+    retrieval`` picks the resulting evidence up automatically on the
+    next chat turn -- no other orchestration change was needed.
+    """
+    session = orchestrator.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"No such chat session: {session_id}")
+
+    content = await file.read()
+    filename = file.filename or "upload"
+    try:
+        validate_log_upload(filename, content)
+    except ChatLogUploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        if session.investigation_id is not None:
+            evidence = investigation_engine.add_file_evidence(session.investigation_id, filename, content)[0]
+        else:
+            evidence = log_upload_service.upload(session_id, filename, content)
+    except InvestigationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"No such investigation: {exc}") from exc
+    except ChatLogUploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 -- never leak an internal stack trace to the client
+        logger.exception("Chat log upload failed for session %s", session_id)
+        raise HTTPException(status_code=500, detail="Internal error while processing the uploaded log.") from exc
+
+    warnings = [w.get("message", "") for w in evidence.metadata.get("warnings", []) if isinstance(w, dict)]
+    return ChatLogUploadResponse(
+        title=evidence.title,
+        event_count=len(evidence.log_events),
+        entity_count=len(evidence.extracted_entities),
+        warnings=[w for w in warnings if w],
+    )
 
 
 @router.get("/enhancements/{job_id}", response_model=ChatEnhancementResponse)

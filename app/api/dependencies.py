@@ -18,6 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from app.config import Settings, get_settings
 from app.engines.chat.conversation_state import ConversationStateEngine
 from app.engines.chat.enhancement import ChatEnhancementService
+from app.engines.chat.log_upload import ChatLogUploadService
 from app.engines.chat.orchestrator import ChatOrchestrator
 from app.engines.ingestion.engine import IngestionEngine
 from app.engines.ingestion.file_type_registry import FileTypeRegistry
@@ -409,6 +410,23 @@ def get_chat_enhancement_service() -> ChatEnhancementService:
     return _chat_enhancement_service()
 
 
+@lru_cache
+def _chat_log_upload_service() -> ChatLogUploadService:
+    """Chat Assistant Phase 39 -- a process-lifetime singleton, same
+    ``lru_cache`` idiom as ``_chat_enhancement_service()`` above and for
+    the same reason: an upload attached to one standalone chat session
+    must remain visible to that session's later turns, each served by a
+    freshly-constructed ``ChatOrchestrator``. Reuses the already-
+    existing ``_ingestion_engine()``/``_log_intelligence_engine()``
+    singletons unmodified -- no new parsing/analysis logic is
+    introduced here, only the session-registry bridge."""
+    return ChatLogUploadService(_ingestion_engine(), _log_intelligence_engine())
+
+
+def get_chat_log_upload_service() -> ChatLogUploadService:
+    return _chat_log_upload_service()
+
+
 def get_chat_orchestrator() -> ChatOrchestrator:
     settings = get_settings()
     llm = _llm_provider() if settings.llm_enabled else None
@@ -420,6 +438,7 @@ def get_chat_orchestrator() -> ChatOrchestrator:
         llm,
         enhancement_service,
         settings.llm_async_enabled,
+        _chat_log_upload_service(),
     )
 
 

@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from app.domain.structured_resolution import StructuredResolution
     from app.engines.chat.conversation_state import ConversationStateEngine
     from app.engines.chat.enhancement import ChatEnhancementService
+    from app.engines.chat.log_upload import ChatLogUploadService
     from app.engines.investigation.engine import InvestigationEngine
     from app.engines.llm.provider import LLMProvider
     from app.engines.recommendation.engine import RecommendationEngine
@@ -171,6 +172,7 @@ class ChatOrchestrator:
         llm_provider: "LLMProvider | None" = None,
         enhancement_service: "ChatEnhancementService | None" = None,
         async_enabled: bool = False,
+        log_upload_service: "ChatLogUploadService | None" = None,
     ) -> None:
         self._state = state_engine
         self._recommend = recommendation_engine
@@ -198,6 +200,19 @@ class ChatOrchestrator:
         handle_message() return the deterministic answer immediately
         and schedule LLM generation as a background job instead --
         see _should_enhance_asynchronously()."""
+        self._log_upload_service = log_upload_service
+        """Chat Assistant Phase 39 -- None (default) means the standalone
+        branch of _resolve_investigation_for_retrieval behaves byte-
+        identical to every prior phase: no session-uploaded log evidence
+        exists to inject. Only wired via DI (app/api/dependencies.py)
+        alongside the new POST /chat/sessions/{session_id}/logs endpoint.
+        Investigation-scoped sessions never consult this service -- a
+        chat-uploaded log for a real investigation is persisted straight
+        into that investigation's own evidence via
+        InvestigationEngine.add_file_evidence (the existing, unmodified
+        Workspace upload path), so it is already present the next time
+        this method re-fetches that real investigation below; no
+        orchestrator change was needed for that branch."""
 
     # --- Session lifecycle (thin passthrough to ConversationStateEngine) ----
 
@@ -424,6 +439,17 @@ class ChatOrchestrator:
                     raw_content="\n".join(user_texts),
                 )
             )
+        if self._log_upload_service is not None:
+            # Chat Assistant Phase 39 -- any log(s) uploaded through this
+            # standalone session's own chat-log-upload endpoint. Additive
+            # only: with no service wired, or nothing uploaded yet, this
+            # is a no-op and `synthesized` is unchanged from every prior
+            # phase. Each Evidence here was already run through the
+            # existing, unmodified LogIntelligenceEngine at upload time
+            # (see ChatLogUploadService.upload) -- summarize_observations()
+            # below picks it up automatically, no further change needed.
+            for evidence in self._log_upload_service.get_evidence_for_session(session.id):
+                synthesized.add_evidence(evidence)
         return synthesized, None
 
     # --- Answer generation (Chat Assistant Phase 1 -- Qwen 4B/Ollama) ----------
