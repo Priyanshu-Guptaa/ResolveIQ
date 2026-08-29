@@ -1759,3 +1759,107 @@ def test_phase44_multipart_scope_fabrication_replay_is_rejected_and_falls_back(b
     assert "this issue affects other customers" not in response.answer_text.lower()
     assert _PHASE44_MULTIPART_UNSAFE_OUTPUT not in response.answer_text
     assert response.answer_text  # a real, non-empty deterministic answer is still returned
+
+
+# --- H. Phase 46 -- Rule 9 output-side troubleshooting-action guard ---------
+# --- (app.engines.chat.troubleshooting_expansion), closing the exact gap ---
+# --- Phase 45's replay found: a differently-phrased troubleshooting       --
+# --- question bypasses the input-side clause removal, reaches the LLM,   --
+# --- and the raw output was previously returned to the user unchecked.   --
+#
+# Rule 11 regression (Test E), Rule 8/unknown-handling regression (Test F),
+# and the exact original THIN question still skipping the LLM entirely
+# (Test G) are already covered by the existing, unmodified tests above
+# (test_phase44_multipart_scope_fabrication_replay_is_rejected_and_falls_back,
+# test_unknown_does_not_invent_a_resolution,
+# test_confirmed_never_from_similarity_alone,
+# test_phase44_thin_fabrication_replay_llm_never_even_called,
+# test_troubleshooting_only_question_skips_the_llm_entirely) -- re-run as
+# part of this same regression suite, not duplicated here.
+
+_PHASE45_BYPASS_QUESTIONS = [
+    "What can I do to resolve this?",
+    "How should I troubleshoot this issue?",
+    "What are the next troubleshooting steps?",
+    "What action should I take?",
+    "How can I investigate this problem?",
+]
+
+
+def _zero_checks_orchestrator_with_llm(bundle, llm) -> ChatOrchestrator:
+    """A zero-evidence-backed-checks fixture (root_cause present, but
+    resolution/next_step empty, so available_checks(structured) is
+    empty) that DOES reach the LLM for a non-matching question --
+    unlike the exact original "What should I check?" phrasing, which
+    the existing input-side guard removes entirely before the LLM is
+    ever called (see test_phase44_thin_fabrication_replay_llm_never_
+    even_called and test_troubleshooting_only_question_skips_the_llm_
+    entirely above, both using this identical fixture shape)."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo, resolution="", next_step="")
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    return _orchestrator_with_llm(bundle, llm)
+
+
+def test_phase46_exact_phase44_unsafe_output_blocked_via_bypass_question(bundle):
+    """Test A (Phase 46) -- the exact captured Phase 44 unsafe response,
+    via a bypass phrasing that reaches the LLM (the original verbatim
+    question never reaches it at all, per Test G above)."""
+    llm = FakeLLMProvider(configured=True, response=_PHASE44_THIN_UNSAFE_OUTPUT)
+    orchestrator = _zero_checks_orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "What action should I take?")
+
+    assert llm.last_prompt is not None  # this phrasing DOES reach the LLM, unlike Test G
+    assert "ensure it is properly configured" not in response.answer_text.lower()
+    assert "check the rf mesh ip command" not in response.answer_text.lower()
+    assert response.answer_text  # a real, non-empty deterministic fallback is still returned
+
+
+def test_phase46_all_five_bypass_questions_are_blocked(bundle):
+    """Test B (Phase 46) -- every Phase 45 bypass phrasing, individually,
+    with the exact captured unsafe output scripted for each."""
+    for question in _PHASE45_BYPASS_QUESTIONS:
+        llm = FakeLLMProvider(configured=True, response=_PHASE44_THIN_UNSAFE_OUTPUT)
+        orchestrator = _zero_checks_orchestrator_with_llm(bundle, llm)
+        session = orchestrator.create_session()
+        response = orchestrator.handle_message(session.id, question)
+
+        assert llm.last_prompt is not None, question  # confirms this phrasing really does reach the LLM
+        assert "ensure it is properly configured" not in response.answer_text.lower(), question
+        assert "check the rf mesh ip command" not in response.answer_text.lower(), question
+        assert response.answer_text, question
+
+
+def test_phase46_positive_control_evidence_backed_check_survives(bundle):
+    """Test C (Phase 46) -- when genuine evidence-backed checks DO
+    exist, the new guard must never reject legitimate troubleshooting
+    content (available_checks(structured) is non-empty, so the guard is
+    never even consulted -- see _attempt_llm_answer's own condition)."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo)  # real root_cause/resolution/next_step (unmodified defaults)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(
+        configured=True,
+        response="You should restart the collector service and confirm the collector's route table is restored.",
+    )
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "What action should I take?")
+
+    assert llm.last_prompt is not None
+    assert "restart the collector service" in response.answer_text.lower()
+
+
+def test_phase46_safe_non_troubleshooting_output_is_not_rejected(bundle):
+    """Test D (Phase 46) -- a safe, non-troubleshooting answer with zero
+    evidence-backed checks must never be rejected merely because the
+    new guard exists (no unsupported phrase is present in this text)."""
+    llm = FakeLLMProvider(configured=True, response="Unknown. The available evidence does not establish a cause.")
+    orchestrator = _zero_checks_orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "What action should I take?")
+
+    assert llm.last_prompt is not None
+    assert "the available evidence does not establish a cause" in response.answer_text.lower()

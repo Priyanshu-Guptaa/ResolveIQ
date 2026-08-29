@@ -56,6 +56,7 @@ from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
 from app.engines.chat.scope_expansion import contains_unsupported_scope_expansion
 from app.engines.chat.scope_question import split_out_scope_clause
+from app.engines.chat.troubleshooting_expansion import contains_unsupported_troubleshooting_action
 from app.engines.chat.troubleshooting_question import split_out_troubleshooting_clause
 from app.engines.investigation.engine import InvestigationNotFoundError
 from app.engines.llm.prompt_builder import PromptBuilder, available_checks
@@ -590,17 +591,20 @@ class ChatOrchestrator:
 
         Returns the validated answer text on success. Returns ``None``
         specifically when generation succeeded but the RAW output failed
-        Phase 35B's customer-scope-expansion gate
-        (``contains_unsupported_scope_expansion`` -- checked here, on
-        the raw text, before any deterministic statement is appended,
-        exactly as Phase 35B established) -- the caller's job in either
-        case is to fall back to the deterministic answer, never to
-        rewrite the rejected text into a new claim. Raises
-        ``LLMProviderError`` (unchanged, from ``_generate_llm_answer``/
-        ``OllamaProvider``) for a genuine provider failure -- connection,
-        timeout, empty response, malformed response -- which every
-        caller must also treat as "fall back to the deterministic
-        answer," exactly as this project always has."""
+        either of two deterministic post-generation gates -- Phase 35B's
+        customer-scope-expansion gate (``contains_unsupported_scope_
+        expansion``) or Phase 46's troubleshooting-action gate
+        (``contains_unsupported_troubleshooting_action``, checked only
+        when zero evidence-backed checks exist) -- both checked here, on
+        the raw text, before any deterministic statement is appended.
+        The caller's job in every rejection case is to fall back to the
+        deterministic answer, never to rewrite the rejected text into a
+        new claim. Raises ``LLMProviderError`` (unchanged, from
+        ``_generate_llm_answer``/``OllamaProvider``) for a genuine
+        provider failure -- connection, timeout, empty response,
+        malformed response -- which every caller must also treat as
+        "fall back to the deterministic answer," exactly as this
+        project always has."""
         answer_text = self._generate_llm_answer(question, structured, log_observations)
         if contains_unsupported_scope_expansion(answer_text):
             # Chat Assistant Phase 35B -- deterministic post-generation
@@ -624,6 +628,32 @@ class ChatOrchestrator:
             logger.warning(
                 "LLM answer contained an unsupported customer-scope expansion claim; "
                 "falling back to deterministic answer."
+            )
+            return None
+        if not available_checks(structured) and contains_unsupported_troubleshooting_action(answer_text):
+            # Chat Assistant Phase 46 -- the troubleshooting analogue of
+            # the gate directly above, gated on "zero evidence-backed
+            # checks exist for this answer" exactly as
+            # troubleshooting_question.py's own INPUT-side removal
+            # already requires (see that module's docstring). Phase 32's
+            # clause-removal only helps when the question text itself
+            # matches its closed phrase table; Phase 45's real qwen2.5:3b
+            # replay found that a differently-phrased troubleshooting
+            # request ("What action should I take?", "How can I
+            # investigate this problem?", and others) bypasses that
+            # table entirely, reaches the LLM, and its raw, unprotected
+            # output can contain exactly the generic, non-evidence-backed
+            # suggestion ("ensure it is properly configured") Rule 9's
+            # own prompt text already tells the model never to
+            # substitute. This is the same "prevent, don't just
+            # instruct" principle as the scope gate above, applied to
+            # the one input path that gate does not cover. Never checked
+            # when real evidence-backed checks exist -- a legitimate
+            # answer is never rejected merely for containing
+            # troubleshooting language.
+            logger.warning(
+                "LLM answer contained an unsupported generic troubleshooting action with no "
+                "evidence-backed checks available; falling back to deterministic answer."
             )
             return None
         return answer_text
