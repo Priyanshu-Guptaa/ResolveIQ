@@ -28,6 +28,12 @@ from __future__ import annotations
 
 import streamlit as st
 from api_client import api_get, api_post, ensure_api_available
+from components.chat_attachments import (
+    format_enhancement_status,
+    format_eviction_notice,
+    persistence_message,
+    record_log_attachment,
+)
 from components.external_knowledge import render_external_knowledge
 from components.historical_match import render_historical_match
 from components.investigation_picker import render_investigation_picker
@@ -77,7 +83,10 @@ if st.session_state.get("chat_session_key") != session_key:
     st.session_state["chat_session_key"] = session_key
     st.session_state["chat_session_id"] = session["id"]
     st.session_state.pop("chat_last_response", None)
-    st.session_state.pop("chat_attached_log", None)
+    st.session_state.pop("chat_log_attachments", None)
+    st.session_state.pop("chat_log_eviction_notice", None)
+    st.session_state.pop("chat_enhancement_job_id", None)
+    st.session_state.pop("chat_enhancement_result", None)
 
 chat_session_id = st.session_state["chat_session_id"]
 
@@ -91,6 +100,15 @@ for msg in messages:
 # the uploaded content flows through the existing, unmodified
 # LogIntelligenceEngine, never a second parser. Restricted to the four
 # plain-text log formats the chat-upload endpoint accepts.
+#
+# Chat Assistant Phase 42 -- shows the FULL retained attachment list
+# (up to 5), not just the most recent upload (Phase 41 audit finding).
+# The FIFO cap (`app.engines.chat.log_upload._MAX_LOGS_PER_SESSION`)
+# only applies server-side to standalone sessions -- an
+# investigation-scoped upload goes through
+# InvestigationEngine.add_file_evidence, which has no cap at all -- so
+# `capped` below must track the real backend contract per session type,
+# never fabricate an eviction that did not actually happen.
 with st.expander("📎 Attach a log file", expanded=False):
     uploaded_log = st.file_uploader(
         "Upload a log (.log, .txt, .csv, .json)",
@@ -105,15 +123,38 @@ with st.expander("📎 Attach a log file", expanded=False):
                 timeout=120,
             )
         if result is not None:
-            st.session_state["chat_attached_log"] = result
+            existing_attachments = st.session_state.get("chat_log_attachments", [])
+            updated_attachments, evicted = record_log_attachment(
+                existing_attachments, result, capped=(scope == "Standalone")
+            )
+            st.session_state["chat_log_attachments"] = updated_attachments
+            # Overwritten on every upload attempt (never left stale from an
+            # earlier upload) -- always None when this upload didn't evict
+            # anything, so the notice can never outlive its own cause.
+            st.session_state["chat_log_eviction_notice"] = format_eviction_notice(evicted)
             entity_word = "entity" if result["entity_count"] == 1 else "entities"
             st.success(f"Attached **{result['title']}** -- {result['event_count']} event(s), {result['entity_count']} recognized {entity_word}.")
             for warning in result.get("warnings") or []:
                 st.caption(f"⚠️ {warning}")
 
-attached_log = st.session_state.get("chat_attached_log")
-if attached_log:
-    st.caption(f"📎 Log attached to this conversation: **{attached_log['title']}**")
+    attachments = st.session_state.get("chat_log_attachments", [])
+    if attachments:
+        st.markdown(f"**{len(attachments)} log(s) currently attached to this chat:**")
+        for item in attachments:
+            item_entity_word = "entity" if item.get("entity_count") == 1 else "entities"
+            st.caption(
+                f"📎 {item['title']} -- {item.get('event_count', 0)} event(s), "
+                f"{item.get('entity_count', 0)} recognized {item_entity_word}"
+            )
+        st.caption(persistence_message(investigation_scoped=(scope == "Investigation")))
+
+eviction_notice = st.session_state.get("chat_log_eviction_notice")
+if eviction_notice:
+    st.warning(eviction_notice)
+
+if attachments:
+    attachment_names = ", ".join(item["title"] for item in attachments)
+    st.caption(f"📎 {len(attachments)} log(s) attached to this conversation: {attachment_names}")
 
 user_text = st.chat_input('Ask a question, e.g. "Has this happened before?" or "Analyze this log"')
 if user_text:
@@ -123,6 +164,12 @@ if user_text:
         response = api_post(f"/chat/sessions/{chat_session_id}/messages", {"message": user_text})
     if response is not None:
         st.session_state["chat_last_response"] = response
+        # Chat Assistant Phase 42 -- a new turn always starts a fresh
+        # enhancement lifecycle: any earlier turn's job/result belonged to
+        # a different answer and must never be shown attached to this one.
+        enhancement_ref = response.get("enhancement")
+        st.session_state["chat_enhancement_job_id"] = enhancement_ref["job_id"] if enhancement_ref else None
+        st.session_state["chat_enhancement_result"] = None
     st.rerun()
 
 response = st.session_state.get("chat_last_response")
@@ -131,6 +178,37 @@ if response is None:
 
 with st.chat_message("assistant"):
     st.write(response["answer_text"])
+
+    # Chat Assistant Phase 42 -- surface the existing async LLM
+    # enhancement (Phase 37/38 backend, previously never rendered here).
+    # The deterministic answer above is ALWAYS shown and is never
+    # replaced or reworded by anything below -- this is presentation
+    # enhancement only, never a second source of truth for confidence,
+    # provenance, or resolution. Bounded polling: at most one
+    # GET /chat/enhancements/{job_id} call per script rerun, no loop, no
+    # sleep -- a still-pending job is checked again only on the next
+    # natural rerun (a new message, an upload, or the button below).
+    enhancement_job_id = st.session_state.get("chat_enhancement_job_id")
+    if enhancement_job_id:
+        poll_result = api_get(f"/chat/enhancements/{enhancement_job_id}")
+        outcome = format_enhancement_status(poll_result)
+        if outcome["outcome"] != "pending":
+            st.session_state["chat_enhancement_result"] = outcome
+            st.session_state["chat_enhancement_job_id"] = None  # terminal -- stop polling this job
+
+    enhancement_result = st.session_state.get("chat_enhancement_result")
+    if enhancement_result is not None:
+        if enhancement_result["outcome"] == "completed":
+            st.info(
+                "✨ **AI-enhanced phrasing** _(same evidence, confidence, and root cause as above -- "
+                f"this only rewords it)_:\n\n{enhancement_result['answer_text']}"
+            )
+        else:
+            st.caption(f"AI-enhanced phrasing unavailable: {enhancement_result['message']}")
+    elif st.session_state.get("chat_enhancement_job_id"):
+        st.caption("⏳ AI-enhanced phrasing is still being generated...")
+        if st.button("🔄 Check for AI-enhanced answer", key="chat_enhancement_check_btn"):
+            st.rerun()
 
     ctx = response.get("active_context") or {}
     context_bits = [
