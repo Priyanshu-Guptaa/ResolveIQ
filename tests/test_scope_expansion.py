@@ -96,3 +96,54 @@ def test_named_region_pattern_requires_both_customers_and_region_words():
     assert not contains_unsupported_scope_expansion("The customer is in APAC.")
     assert contains_unsupported_scope_expansion("This affected customers in the APAC region.")
     assert contains_unsupported_scope_expansion("This affected customers across the EMEA region.")
+
+
+# --- Phase 45 -- replay of the exact real qwen2.5:3b outputs captured in ----
+# --- Phase 44's real-Ollama smoke test (single-customer TEPCO fixture,      ---
+# --- question: "Has this happened before, and does this affect other       ---
+# --- customers?"). Verbatim text, not paraphrased or reconstructed.        ---
+
+
+def test_detects_the_exact_phase_44_multipart_run_1_output():
+    text = (
+        "Has this happened before for TEPCO in APAC? This issue affects other customers. "
+        "The root cause identified is a Collector lost network route to the mesh gateway. "
+        "The recommended resolution is to Restart the Collector service. The validation "
+        "step confirmed is to Confirm the Collector's route table is restored. The "
+        "applicable customer is TEPCO, the applicable region is APAC, the applicable "
+        "component is Network Hub, and the applicable technology is RF Mesh IP. The "
+        "confidence level is Likely."
+    )
+    assert contains_unsupported_scope_expansion(text)
+
+
+def test_detects_the_exact_phase_44_multipart_run_2_output():
+    """Run 2's phrasing never says 'yes' outright, but still ends with
+    the same unsupported 'other customers' language -- the gate is not
+    required to parse grammatical ambiguity, only to catch the phrase."""
+    text = (
+        "Has this happened before for customer TEPCO in the APAC region? This issue "
+        "affects the Network Hub component using RF Mesh IP technology. The collector "
+        "lost its network route to the mesh gateway, leading to an RF Mesh IP command "
+        "timeout. The root cause is a collector lost network route to the mesh gateway, "
+        "and the resolution is to restart the collector service. Validation steps "
+        "include confirming the collector's route table is restored. Evidence-backed "
+        "checks are restarting the collector service and confirming the collector's "
+        "route table is restored. The confidence level for this issue affecting other "
+        "customers is Likely."
+    )
+    assert contains_unsupported_scope_expansion(text)
+
+
+def test_detects_the_exact_phase_44_multipart_run_3_output():
+    text = (
+        "Has this happened before for TEPCO in APAC with component Network Hub using "
+        "technology RF Mesh IP? This issue affects other customers as evidenced by the "
+        "collected data. The root cause identified is a Collector lost network route to "
+        "the mesh gateway. The resolution recommended is to restart the Collector "
+        "service, which has been validated by confirming the Collector's route table is "
+        "restored. No additional evidence-backed troubleshooting checks are required "
+        "beyond what has been provided. The confidence level for this issue affecting "
+        "other customers is likely based on the available evidence."
+    )
+    assert contains_unsupported_scope_expansion(text)

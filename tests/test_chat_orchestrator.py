@@ -1657,3 +1657,105 @@ def test_standalone_chat_log_upload_deterministic_without_llm(bundle):
 
     assert response.answer_text
     assert response.enhancement is None
+
+
+# --- G. Phase 45 -- replay the exact real qwen2.5:3b failures captured in --
+# --- Phase 44's real-Ollama smoke test through the real ChatOrchestrator   --
+# --- production path, via FakeLLMProvider scripted with the VERBATIM real --
+# --- text (never paraphrased). No new real Ollama calls are made here --   --
+# --- this deterministically answers whether the existing safety gates     --
+# --- would have intercepted these two specific real failures before a     --
+# --- real user ever saw them.
+
+_PHASE44_THIN_UNSAFE_OUTPUT = (
+    "You should check the RF Mesh IP command and ensure it is properly configured. "
+    "There are no evidence-backed checks provided, so no specific troubleshooting "
+    "actions can be determined from the supplied information."
+)
+
+_PHASE44_MULTIPART_UNSAFE_OUTPUT = (
+    "Has this issue happened before for TEPCO in APAC? This issue affects other customers. "
+    "The root cause identified is a Collector lost network route to the mesh gateway. "
+    "The recommended resolution is to Restart the Collector service. The validation step "
+    "confirmed is to Confirm the Collector's route table is restored. The applicable "
+    "customer is TEPCO, the applicable region is APAC, the applicable component is Network "
+    "Hub, and the applicable technology is RF Mesh IP. The confidence level is Likely."
+)
+
+
+def test_phase44_thin_fabrication_replay_llm_never_even_called(bundle):
+    """Test A (Phase 45) -- THIN troubleshooting-fabrication replay.
+
+    Real Phase 44 fixture: zero resolution candidates, zero validation
+    steps (AVAILABLE EVIDENCE-BACKED CHECKS = NONE), question verbatim
+    "What should I check?" -- the exact fixture/question pair that
+    produced the real, captured unsafe qwen2.5:3b output above.
+
+    Finding: "What should I check?" is a whole-phrase match in
+    TROUBLESHOOTING_PHRASES (app.engines.chat.troubleshooting_question),
+    and with zero evidence-backed checks available, ChatOrchestrator's
+    own _prepare_question removes the ENTIRE question as the
+    troubleshooting clause -- nothing non-troubleshooting remains to ask
+    the LLM, so _generate_answer's own guard
+    ("(had_scope or had_troubleshooting) and not sanitized_question")
+    short-circuits straight to the deterministic answer and the LLM is
+    NEVER INVOKED AT ALL. This is a stronger guarantee than a
+    post-generation filter: the fabrication has no opportunity to be
+    generated in the first place for this exact real scenario."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo, resolution="", next_step="")
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(configured=True, response=_PHASE44_THIN_UNSAFE_OUTPUT)
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "What should I check?")
+
+    assert llm.last_prompt is None  # the LLM was never called -- generate() was never invoked
+    assert "ensure it is properly configured" not in response.answer_text.lower()
+    assert "check the rf mesh ip command" not in response.answer_text.lower()
+    assert "No evidence-backed troubleshooting check can be determined" in response.answer_text
+
+
+def test_phase44_multipart_scope_fabrication_replay_is_rejected_and_falls_back(bundle):
+    """Test B (Phase 45) -- cross-customer scope-fabrication replay.
+
+    Real Phase 44 fixture: single customer (TEPCO) in APPLICABILITY,
+    question verbatim "Has this happened before, and does this affect
+    other customers?" -- the exact fixture/question pair that produced
+    the real, captured unsafe qwen2.5:3b output above (run 1, byte-for-
+    byte).
+
+    Unlike THIN, this question's scope clause ("does this affect other
+    customers") IS removed from the LLM's input by
+    split_out_scope_clause before generation (input-side protection,
+    Phase 31) -- but the LLM is still called with the remaining
+    non-scope question, since something real is still left to ask. This
+    test proves the SECOND, independent layer: even when the (stubbed)
+    LLM spontaneously returns the real captured unsafe text regardless
+    of what it was actually asked, ChatOrchestrator._attempt_llm_answer
+    calls contains_unsupported_scope_expansion() on the raw output
+    BEFORE any deterministic statement is appended, rejects it, and
+    falls back to the existing, unchanged deterministic answer -- the
+    unsafe text never reaches the user."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(configured=True, response=_PHASE44_MULTIPART_UNSAFE_OUTPUT)
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(
+        session.id, "Has this happened before, and does this affect other customers?"
+    )
+
+    # The LLM WAS called (something real remained to ask), but never saw the
+    # scope clause itself (Phase 31's existing input-side protection).
+    assert llm.last_prompt is not None
+    assert "other customers" not in llm.last_prompt.lower()
+    # The decisive Phase 45 finding: the real captured unsafe text is
+    # rejected wholesale and never reaches the user, in favor of the
+    # existing deterministic fallback.
+    assert "this issue affects other customers" not in response.answer_text.lower()
+    assert _PHASE44_MULTIPART_UNSAFE_OUTPUT not in response.answer_text
+    assert response.answer_text  # a real, non-empty deterministic answer is still returned
