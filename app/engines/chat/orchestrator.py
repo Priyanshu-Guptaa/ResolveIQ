@@ -54,6 +54,7 @@ from app.domain.evidence import Evidence
 from app.domain.investigation import InvestigationSession
 from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
+from app.engines.chat.confidence_expansion import contains_unsupported_confidence_claim
 from app.engines.chat.scope_expansion import contains_unsupported_scope_expansion
 from app.engines.chat.scope_question import split_out_scope_clause
 from app.engines.chat.troubleshooting_expansion import contains_unsupported_troubleshooting_action
@@ -591,21 +592,45 @@ class ChatOrchestrator:
 
         Returns the validated answer text on success. Returns ``None``
         specifically when generation succeeded but the RAW output failed
-        either of two deterministic post-generation gates -- Phase 35B's
-        customer-scope-expansion gate (``contains_unsupported_scope_
-        expansion``) or Phase 46's troubleshooting-action gate
-        (``contains_unsupported_troubleshooting_action``, checked only
-        when zero evidence-backed checks exist) -- both checked here, on
-        the raw text, before any deterministic statement is appended.
-        The caller's job in every rejection case is to fall back to the
-        deterministic answer, never to rewrite the rejected text into a
-        new claim. Raises ``LLMProviderError`` (unchanged, from
+        any of three deterministic post-generation gates -- Phase 49's
+        confidence-upgrade gate (``contains_unsupported_confidence_
+        claim``), Phase 35B's customer-scope-expansion gate
+        (``contains_unsupported_scope_expansion``), or Phase 46's
+        troubleshooting-action gate (``contains_unsupported_
+        troubleshooting_action``, checked only when zero evidence-backed
+        checks exist) -- all three checked here, on the raw text, before
+        any deterministic statement is appended. The caller's job in
+        every rejection case is to fall back to the deterministic
+        answer, never to rewrite the rejected text into a new claim.
+        Raises ``LLMProviderError`` (unchanged, from
         ``_generate_llm_answer``/``OllamaProvider``) for a genuine
         provider failure -- connection, timeout, empty response,
         malformed response -- which every caller must also treat as
         "fall back to the deterministic answer," exactly as this
         project always has."""
         answer_text = self._generate_llm_answer(question, structured, log_observations)
+        if contains_unsupported_confidence_claim(answer_text, structured.confidence):
+            # Chat Assistant Phase 49 -- deterministic post-generation
+            # gate, checked first (before the scope/troubleshooting gates
+            # below) on the RAW LLM text, before any deterministic
+            # statement is appended. Phase 48's real 140-call qwen2.5:3b
+            # benchmark found a real, live case -- "Has this happened
+            # before? Confirmed." -- answered against a fixture whose
+            # authoritative structured.confidence was LIKELY, not
+            # CONFIRMED, reaching the simulated user with no protection
+            # (Rule 4 was, until this phase, a prompt-only instruction --
+            # see prompt_builder.py rule 4 -- with no deterministic
+            # backstop, unlike Rule 9/Rule 11). Same "prevent, don't just
+            # instruct" principle as both gates below: rejecting the
+            # whole answer and falling back to the existing, unchanged
+            # deterministic path -- which always renders the correct
+            # tier via the same, unmodified _compose_answer -- rather
+            # than rewriting the claim.
+            logger.warning(
+                "LLM answer contained an unsupported confidence-upgrade claim "
+                "('confirmed'/'verified' below the Confirmed tier); falling back to deterministic answer."
+            )
+            return None
         if contains_unsupported_scope_expansion(answer_text):
             # Chat Assistant Phase 35B -- deterministic post-generation
             # gate, checked on the RAW LLM text before any deterministic

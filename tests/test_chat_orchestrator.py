@@ -1895,3 +1895,65 @@ def test_phase47_troubleshoot_this_issue_phrasing_now_skips_the_llm_entirely(bun
     assert llm.last_prompt is None  # the LLM was never called
     assert "should never be returned" not in response.answer_text
     assert "No evidence-backed troubleshooting check can be determined" in response.answer_text
+
+
+# --- I. Phase 49 -- Rule 4 output-side confidence-upgrade guard replay ------
+# --- (app.engines.chat.confidence_expansion), closing the exact real gap ---
+# --- Phase 48's 140-call qwen2.5:3b benchmark found: "Has this happened   --
+# --- before? Confirmed." reached the simulated user against a LIKELY-tier --
+# --- fixture, with no deterministic protection.
+
+_PHASE48_CONFIRMED_OVERCLAIM_OUTPUT = "Has this happened before? Confirmed."
+
+
+def test_phase48_confirmed_overclaim_replay_is_rejected_and_falls_back(bundle):
+    """Replays the exact real Phase 48 captured text through the real
+    ChatOrchestrator via a FakeLLMProvider -- the fixture's authoritative
+    confidence is LIKELY (real historical match, real root cause, real
+    resolution), never CONFIRMED, so the bare 'Confirmed.' answer must
+    be rejected wholesale and the deterministic fallback (which correctly
+    renders the real LIKELY-tier text) returned instead."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(configured=True, response=_PHASE48_CONFIRMED_OVERCLAIM_OUTPUT)
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "Has this happened before?")
+
+    assert llm.last_prompt is not None  # the LLM was called
+    assert response.answer_text != _PHASE48_CONFIRMED_OVERCLAIM_OUTPUT
+    assert "confirmed" not in response.answer_text.lower()
+    assert response.resolution_provenance is not None
+    assert response.resolution_provenance.value == "likely"  # the real, unmodified deterministic tier
+    assert response.answer_text  # a real, non-empty deterministic answer is still returned
+
+
+def test_phase49_confirmed_tier_fixture_allows_confirmed_language(bundle):
+    """Positive control -- a genuinely CONFIRMED-tier answer must not be
+    rejected merely for containing 'confirmed'. This project's real
+    fixtures reach CONFIRMED only via cross-source corroboration or an
+    explicit human-verified record; rather than fabricate one through
+    the full retrieval pipeline, this test directly exercises the same
+    _attempt_llm_answer path the orchestrator uses, with a real CONFIRMED
+    StructuredResolution built the same way RecommendationEngine itself
+    would represent one."""
+    from app.domain.provenance import EvidenceKind, EvidenceReference, ResolutionProvenance
+    from app.domain.structured_resolution import ApplicabilitySummary, StructuredResolution
+
+    structured = StructuredResolution(
+        source_kind="historical_investigation", source_id="hi-1", problem="RF Mesh IP command timeout",
+        symptoms="Meters stopped responding.", applicability=ApplicabilitySummary(),
+        root_cause="Collector lost network route to the mesh gateway.",
+        root_cause_evidence=[
+            EvidenceReference(kind=EvidenceKind.HISTORICAL_INVESTIGATION, source_id="hi-1", title="x", reason="r", score=0.9)
+        ],
+        resolution_candidates=[], validation_steps=[], confidence=ResolutionProvenance.CONFIRMED,
+        confidence_rationale="Cross-source corroboration.",
+    )
+    llm = FakeLLMProvider(configured=True, response="This is confirmed based on two independent sources.")
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    result = orchestrator._attempt_llm_answer("Has this happened before?", structured, None)
+
+    assert result == "This is confirmed based on two independent sources."  # never rejected
