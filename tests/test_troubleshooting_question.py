@@ -119,3 +119,84 @@ def test_combined_with_scope_clause_removal_preserves_remaining_parts():
     assert had_scope is True
     assert had_troubleshooting is True
     assert remaining == ""
+
+
+# --- Chat Assistant Phase 47 -- "how (do/should) i troubleshoot this <noun>" -
+# --- input-parsing fix. Reproduced real bug: the closed phrase table only  --
+# --- had "how should i troubleshoot this" (bare "this"), so a natural      --
+# --- phrasing like "...this issue?" left the meaningless remainder         --
+# --- "issue?" rather than being recognized as a complete troubleshooting-  --
+# --- only question. Already fully mitigated for SAFETY by Phase 46's       --
+# --- output-side guard (which runs regardless of what question text        --
+# --- reaches the LLM) -- this fix is a quality/completeness improvement    --
+# --- to the input-side detector, not a new safety mechanism.
+
+
+def test_troubleshoot_this_issue_phrasing_is_recognized_completely():
+    """Test A/B/C (Phase 47) -- the exact reported phrasing is now
+    detected, leaves NO meaningless remainder, and follows the same
+    empty-remainder path as every other fully-covered troubleshooting-
+    only question (see test_troubleshooting_only_question_skips_the_
+    llm_entirely in test_chat_orchestrator.py for the end-to-end,
+    no-LLM-call confirmation)."""
+    remaining, had = split_out_troubleshooting_clause("How should I troubleshoot this issue?")
+    assert had is True
+    assert remaining == ""
+    assert contains_troubleshooting_question("How should I troubleshoot this issue?")
+
+
+def test_troubleshoot_this_problem_and_situation_variants_also_fully_consumed():
+    for noun in ("issue", "problem", "situation"):
+        for verb_phrase in ("how do i troubleshoot", "how should i troubleshoot"):
+            question = f"{verb_phrase.capitalize()} this {noun}?"
+            remaining, had = split_out_troubleshooting_clause(question)
+            assert had is True, question
+            assert remaining == "", (question, remaining)
+
+
+def test_bare_troubleshoot_this_without_a_trailing_noun_still_works_unchanged():
+    """Test D (Phase 47) -- the existing, pre-fix phrasing (no trailing
+    noun at all) must continue to behave identically -- this fix must
+    be purely additive, never a behavior change for what already
+    worked."""
+    for question in ("How do I troubleshoot this?", "How should I troubleshoot this?"):
+        remaining, had = split_out_troubleshooting_clause(question)
+        assert had is True, question
+        assert remaining == "", question
+
+
+def test_multipart_question_with_the_issue_variant_preserves_the_other_part():
+    """The fix must correctly isolate just the troubleshooting clause
+    even when it uses the new "this issue" phrasing inside a real
+    multi-part question -- mirroring test_split_preserves_three_part_
+    question_around_troubleshooting_clause's existing discipline."""
+    remaining, had = split_out_troubleshooting_clause(
+        "Has this happened before, and how should I troubleshoot this issue?"
+    )
+    assert had is True
+    assert remaining == "Has this happened before?"
+
+
+def test_ordinary_questions_mentioning_issue_or_problem_are_not_misclassified():
+    """Test E (Phase 47) -- a question that merely contains the words
+    "issue"/"problem"/"troubleshoot"/"check"/"steps" without matching one
+    of the exact closed-list phrases must never be misclassified."""
+    ordinary = [
+        "This issue affects other customers.",
+        "What is the root cause of this problem?",
+        "Is this issue confirmed?",
+        "What troubleshooting has already been done for this issue?",
+        "Can you check the ticket for this issue?",
+        "This has been a recurring problem.",
+    ]
+    for question in ordinary:
+        assert not contains_troubleshooting_question(question), question
+
+
+def test_new_phrases_are_still_whole_phrase_multi_word_entries():
+    """The new entries must uphold the same whole-phrase discipline
+    test_troubleshooting_phrases_use_whole_phrase_matching_not_lone_
+    keywords already asserts for the full table."""
+    new_entries = [p for p in TROUBLESHOOTING_PHRASES if p.endswith(("issue", "problem", "situation"))]
+    assert len(new_entries) == 6
+    assert all(len(phrase.split()) >= 5 for phrase in new_entries)

@@ -1779,7 +1779,14 @@ def test_phase44_multipart_scope_fabrication_replay_is_rejected_and_falls_back(b
 
 _PHASE45_BYPASS_QUESTIONS = [
     "What can I do to resolve this?",
-    "How should I troubleshoot this issue?",
+    # "How should I troubleshoot this issue?" was originally in this list
+    # (Phase 45's finding: it reached the LLM and relied on Phase 46's
+    # output-side guard). Chat Assistant Phase 47 fixed the underlying
+    # input-side parser so this exact phrasing is now fully recognized
+    # and never reaches the LLM at all (a strictly stronger guarantee,
+    # not a weaker one) -- see
+    # test_phase47_troubleshoot_this_issue_phrasing_now_skips_the_llm_
+    # entirely below, which replaces this list's former coverage of it.
     "What are the next troubleshooting steps?",
     "What action should I take?",
     "How can I investigate this problem?",
@@ -1863,3 +1870,28 @@ def test_phase46_safe_non_troubleshooting_output_is_not_rejected(bundle):
 
     assert llm.last_prompt is not None
     assert "the available evidence does not establish a cause" in response.answer_text.lower()
+
+
+def test_phase47_troubleshoot_this_issue_phrasing_now_skips_the_llm_entirely(bundle):
+    """Phase 47 -- the exact reported input-parsing quirk, end to end.
+    Before the fix, "How should I troubleshoot this issue?" left a
+    meaningless "issue?" remainder and reached the LLM (relying solely
+    on Phase 46's output-side guard for safety, as proven by this exact
+    phrasing's presence in test_phase46_all_five_bypass_questions_are_
+    blocked above -- that test used a DIFFERENT, still-unmatched
+    phrasing set and remains valid/unchanged). After this phase's input-
+    side fix, the phrase table now fully consumes "this issue" and the
+    question is recognized as complete, so it takes the same no-LLM-call
+    path as test_troubleshooting_only_question_skips_the_llm_entirely."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo, resolution="", next_step="")
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(configured=True, response="should never be returned")
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "How should I troubleshoot this issue?")
+
+    assert llm.last_prompt is None  # the LLM was never called
+    assert "should never be returned" not in response.answer_text
+    assert "No evidence-backed troubleshooting check can be determined" in response.answer_text

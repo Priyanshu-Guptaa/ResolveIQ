@@ -65,6 +65,22 @@ TROUBLESHOOTING_PHRASES: list[str] = [
     "what can i check first",
     "what can i check",
     "what to check first",
+    # Chat Assistant Phase 47 -- the "this <noun>" variants MUST be listed
+    # BEFORE their bare "this" counterparts below: _TROUBLESHOOTING_CLAUSE_RE
+    # joins every entry with regex alternation, which (in Python's `re`)
+    # takes the FIRST alternative that matches at a given position, not the
+    # longest -- so an entry listed later never gets a chance to match once
+    # an earlier, shorter prefix already has. Without this ordering, "How
+    # should I troubleshoot this issue?" would match only
+    # "how should i troubleshoot this", leaving the meaningless remainder
+    # "issue?" rather than being recognized as a complete troubleshooting-
+    # only question (reproduced and documented in Phase 45/46; fixed here).
+    "how do i troubleshoot this issue",
+    "how do i troubleshoot this problem",
+    "how do i troubleshoot this situation",
+    "how should i troubleshoot this issue",
+    "how should i troubleshoot this problem",
+    "how should i troubleshoot this situation",
     "how do i troubleshoot this",
     "how should i troubleshoot this",
     "how do i troubleshoot",
