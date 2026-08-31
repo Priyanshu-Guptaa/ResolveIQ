@@ -450,6 +450,42 @@ def test_sending_a_new_message_clears_the_previous_turns_enhancement_result(fake
     assert "Second answer." in text
 
 
+# --- Chat Knowledge-Synthesis feature -- knowledge-answer badge -------------
+
+
+def test_knowledge_answer_shows_informational_caption_not_a_confidence_badge(fake_client):
+    """Step 18 -- an informational answer must never be shown next to a
+    Possible/Likely/Confirmed badge, since that would present the tier
+    as if it graded the informational answer's own certainty."""
+    at = _run(
+        fake_client,
+        session_state={
+            "chat_session_id": "sess-1",
+            "chat_last_response": _chat_response(
+                answer_text="Based on ResolveIQ's documentation...", answer_kind="knowledge", resolution_provenance="possible"
+            ),
+        },
+    )
+    text = _all_text(at)
+    assert "Informational answer" in text
+    assert "Possible" not in text
+
+
+def test_investigation_answer_still_shows_the_confidence_badge(fake_client):
+    """The badge must remain exactly as before for every non-knowledge
+    answer -- this feature must never suppress it elsewhere."""
+    at = _run(
+        fake_client,
+        session_state={
+            "chat_session_id": "sess-1",
+            "chat_last_response": _chat_response(answer_text="A likely cause has been identified.", resolution_provenance="likely"),
+        },
+    )
+    text = _all_text(at)
+    assert "Likely" in text
+    assert "Informational answer" not in text
+
+
 # --- "New Chat" button (real-usage finding: a Standalone session's --------
 # --- retrieval is built from every message sent in it -- see             --
 # --- _resolve_investigation_for_retrieval's own docstring -- so switching --

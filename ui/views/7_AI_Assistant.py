@@ -235,7 +235,16 @@ with st.chat_message("assistant"):
     if context_bits:
         st.caption(" · ".join(context_bits))
 
-    if response.get("resolution_provenance"):
+    if response.get("answer_kind") == "knowledge":
+        # Chat Knowledge-Synthesis feature -- an informational answer is
+        # not an investigation-confidence claim, so it must never be
+        # shown next to a Possible/Likely/Confirmed badge (Step 18): the
+        # real, unchanged investigation-confidence tier for THIS
+        # conversation is still available below/in the evidence panel,
+        # it is just not presented as if it graded the informational
+        # answer's own certainty.
+        st.caption("📄 Informational answer assembled from ResolveIQ's knowledge base")
+    elif response.get("resolution_provenance"):
         st.markdown(_PROVENANCE_BADGE.get(response["resolution_provenance"], response["resolution_provenance"]))
 
     if response.get("follow_up_question"):
@@ -250,7 +259,13 @@ with st.chat_message("assistant"):
     if structured:
         if structured.get("root_cause"):
             st.markdown(f"**Root cause:** {structured['root_cause']}")
-        if structured.get("confidence_rationale"):
+        if structured.get("confidence_rationale") and response.get("answer_kind") != "knowledge":
+            # Investigation-confidence-tier language ("doesn't reach a
+            # single strong, corroborated source") -- suppressed for a
+            # knowledge answer for the same reason the badge above is
+            # (Step 18): it would contradict the "informational answer"
+            # framing right above it by re-introducing tier language
+            # about a resolution this question never asked for.
             st.caption(structured["confidence_rationale"])
 
         candidates = structured.get("resolution_candidates") or []

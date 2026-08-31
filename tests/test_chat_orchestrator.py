@@ -1957,3 +1957,207 @@ def test_phase49_confirmed_tier_fixture_allows_confirmed_language(bundle):
     result = orchestrator._attempt_llm_answer("Has this happened before?", structured, None)
 
     assert result == "This is confirmed based on two independent sources."  # never rejected
+
+
+# --- J. Chat Knowledge-Synthesis feature -------------------------------------
+# --- Real usage finding: "tell me about dashboard in CC" -- an          -----
+# --- informational question -- was answered with generic "evidence is  -----
+# --- insufficient" boilerplate even though real, relevant Documentation -----
+# --- existed, because the deterministic composer only ever consulted    -----
+# --- root_cause/resolution_candidates, never strategy.documentation/    -----
+# --- historical_investigations/known_bugs/tfs_matches/wiki_matches.     -----
+# --- See app.engines.chat.knowledge_question and ChatOrchestrator.       -----
+# --- _compose_knowledge_synthesis's own docstrings for the full design. -----
+
+
+def _doc_match_for(title: str, snippet: str, score: float, record_id: str | None = None) -> KnowledgeMatch:
+    return KnowledgeMatch(
+        collection=KnowledgeCollection.DOCUMENTATION, record_id=record_id or str(uuid.uuid4()), title=title,
+        snippet=snippet, score=score, metadata={},
+    )
+
+
+def test_knowledge_answer_synthesizes_from_documentation_when_no_strong_match(bundle):
+    """The exact real bug: no historical/known-bug match reaches the
+    tier bar, but real, relevant documentation exists -- the answer
+    must cite it instead of the generic boilerplate."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views in CRM.", 0.73)
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Tell me about dashboard in CC")
+
+    assert response.answer_kind == "knowledge"
+    assert "Access to Dashboard and Views in CRM" in response.answer_text
+    assert "How to access Dashboard and Views in CRM" in response.answer_text
+    assert "not a validated root cause or resolution" in response.answer_text
+
+
+def test_knowledge_answer_never_fires_for_investigation_questions(bundle):
+    """The same evidence, but an investigation question -- must reach
+    the existing, unmodified tier-based composer, never the knowledge
+    synthesizer (Rule 3/4's tier-preservation depends on this)."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views in CRM.", 0.73)
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is the likely root cause?")
+
+    assert response.answer_kind is None
+    assert response.answer_text == "I don't have enough evidence to determine the cause."
+
+
+def test_knowledge_answer_does_not_override_a_real_likely_tier(bundle):
+    """CONFIRMED/LIKELY must be completely untouched: when a real root
+    cause/resolution already exists, the existing tier-based text is
+    already the right, specific, grounded answer -- the knowledge
+    synthesizer must never replace it, even for informational phrasing."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Unrelated documentation page", "Some unrelated documentation content.", 0.73)
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Tell me about this issue")
+
+    assert response.answer_kind is None
+    assert response.resolution_provenance.value == "likely"
+    assert "Collector lost network route to the mesh gateway" in response.answer_text
+    assert "Unrelated documentation page" not in response.answer_text
+
+
+def test_knowledge_answer_falls_back_when_nothing_relevant_retrieved(bundle):
+    """An informational question against a completely empty knowledge
+    base must still fall back to the existing, unmodified "I don't have
+    enough evidence" text -- never fabricate a knowledge answer from
+    nothing."""
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Tell me about dashboard in CC")
+
+    assert response.answer_kind is None
+    assert response.answer_text == "I don't have enough evidence to determine the cause."
+
+
+def test_knowledge_answer_excludes_low_relevance_known_bug_but_includes_high_relevance(bundle):
+    """Real live finding: a Known Bug match that only barely clears the
+    primary relevance bar (0.35) can still be pure noise in a small
+    corpus -- Known Bugs/TFS/Wiki require the stricter secondary bar
+    (0.6) to be cited at all."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views in CRM.", 0.73)
+    ]
+    bundle["store"].matches[KnowledgeCollection.KNOWN_BUGS] = [
+        _bug_match_for(_save_bug(bundle["knowledge_repo"], title="Weakly related bug", id=str(uuid.uuid4())), 0.5),
+        _bug_match_for(_save_bug(bundle["knowledge_repo"], title="Strongly related bug", id=str(uuid.uuid4())), 0.65),
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Tell me about dashboard in CC")
+
+    assert response.answer_kind == "knowledge"
+    assert "Strongly related bug" in response.answer_text
+    assert "Weakly related bug" not in response.answer_text
+
+
+def test_knowledge_answer_cites_documentation_never_troubleshooting_fields(bundle):
+    """Structural safety guarantee: the knowledge synthesizer must never
+    reach into resolution_candidates/validation_steps at all -- Rule 9's
+    troubleshooting-safety contract stays entirely out of this code
+    path's reach by construction. A documentation-only fixture (no
+    historical/known-bug match at all) proves this directly: there is
+    no root_cause/resolution/validation_step anywhere in this fixture
+    for the answer to leak, by construction of the fixture itself."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Playbook: Meter/collector communication failure triage", "Check the collector's command log first.", 0.73)
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Tell me about meter troubleshooting")
+
+    assert response.answer_kind == "knowledge"
+    assert response.structured_resolution.root_cause is None
+    assert response.structured_resolution.resolution_candidates == []
+
+
+def test_knowledge_answer_incorporates_live_tfs_and_wiki_matches(bundle):
+    """Step 14 -- TFS/Wiki results must not be left "trapped in the
+    retrieval panel": when relevant, real live matches are cited in the
+    conversational answer text too. Constructs a real InvestigationStrategy
+    directly (real retrieval fixtures in this test bundle use no-op/
+    unconfigured connectors, so tfs_matches/wiki_matches are always
+    unavailable through the full pipeline) and calls the synthesizer
+    directly -- the same private-method-direct-call pattern already
+    established for _attempt_llm_answer in this file."""
+    from datetime import datetime, timezone
+
+    from app.domain.external_knowledge import ExternalKnowledgeResult, ExternalMatch, ExternalSource, TfsCase, WikiPage
+    from app.domain.recommendation import InvestigationStage, InvestigationStrategy
+
+    tfs_case = TfsCase(
+        tfs_id=12345, work_item_type="Bug", title="Dashboard nugets not populated after upgrade", state="Active",
+        area_path="Command Center", team_project="Command Center", changed_date=datetime.now(timezone.utc),
+        url="https://am.tfs.landisgyr.net/tfs/DefaultCollection/_workitems/edit/12345",
+    )
+    wiki_page = WikiPage(page_id="99", title="Dashboard Configuration Guide", space_key="CC", url="https://wiki.landisgyr.net/99")
+    strategy = InvestigationStrategy(
+        current_stage=InvestigationStage.TRIAGE, stage_rationale="r", progress=0.0, progress_summary="s",
+        recommended_next_action="n", next_action_rationale="r",
+        documentation=[_doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views.", 0.73)],
+        tfs_matches=ExternalKnowledgeResult(
+            source=ExternalSource.TFS, available=True,
+            matches=[ExternalMatch(source=ExternalSource.TFS, tfs_case=tfs_case, score=0.7, confidence="High")],
+        ),
+        wiki_matches=ExternalKnowledgeResult(
+            source=ExternalSource.WIKI, available=True,
+            matches=[ExternalMatch(source=ExternalSource.WIKI, wiki_page=wiki_page, score=0.65, confidence="High")],
+        ),
+    )
+    orchestrator = bundle["orchestrator"]
+
+    synthesis = orchestrator._compose_knowledge_synthesis(strategy)
+
+    assert synthesis is not None
+    assert "Dashboard nugets not populated after upgrade" in synthesis
+    assert "Dashboard Configuration Guide" in synthesis
+
+
+def test_knowledge_answer_excludes_low_relevance_tfs_wiki_matches(bundle):
+    """The same stricter secondary bar applies to TFS/Wiki as to Known
+    Bugs -- a weak, coincidental match must not be cited."""
+    from datetime import datetime, timezone
+
+    from app.domain.external_knowledge import ExternalKnowledgeResult, ExternalMatch, ExternalSource, TfsCase
+
+    tfs_case = TfsCase(
+        tfs_id=99999, work_item_type="Bug", title="Unrelated weak TFS match", state="Active",
+        area_path="Command Center", team_project="Command Center", changed_date=datetime.now(timezone.utc),
+        url="https://am.tfs.landisgyr.net/tfs/DefaultCollection/_workitems/edit/99999",
+    )
+    from app.domain.recommendation import InvestigationStage, InvestigationStrategy
+
+    strategy = InvestigationStrategy(
+        current_stage=InvestigationStage.TRIAGE, stage_rationale="r", progress=0.0, progress_summary="s",
+        recommended_next_action="n", next_action_rationale="r",
+        documentation=[_doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views.", 0.73)],
+        tfs_matches=ExternalKnowledgeResult(
+            source=ExternalSource.TFS, available=True,
+            matches=[ExternalMatch(source=ExternalSource.TFS, tfs_case=tfs_case, score=0.4, confidence="Low")],
+        ),
+    )
+    orchestrator = bundle["orchestrator"]
+
+    synthesis = orchestrator._compose_knowledge_synthesis(strategy)
+
+    assert synthesis is not None
+    assert "Unrelated weak TFS match" not in synthesis

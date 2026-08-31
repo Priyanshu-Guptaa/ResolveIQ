@@ -55,10 +55,12 @@ from app.domain.investigation import InvestigationSession
 from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
 from app.engines.chat.confidence_expansion import contains_unsupported_confidence_claim
+from app.engines.chat.knowledge_question import contains_knowledge_question
 from app.engines.chat.scope_expansion import contains_unsupported_scope_expansion
 from app.engines.chat.scope_question import split_out_scope_clause
 from app.engines.chat.troubleshooting_expansion import contains_unsupported_troubleshooting_action
 from app.engines.chat.troubleshooting_question import split_out_troubleshooting_clause
+from app.engines.external_knowledge.extraction import truncate as truncate_extract
 from app.engines.investigation.engine import InvestigationNotFoundError
 from app.engines.llm.prompt_builder import PromptBuilder, available_checks
 from app.engines.llm.provider import LLMProviderError
@@ -294,6 +296,7 @@ class ChatOrchestrator:
             (
                 answer_text,
                 follow_up,
+                answer_kind,
                 sanitized_question,
                 had_scope,
                 had_troubleshooting,
@@ -311,7 +314,7 @@ class ChatOrchestrator:
                 )
                 enhancement_ref = ChatEnhancementRef(job_id=job.id, status=job.status)
         else:
-            answer_text, follow_up = self._generate_answer(text, strategy, log_observations)
+            answer_text, follow_up, answer_kind = self._generate_answer(text, strategy, log_observations)
 
         focus, referenced_investigation_id, referenced_tfs_id = self._derive_focus(strategy)
         self._state.record_assistant_turn(
@@ -325,6 +328,7 @@ class ChatOrchestrator:
         structured = strategy.structured_resolution
         return ChatResponse(
             answer_text=answer_text,
+            answer_kind=answer_kind,
             intent=parsed.intent,
             active_context=active_context,
             parsed_query=parsed,
@@ -467,7 +471,7 @@ class ChatOrchestrator:
         question: str,
         strategy: "InvestigationStrategy",
         log_observations: "LogObservationSummary | None" = None,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, str | None]:
         """Tries LLM generation first when a provider is wired, enabled,
         and there's a real StructuredResolution to ground it in; falls
         back to the existing, untouched _compose_answer() in every
@@ -534,16 +538,16 @@ class ChatOrchestrator:
         if (had_scope or had_troubleshooting) and not sanitized_question:
             # Nothing non-scope/non-troubleshooting is left to ask the
             # LLM at all.
-            answer_text, follow_up = self._compose_answer(strategy)
+            answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question)
             answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
-            return answer_text, follow_up
+            return answer_text, follow_up, answer_kind
 
         if self._llm is not None and structured is not None and self._llm.is_configured():
             try:
                 answer_text = self._attempt_llm_answer(sanitized_question, structured, log_observations)
                 if answer_text is not None:
                     answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
-                    return answer_text, None
+                    return answer_text, None, None
             except LLMProviderError as exc:
                 # Environmental/provider failure only (connection, timeout,
                 # HTTP error, malformed/empty response) -- never a bare
@@ -554,9 +558,9 @@ class ChatOrchestrator:
                 # other graceful-degradation path in this codebase
                 # (ExternalKnowledgeService, _reconcile_orphaned_columns).
                 logger.warning("LLM generation failed, falling back to deterministic answer: %s", exc)
-        answer_text, follow_up = self._compose_answer(strategy)
+        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question)
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
-        return answer_text, follow_up
+        return answer_text, follow_up, answer_kind
 
     def _prepare_question(
         self, question: str, strategy: "InvestigationStrategy"
@@ -685,7 +689,7 @@ class ChatOrchestrator:
 
     def _compose_deterministic_answer(
         self, question: str, strategy: "InvestigationStrategy"
-    ) -> tuple[str, str | None, str, bool, bool, "StructuredResolution | None"]:
+    ) -> tuple[str, str | None, str | None, str, bool, bool, "StructuredResolution | None"]:
         """Chat Assistant Phase 37 -- composes the same deterministic
         answer ``_generate_answer``'s own fallback branch would (real
         root cause/resolution/confidence, plus scope/no-checks
@@ -697,16 +701,16 @@ class ChatOrchestrator:
         rejection, so an asynchronous user's initial answer is never
         weaker than a synchronous user's worst case.
 
-        Returns ``(answer_text, follow_up, sanitized_question, had_scope,
-        had_troubleshooting, structured)`` -- the last four are handed
-        straight to ``_finalize_llm_answer`` if an enhancement job is
-        scheduled, so that job makes the identical clause-splitting
+        Returns ``(answer_text, follow_up, answer_kind, sanitized_question,
+        had_scope, had_troubleshooting, structured)`` -- the last four are
+        handed straight to ``_finalize_llm_answer`` if an enhancement job
+        is scheduled, so that job makes the identical clause-splitting
         decision this answer was already built from, never a second,
         possibly-different one."""
         sanitized_question, had_scope, had_troubleshooting, structured = self._prepare_question(question, strategy)
-        answer_text, follow_up = self._compose_answer(strategy)
+        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question)
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
-        return answer_text, follow_up, sanitized_question, had_scope, had_troubleshooting, structured
+        return answer_text, follow_up, answer_kind, sanitized_question, had_scope, had_troubleshooting, structured
 
     def _finalize_llm_answer(
         self,
@@ -825,10 +829,18 @@ class ChatOrchestrator:
 
     # --- Deterministic answer composition (§4) ---------------------------------
 
-    def _compose_answer(self, strategy: "InvestigationStrategy") -> tuple[str, str | None]:
+    def _compose_answer(self, strategy: "InvestigationStrategy", question: str = "") -> tuple[str, str | None, str | None]:
+        """Returns ``(answer_text, follow_up, answer_kind)``.
+        ``answer_kind`` is ``"knowledge"`` when ``answer_text`` came from
+        ``_compose_knowledge_synthesis`` instead of the tier-based
+        boilerplate below -- see that method's own docstring for why,
+        and ``ChatResponse.answer_kind``'s docstring for how callers
+        should use it (never a change to ``resolution_provenance``'s
+        own semantics)."""
         structured = strategy.structured_resolution
         if structured is None:
-            return self._compose_answer_without_structured_resolution(strategy)
+            text, follow_up = self._compose_answer_without_structured_resolution(strategy)
+            return text, follow_up, None
 
         tier = structured.confidence
         primary = next((c for c in structured.resolution_candidates if c.is_primary), None)
@@ -844,7 +856,7 @@ class ChatOrchestrator:
                 text += f" ({structured.confidence_rationale})"
             if primary is not None:
                 text += f" Recommended resolution: {primary.text}"
-            return text, None
+            return text, None, None
 
         if tier == ResolutionProvenance.LIKELY:
             text = (
@@ -858,7 +870,23 @@ class ChatOrchestrator:
             text += " This has not been independently verified."
             if primary is not None:
                 text += f" A likely resolution, not yet independently verified: {primary.text}"
-            return text, None
+            return text, None, None
+
+        # POSSIBLE and UNKNOWN both fall through to the tier boilerplate
+        # below UNLESS this is a real knowledge/historical question (§2.A/
+        # B of the Chat Knowledge-Synthesis feature) AND real, already-
+        # retrieved documentation/historical/known-bug/TFS/Wiki evidence
+        # actually exists to cite -- see _compose_knowledge_synthesis's own
+        # docstring for the full rationale. CONFIRMED/LIKELY above are
+        # completely untouched: when a real root cause/resolution already
+        # exists, the existing tier-based text already is the right,
+        # specific, grounded answer -- this only fires for the case the
+        # real bug report was about, where that text would otherwise be
+        # uselessly generic despite real evidence sitting unused.
+        if contains_knowledge_question(question):
+            synthesis = self._compose_knowledge_synthesis(strategy)
+            if synthesis is not None:
+                return synthesis, None, "knowledge"
 
         if tier == ResolutionProvenance.POSSIBLE:
             text = f"A possible explanation is: {subject}." if subject else "A possible explanation may exist, but the evidence found is limited."
@@ -866,10 +894,98 @@ class ChatOrchestrator:
                 " Evidence is not yet sufficient to verify this -- treat it as a hypothesis to check, not a"
                 " resolution to act on."
             )
-            return text, None
+            return text, None, None
 
         # UNKNOWN
-        return "I don't have enough evidence to determine the cause.", self._unknown_follow_up(strategy)
+        return "I don't have enough evidence to determine the cause.", self._unknown_follow_up(strategy), None
+
+    _KNOWLEDGE_SYNTHESIS_MIN_SCORE = 0.35
+    """Same value and rationale as Settings.min_similarity_for_root_cause
+    (app/config.py) -- reused here, not re-derived, as the "is this match
+    actually relevant, not just whatever Chroma's top_k happened to
+    return" cutoff for citing Documentation/Historical Investigation
+    matches, both real-tested (see below) to be strong, genuinely
+    on-topic signals even at this permissive bar. Not wired to the live
+    Settings object (ChatOrchestrator holds no Settings reference) -- a
+    local constant keeps this change contained to one file rather than
+    threading a new constructor dependency through every existing
+    caller/test; revisit together if that threshold is ever retuned."""
+
+    _KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY = 0.6
+    """A real live test ("tell me about dashboard in CC" against the
+    real seeded sample corpus) found ``_KNOWLEDGE_SYNTHESIS_MIN_SCORE``
+    too permissive specifically for Known Bugs/TFS/Wiki: Documentation
+    and Historical Investigation matches were genuinely on-topic at
+    0.68-0.77, but the two Known Bug matches that also cleared 0.35
+    (0.54, 0.51 -- "Collector command queue stalls...",  "Kafka client
+    rebalance storm...") were topically unrelated noise, an artifact of
+    this sample corpus having very few Known Bug records at all so
+    *something* is always nearest. A stricter bar for these three,
+    lower-precedence categories keeps the synthesis's most prominent
+    claims (documentation, historical context) reliably strong while
+    only citing a known bug or TFS/Wiki match when it clears the same
+    genuinely-on-topic range Documentation/Historical already showed."""
+
+    def _compose_knowledge_synthesis(self, strategy: "InvestigationStrategy") -> str | None:
+        """Chat Knowledge-Synthesis feature -- deterministic informational-
+        answer composition from evidence ``RecommendationEngine.generate()``
+        ALREADY retrieved (``strategy.documentation``/``historical_
+        investigations``/``known_bugs``/``tfs_matches``/``wiki_matches``) --
+        never a new retrieval call, never LLM-generated, never a paraphrase:
+        every sentence either directly quotes a real ``KnowledgeMatch``/
+        ``ExternalMatch`` title+snippet or lists real titles verbatim.
+        Returns ``None`` (caller falls back to the existing tier-based
+        boilerplate, unchanged) when nothing retrieved clears the
+        relevance bar -- this function has no opinion about WHETHER the
+        question deserves a knowledge answer, only WHAT to say once
+        ``_compose_answer`` has already decided it does.
+
+        Deliberately excludes ``resolution_candidates``/``validation_
+        steps``/``root_cause`` entirely -- an informational answer is not
+        a troubleshooting or investigation answer, and must never present
+        (or imply) either, keeping Rule 9's troubleshooting-safety
+        contract and Rule 4's confidence-tier contract completely out of
+        this code path's reach, by construction, not by extra checking."""
+        min_score = self._KNOWLEDGE_SYNTHESIS_MIN_SCORE
+        min_score_secondary = self._KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY
+        doc_matches = [m for m in strategy.documentation if m.score >= min_score]
+        hist_matches = [m for m in strategy.historical_investigations if m.score >= min_score]
+        bug_matches = [m for m in strategy.known_bugs if m.score >= min_score_secondary]
+        tfs = strategy.tfs_matches
+        wiki = strategy.wiki_matches
+        tfs_matches = [m for m in (tfs.matches if tfs is not None and tfs.available else []) if m.score >= min_score_secondary]
+        wiki_matches = [m for m in (wiki.matches if wiki is not None and wiki.available else []) if m.score >= min_score_secondary]
+
+        if not (doc_matches or hist_matches or bug_matches or tfs_matches or wiki_matches):
+            return None
+
+        sentences: list[str] = []
+        if doc_matches:
+            top = doc_matches[0]
+            excerpt = truncate_extract(top.snippet, 240)
+            sentences.append(f'Based on ResolveIQ\'s documentation "{top.title}": {excerpt}')
+            more_titles = [f'"{m.title}"' for m in doc_matches[1:3] if m.title != top.title]
+            if more_titles:
+                sentences.append(f"Related documentation: {', '.join(more_titles)}.")
+        if hist_matches:
+            titles = ", ".join(f'"{m.title}"' for m in hist_matches[:3])
+            sentences.append(f"ResolveIQ has related historical cases on record: {titles}.")
+        if bug_matches:
+            titles = ", ".join(f'"{m.title}"' for m in bug_matches[:2])
+            sentences.append(f"Related known bugs on record: {titles}.")
+        if tfs_matches:
+            titles = ", ".join(f'"{m.tfs_case.title}"' for m in tfs_matches[:2] if m.tfs_case is not None)
+            if titles:
+                sentences.append(f"Live TFS also shows: {titles}.")
+        if wiki_matches:
+            titles = ", ".join(f'"{m.wiki_page.title}"' for m in wiki_matches[:2] if m.wiki_page is not None)
+            if titles:
+                sentences.append(f"Live Wiki also shows: {titles}.")
+        sentences.append(
+            "This is informational context assembled from ResolveIQ's knowledge base -- not a validated root "
+            "cause or resolution."
+        )
+        return " ".join(sentences)
 
     def _compose_answer_without_structured_resolution(self, strategy: "InvestigationStrategy") -> tuple[str, str | None]:
         """Defensive fallback for a build where the relationship engine
