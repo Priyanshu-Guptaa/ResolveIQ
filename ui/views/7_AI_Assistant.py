@@ -75,18 +75,34 @@ if scope == "Investigation":
     if not investigation_id:
         st.stop()
 
+_CHAT_TURN_STATE_KEYS = (
+    "chat_last_response",
+    "chat_log_attachments",
+    "chat_log_eviction_notice",
+    "chat_enhancement_job_id",
+    "chat_enhancement_result",
+)
+
 session_key = f"{scope}::{investigation_id or 'standalone'}"
+
+if st.button("🆕 New Chat", help="Start a fresh conversation. A Standalone session's search is built from every message you send in it, so switching to an unrelated topic without starting a new chat can keep returning results for your earlier question."):
+    # Forces the session-creation check right below to run again, exactly
+    # as it already does on a genuine scope/investigation change -- no
+    # separate creation path, so this can never drift from that logic.
+    st.session_state.pop("chat_session_key", None)
+    st.session_state.pop("chat_session_id", None)
+    for key in _CHAT_TURN_STATE_KEYS:
+        st.session_state.pop(key, None)
+    st.rerun()
+
 if st.session_state.get("chat_session_key") != session_key:
     session = api_post("/chat/sessions", {"investigation_id": investigation_id})
     if session is None:
         st.stop()
     st.session_state["chat_session_key"] = session_key
     st.session_state["chat_session_id"] = session["id"]
-    st.session_state.pop("chat_last_response", None)
-    st.session_state.pop("chat_log_attachments", None)
-    st.session_state.pop("chat_log_eviction_notice", None)
-    st.session_state.pop("chat_enhancement_job_id", None)
-    st.session_state.pop("chat_enhancement_result", None)
+    for key in _CHAT_TURN_STATE_KEYS:
+        st.session_state.pop(key, None)
 
 chat_session_id = st.session_state["chat_session_id"]
 

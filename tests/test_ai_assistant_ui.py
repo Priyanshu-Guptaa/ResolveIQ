@@ -448,3 +448,58 @@ def test_sending_a_new_message_clears_the_previous_turns_enhancement_result(fake
     text = _all_text(at)
     assert "Old enhanced phrasing." not in text
     assert "Second answer." in text
+
+
+# --- "New Chat" button (real-usage finding: a Standalone session's --------
+# --- retrieval is built from every message sent in it -- see             --
+# --- _resolve_investigation_for_retrieval's own docstring -- so switching --
+# --- to an unrelated topic without starting a new session kept returning --
+# --- the previous topic's results. This button is the fix: it clears the --
+# --- session state the page's own "session changed" block already resets --
+# --- (see _run's docstring above), forcing that exact, pre-existing,     --
+# --- already-tested reset path to run again -- no new reset logic.
+
+
+def test_new_chat_button_is_present_in_standalone_scope(fake_client):
+    at = _run(fake_client, session_state={"chat_session_id": "sess-1"})
+    assert any("new chat" in b.label.lower() for b in at.button)
+
+
+def test_new_chat_button_clears_transcript_and_starts_a_fresh_session(fake_client):
+    fake_client.session_response = {"id": "new-session", "investigation_id": None}
+    at = _run(
+        fake_client,
+        session_state={
+            "chat_session_id": "old-session",
+            "chat_last_response": _chat_response(answer_text="Old topic's answer."),
+            "chat_log_attachments": [_attachment("old-topic.log")],
+        },
+    )
+    assert "Old topic's answer." in _all_text(at)  # sanity: the old turn is really showing first
+
+    new_chat_button = next(b for b in at.button if "new chat" in b.label.lower())
+    new_chat_button.click().run()
+
+    assert not at.exception
+    assert _state_get(at, "chat_session_id") == "new-session"
+    assert _state_get(at, "chat_log_attachments") in (None, [])
+    text = _all_text(at)
+    assert "Old topic's answer." not in text
+    assert "old-topic.log" not in text
+
+
+def test_new_chat_button_requests_a_session_for_the_current_scope_not_the_stale_one(fake_client):
+    """The button must hand off to the page's own existing session-
+    creation call (POST /chat/sessions with the CURRENT scope's
+    investigation_id) -- never a separate, second creation path that
+    could drift from it."""
+    fake_client.session_response = {"id": "new-session", "investigation_id": None}
+    at = _run(fake_client, session_state={"chat_session_id": "old-session"})
+    calls_before = len([c for c in fake_client.calls if c[0] == "POST" and c[1] == "/chat/sessions"])
+
+    new_chat_button = next(b for b in at.button if "new chat" in b.label.lower())
+    new_chat_button.click().run()
+
+    session_calls_after = [c for c in fake_client.calls if c[0] == "POST" and c[1] == "/chat/sessions"]
+    assert len(session_calls_after) == calls_before + 1
+    assert session_calls_after[-1][2] == {"investigation_id": None}
