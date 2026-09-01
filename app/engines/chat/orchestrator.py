@@ -55,7 +55,7 @@ from app.domain.investigation import InvestigationSession
 from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
 from app.engines.chat.confidence_expansion import contains_unsupported_confidence_claim
-from app.engines.chat.knowledge_question import contains_knowledge_question
+from app.engines.chat.knowledge_question import contains_knowledge_question, extract_concept_words, lexical_overlap
 from app.engines.chat.scope_expansion import contains_unsupported_scope_expansion
 from app.engines.chat.scope_question import split_out_scope_clause
 from app.engines.chat.troubleshooting_expansion import contains_unsupported_troubleshooting_action
@@ -884,7 +884,7 @@ class ChatOrchestrator:
         # real bug report was about, where that text would otherwise be
         # uselessly generic despite real evidence sitting unused.
         if contains_knowledge_question(question):
-            synthesis = self._compose_knowledge_synthesis(strategy)
+            synthesis = self._compose_knowledge_synthesis(strategy, question)
             if synthesis is not None:
                 return synthesis, None, "knowledge"
 
@@ -926,7 +926,7 @@ class ChatOrchestrator:
     only citing a known bug or TFS/Wiki match when it clears the same
     genuinely-on-topic range Documentation/Historical already showed."""
 
-    def _compose_knowledge_synthesis(self, strategy: "InvestigationStrategy") -> str | None:
+    def _compose_knowledge_synthesis(self, strategy: "InvestigationStrategy", question: str) -> str | None:
         """Chat Knowledge-Synthesis feature -- deterministic informational-
         answer composition from evidence ``RecommendationEngine.generate()``
         ALREADY retrieved (``strategy.documentation``/``historical_
@@ -939,6 +939,31 @@ class ChatOrchestrator:
         relevance bar -- this function has no opinion about WHETHER the
         question deserves a knowledge answer, only WHAT to say once
         ``_compose_answer`` has already decided it does.
+
+        RETRIEVAL SIMILARITY IS NOT ANSWER RELEVANCE (real live finding):
+        "what is process setting in emerge" retrieved a personal task-list
+        export ("task") as Chroma's single highest-scoring Documentation
+        candidate (69% similarity) -- "task" shares no real subject with
+        "process setting"/"emerge" at all, while a genuinely on-topic
+        Historical Investigation ("Review Emerge Settings listed in
+        CIL-98-3114 -- settings id 1126 missing in Emerge System Settings
+        page") was sitting right there, unused, because the old version of
+        this method always cited ``documentation[0]`` -- whichever
+        Documentation candidate scored highest -- never comparing it
+        against Historical Investigation candidates, and never checking
+        whether it actually shares the question's own subject at all. This
+        method now re-ranks the combined Documentation + Historical
+        Investigation candidate pool by REAL LEXICAL OVERLAP with the
+        question's own content words (``extract_concept_words``/
+        ``lexical_overlap`` -- see that module's docstring) FIRST, semantic
+        score only as a tiebreak, and degrades to an explicit, honest
+        "couldn't find documentation that specifically covers this"
+        admission (Step 9 of the Chat Intelligence Upgrade) rather than
+        ever presenting a zero-overlap, merely-highest-scoring candidate as
+        if it answered the question. Known Bugs/TFS/Wiki remain governed
+        by the stricter secondary score bar alone (no title-based
+        definition claim is ever made from those three categories, so the
+        lexical re-rank doesn't apply there) -- unchanged from before.
 
         Deliberately excludes ``resolution_candidates``/``validation_
         steps``/``root_cause`` entirely -- an informational answer is not
@@ -959,17 +984,55 @@ class ChatOrchestrator:
         if not (doc_matches or hist_matches or bug_matches or tfs_matches or wiki_matches):
             return None
 
+        concept_words = extract_concept_words(question)
+        # (candidate, kind, overlap) for every Documentation/Historical
+        # candidate, ranked by real subject overlap first, score second --
+        # never the other way around (see docstring above).
+        ranked: list[tuple["KnowledgeMatch", str, int]] = sorted(
+            (
+                [(m, "documentation", lexical_overlap(concept_words, f"{m.title} {m.snippet[:500]}")) for m in doc_matches]
+                + [(m, "historical", lexical_overlap(concept_words, f"{m.title} {m.snippet[:500]}")) for m in hist_matches]
+            ),
+            key=lambda item: (item[2], item[0].score),
+            reverse=True,
+        )
+
         sentences: list[str] = []
-        if doc_matches:
-            top = doc_matches[0]
-            excerpt = truncate_extract(top.snippet, 240)
-            sentences.append(f'Based on ResolveIQ\'s documentation "{top.title}": {excerpt}')
-            more_titles = [f'"{m.title}"' for m in doc_matches[1:3] if m.title != top.title]
-            if more_titles:
-                sentences.append(f"Related documentation: {', '.join(more_titles)}.")
-        if hist_matches:
-            titles = ", ".join(f'"{m.title}"' for m in hist_matches[:3])
-            sentences.append(f"ResolveIQ has related historical cases on record: {titles}.")
+        primary_match, primary_kind = None, None
+        if ranked:
+            top_match, top_kind, top_overlap = ranked[0]
+            # Deliberately NOT "or top_match.score >= some bar" -- the
+            # real motivating bug ("task", 69% similarity) is itself
+            # proof that a high raw semantic score is not a safe
+            # override here. Only a real word-overlap match, or a
+            # question with no extractable subject words to compare
+            # against at all, counts as answerable.
+            answerable = top_overlap > 0 or not concept_words
+            if answerable:
+                primary_match, primary_kind = top_match, top_kind
+                excerpt = truncate_extract(primary_match.snippet, 240)
+                if primary_kind == "documentation":
+                    sentences.append(f'Based on ResolveIQ\'s documentation "{primary_match.title}": {excerpt}')
+                else:
+                    sentences.append(f'ResolveIQ has a related historical case on record, "{primary_match.title}": {excerpt}')
+            else:
+                # Real evidence exists but none of it actually shares the
+                # question's own subject -- an honest admission, never a
+                # confident-sounding answer built from a coincidentally
+                # highest-scoring but unrelated candidate.
+                subject = " ".join(concept_words) if concept_words else "this"
+                sentences.append(
+                    f"I found some ResolveIQ content that scored as semantically similar to \"{subject}\", but none of "
+                    f"it actually shares that subject -- I couldn't find documentation or a historical case that "
+                    f"specifically covers \"{subject}\"."
+                )
+
+        remaining_doc_titles = [f'"{m.title}"' for m in doc_matches if m is not primary_match][:2]
+        if remaining_doc_titles:
+            sentences.append(f"Related documentation: {', '.join(remaining_doc_titles)}.")
+        remaining_hist_titles = [f'"{m.title}"' for m in hist_matches if m is not primary_match][:3]
+        if remaining_hist_titles:
+            sentences.append(f"ResolveIQ has related historical cases on record: {', '.join(remaining_hist_titles)}.")
         if bug_matches:
             titles = ", ".join(f'"{m.title}"' for m in bug_matches[:2])
             sentences.append(f"Related known bugs on record: {titles}.")

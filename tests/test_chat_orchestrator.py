@@ -2125,7 +2125,7 @@ def test_knowledge_answer_incorporates_live_tfs_and_wiki_matches(bundle):
     )
     orchestrator = bundle["orchestrator"]
 
-    synthesis = orchestrator._compose_knowledge_synthesis(strategy)
+    synthesis = orchestrator._compose_knowledge_synthesis(strategy, "Tell me about dashboard in CC")
 
     assert synthesis is not None
     assert "Dashboard nugets not populated after upgrade" in synthesis
@@ -2157,7 +2157,84 @@ def test_knowledge_answer_excludes_low_relevance_tfs_wiki_matches(bundle):
     )
     orchestrator = bundle["orchestrator"]
 
-    synthesis = orchestrator._compose_knowledge_synthesis(strategy)
+    synthesis = orchestrator._compose_knowledge_synthesis(strategy, "Tell me about dashboard in CC")
 
     assert synthesis is not None
     assert "Unrelated weak TFS match" not in synthesis
+
+
+# --- K. Chat Intelligence Upgrade -- retrieval similarity != answer relevance
+# --- Real live finding: "what is process setting in emerge" retrieved a    -
+# --- personal task-list export ("task") as Chroma's single highest-scoring -
+# --- Documentation candidate (69% similarity), and the answer was composed -
+# --- from it -- despite a genuinely on-topic Historical Investigation      -
+# --- ("Review Emerge Settings...") also being retrieved, just never        -
+# --- considered because the old composer always cited documentation[0].
+
+
+def test_process_setting_emerge_regression_prefers_lexically_relevant_historical_over_top_scored_unrelated_doc(bundle):
+    """The exact real bug, reproduced with a fixture shaped like the real
+    one: an unrelated document (higher score) vs. a genuinely on-topic
+    historical case (slightly lower score) -- the historical case must
+    win, and the unrelated document must never be presented as if it
+    answered the question."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("task", "Task List. Assigned to = Arun Bhukker AND Active = false.", 0.693),
+    ]
+    record = _save_hi(
+        bundle["knowledge_repo"],
+        title="Review Emerge Settings listed in CIL-98-3114",
+        description="settings id 1126 missing in Emerge System Settings page.",
+        root_cause="", resolution="", next_step="",  # no recorded root cause -- keeps this at POSSIBLE/UNKNOWN, not LIKELY
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.791)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "what is process setting in emerge")
+
+    assert response.answer_kind == "knowledge"
+    assert "Review Emerge Settings listed in CIL-98-3114" in response.answer_text
+    assert not response.answer_text.startswith('Based on ResolveIQ\'s documentation "task"')
+
+
+def test_no_relevant_evidence_produces_an_honest_admission_not_a_confident_wrong_answer(bundle):
+    """When NOTHING retrieved actually shares the question's subject
+    (zero lexical overlap on every candidate, and none scores high
+    enough to stand alone), the answer must say so explicitly rather
+    than present the merely-highest-scoring candidate as if it were
+    the answer."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("task", "Task List. Assigned to = Arun Bhukker AND Active = false.", 0.693),
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "what is process setting in emerge")
+
+    assert response.answer_kind == "knowledge"
+    assert "couldn't find documentation or a historical case that specifically covers" in response.answer_text
+    assert not response.answer_text.startswith('Based on ResolveIQ\'s documentation "task"')
+
+
+def test_dashboard_cc_regression_prefers_on_topic_historical_case_over_loosely_related_doc(bundle):
+    """The dashboard/CC example, reproduced: a documentation match that
+    only shares "dashboard" (not "CC") vs. a historical case that
+    shares both -- the historical case, with the higher combined
+    relevance, must be the one cited."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views in CRM.", 0.735),
+    ]
+    record = _save_hi(
+        bundle["knowledge_repo"], title="Grand Bahamas CC 8.4 MR1 - Execute Dashboard nugets not populated in CC",
+        description="Dashboard nugets not populated after upgrade.",
+        root_cause="", resolution="", next_step="",  # no recorded root cause -- keeps this at POSSIBLE/UNKNOWN, not LIKELY
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.72)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "tell me about dashboard in CC")
+
+    assert response.answer_kind == "knowledge"
+    assert "Grand Bahamas CC 8.4 MR1" in response.answer_text

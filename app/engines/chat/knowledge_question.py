@@ -137,3 +137,75 @@ def contains_knowledge_question(question: str) -> bool:
         if not any(remainder.startswith(lead_in) for lead_in in _RESERVED_INVESTIGATION_LEAD_INS):
             return True
     return False
+
+
+_CONCEPT_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "what", "whats", "is", "are", "was", "were", "tell", "me", "more", "about", "in", "on", "of", "the",
+        "a", "an", "to", "does", "do", "did", "mean", "means", "how", "we", "have", "has", "had", "any",
+        "information", "documentation", "docs", "know", "known", "explain", "describe", "give", "overview",
+        "summary", "for", "this", "that", "these", "those", "seen", "before", "happened", "related", "case",
+        "cases", "previous", "prior", "past", "and", "or", "with", "can", "you", "us", "please", "there",
+    }
+)
+"""Closed stopword list for ``extract_concept_words`` -- the fixed
+lead-in/trailing words every ``INFORMATIONAL_PHRASES``/
+``HISTORICAL_PHRASES`` entry is built from, plus ordinary English
+function words. Never a general-purpose NLP stopword list (no attempt
+at completeness beyond what this project's own closed question
+patterns actually use) -- conservative by construction, same as every
+other list in this module."""
+
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+
+
+def extract_concept_words(question: str) -> list[str]:
+    """Chat Knowledge-Synthesis feature -- the deterministic "what is
+    this question actually about" signal ``ChatOrchestrator.
+    _compose_knowledge_synthesis`` uses to distinguish a retrieval
+    candidate that merely scored well from one that actually contains
+    the subject the user asked about (real usage finding: "what is
+    process setting in emerge" retrieved a personal task-list export at
+    69% similarity -- "task" shares no real subject with "process
+    setting"/"emerge" at all, and was still presented as the answer
+    because it was Chroma's single highest-scoring Documentation
+    candidate). Not a POS tagger or an entity extractor -- just
+    ``question``'s own content words, with this module's own fixed
+    question-scaffolding vocabulary (see ``_CONCEPT_STOPWORDS``)
+    removed, lowercased, deduplicated, in first-occurrence order.
+    Short, real product/technology acronyms (e.g. "cc", "nmm") are kept
+    -- ``_lexical_overlap`` (the only caller) applies word-boundary
+    matching for anything 3 characters or shorter specifically so a
+    short acronym never matches as a false-positive substring of an
+    unrelated longer word."""
+    seen: set[str] = set()
+    words: list[str] = []
+    for match in _WORD_RE.finditer(question):
+        word = match.group(0).lower()
+        if word in _CONCEPT_STOPWORDS or word in seen:
+            continue
+        seen.add(word)
+        words.append(word)
+    return words
+
+
+def lexical_overlap(concept_words: list[str], text: str) -> int:
+    """How many of ``concept_words`` actually appear in ``text``
+    (case-insensitive) -- substring matching for anything longer than 3
+    characters (so "setting"/"settings", "dashboard"/"dashboards" etc.
+    match regardless of this project's own real, observed pluralization
+    without needing a stemmer), whole-word matching for anything 3
+    characters or shorter (so a short acronym like "cc" never falsely
+    matches inside an unrelated longer word like "access" or "occurred").
+    Used by ``ChatOrchestrator._compose_knowledge_synthesis`` to re-rank
+    already-retrieved candidates by real subject overlap, never to
+    perform a new retrieval of its own."""
+    lowered = text.lower()
+    count = 0
+    for word in concept_words:
+        if len(word) <= 3:
+            if phrase_present(word, lowered):
+                count += 1
+        elif word in lowered:
+            count += 1
+    return count
