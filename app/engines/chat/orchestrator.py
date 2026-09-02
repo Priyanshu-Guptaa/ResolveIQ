@@ -49,13 +49,14 @@ from app.domain.chat import (
     MessageRole,
     ReferenceState,
 )
-from app.domain.enums import EvidenceType
+from app.domain.enums import EvidenceType, LogLevel
 from app.domain.evidence import Evidence
 from app.domain.investigation import InvestigationSession
 from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
 from app.engines.chat.confidence_expansion import contains_unsupported_confidence_claim
 from app.engines.chat.knowledge_question import contains_knowledge_question, extract_concept_words, lexical_overlap
+from app.engines.chat.log_question import contains_log_analysis_question
 from app.engines.chat.scope_expansion import contains_unsupported_scope_expansion
 from app.engines.chat.scope_question import split_out_scope_clause
 from app.engines.chat.troubleshooting_expansion import contains_unsupported_troubleshooting_action
@@ -265,6 +266,14 @@ class ChatOrchestrator:
         recommendation = self._recommend.generate(investigation_for_retrieval)
         strategy = recommendation.strategy
         log_observations = LogIntelligenceEngine.summarize_observations(investigation_for_retrieval.evidence)
+        log_evidence = [
+            e for e in investigation_for_retrieval.evidence if e.evidence_type == EvidenceType.LOG_FILE and e.log_events
+        ]
+        """Chat + Log Intelligence integration -- the REAL, already-parsed
+        LogEvent/ExtractedEntity detail behind ``log_observations``'
+        aggregate counts, for ``_compose_log_analysis_answer`` (never for
+        the LLM prompt -- that remains ``log_observations`` only, the
+        existing allowlist-transform safety property, untouched)."""
         """Chat Assistant Phase 33 -- a deterministic, provenance-
         preserving summary of any LOG_FILE evidence already uploaded to
         this investigation (via the Investigation Workspace -- chat
@@ -301,7 +310,7 @@ class ChatOrchestrator:
                 had_scope,
                 had_troubleshooting,
                 structured_for_job,
-            ) = self._compose_deterministic_answer(text, strategy)
+            ) = self._compose_deterministic_answer(text, strategy, log_evidence)
             if not ((had_scope or had_troubleshooting) and not sanitized_question):
                 # Something non-scope/non-troubleshooting remains to ask
                 # the LLM -- otherwise there is nothing for a job to
@@ -314,7 +323,7 @@ class ChatOrchestrator:
                 )
                 enhancement_ref = ChatEnhancementRef(job_id=job.id, status=job.status)
         else:
-            answer_text, follow_up, answer_kind = self._generate_answer(text, strategy, log_observations)
+            answer_text, follow_up, answer_kind = self._generate_answer(text, strategy, log_observations, log_evidence)
 
         focus, referenced_investigation_id, referenced_tfs_id = self._derive_focus(strategy)
         self._state.record_assistant_turn(
@@ -471,6 +480,7 @@ class ChatOrchestrator:
         question: str,
         strategy: "InvestigationStrategy",
         log_observations: "LogObservationSummary | None" = None,
+        log_evidence: "list[Evidence] | None" = None,
     ) -> tuple[str, str | None, str | None]:
         """Tries LLM generation first when a provider is wired, enabled,
         and there's a real StructuredResolution to ground it in; falls
@@ -538,7 +548,7 @@ class ChatOrchestrator:
         if (had_scope or had_troubleshooting) and not sanitized_question:
             # Nothing non-scope/non-troubleshooting is left to ask the
             # LLM at all.
-            answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question)
+            answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence)
             answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
             return answer_text, follow_up, answer_kind
 
@@ -558,7 +568,7 @@ class ChatOrchestrator:
                 # other graceful-degradation path in this codebase
                 # (ExternalKnowledgeService, _reconcile_orphaned_columns).
                 logger.warning("LLM generation failed, falling back to deterministic answer: %s", exc)
-        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question)
+        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence)
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
         return answer_text, follow_up, answer_kind
 
@@ -688,7 +698,7 @@ class ChatOrchestrator:
         return answer_text
 
     def _compose_deterministic_answer(
-        self, question: str, strategy: "InvestigationStrategy"
+        self, question: str, strategy: "InvestigationStrategy", log_evidence: "list[Evidence] | None" = None
     ) -> tuple[str, str | None, str | None, str, bool, bool, "StructuredResolution | None"]:
         """Chat Assistant Phase 37 -- composes the same deterministic
         answer ``_generate_answer``'s own fallback branch would (real
@@ -708,7 +718,7 @@ class ChatOrchestrator:
         decision this answer was already built from, never a second,
         possibly-different one."""
         sanitized_question, had_scope, had_troubleshooting, structured = self._prepare_question(question, strategy)
-        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question)
+        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence)
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
         return answer_text, follow_up, answer_kind, sanitized_question, had_scope, had_troubleshooting, structured
 
@@ -829,14 +839,32 @@ class ChatOrchestrator:
 
     # --- Deterministic answer composition (§4) ---------------------------------
 
-    def _compose_answer(self, strategy: "InvestigationStrategy", question: str = "") -> tuple[str, str | None, str | None]:
+    def _compose_answer(
+        self, strategy: "InvestigationStrategy", question: str = "", log_evidence: "list[Evidence] | None" = None
+    ) -> tuple[str, str | None, str | None]:
         """Returns ``(answer_text, follow_up, answer_kind)``.
-        ``answer_kind`` is ``"knowledge"`` when ``answer_text`` came from
-        ``_compose_knowledge_synthesis`` instead of the tier-based
-        boilerplate below -- see that method's own docstring for why,
-        and ``ChatResponse.answer_kind``'s docstring for how callers
-        should use it (never a change to ``resolution_provenance``'s
-        own semantics)."""
+        ``answer_kind`` is ``"log_analysis"`` when ``answer_text`` came
+        from ``_compose_log_analysis_answer`` (real, uploaded log
+        content -- see that method's own docstring), ``"knowledge"`` when
+        it came from ``_compose_knowledge_synthesis`` instead of the
+        tier-based boilerplate below, and ``None`` for the original,
+        unmodified tier-based text -- see ``ChatResponse.answer_kind``'s
+        docstring for how callers should use it (never a change to
+        ``resolution_provenance``'s own semantics).
+
+        Log-analysis questions are checked FIRST, ahead of the tier
+        switch below, and fire regardless of tier: "analyze this log"/
+        "show me the timeline"/"what errors do you see" are a
+        fundamentally different question type than "what is the root
+        cause" (Chat + Log Intelligence integration, §2) -- the tier-
+        based text, even at LIKELY/CONFIRMED, has no way to answer them
+        at all, since it was never designed to describe a timeline or
+        list specific log lines."""
+        if log_evidence and contains_log_analysis_question(question):
+            log_synthesis = self._compose_log_analysis_answer(log_evidence, strategy)
+            if log_synthesis is not None:
+                return log_synthesis, None, "log_analysis"
+
         structured = strategy.structured_resolution
         if structured is None:
             text, follow_up = self._compose_answer_without_structured_resolution(strategy)
@@ -1049,6 +1077,148 @@ class ChatOrchestrator:
             "cause or resolution."
         )
         return " ".join(sentences)
+
+    _LOG_ANALYSIS_MAX_TIMELINE_EVENTS = 20
+    _LOG_ANALYSIS_MAX_QUOTED_EVENTS = 5
+    _LOG_ANALYSIS_RETRY_KEYWORDS = ("retry", "retries", "retrying", "retried")
+    _LOG_ANALYSIS_TIMEOUT_KEYWORDS = ("timeout", "timed out", "time out", "time-out")
+    """Literal, closed keyword lists -- a mechanical text search over the
+    log's own real message/raw_line content, never an inferred causal
+    signal. See ``_compose_log_analysis_answer``'s own docstring for why
+    this is reported as "N event(s) mention a retry/timeout", not "a
+    retry/timeout occurred"."""
+
+    def _compose_log_analysis_answer(
+        self, log_evidence: "list[Evidence]", strategy: "InvestigationStrategy"
+    ) -> str | None:
+        """Chat + Log Intelligence integration -- deterministic,
+        evidence-only log-analysis answer built directly from the REAL,
+        already-parsed ``LogEvent``/``ExtractedEntity`` data every
+        uploaded log already carries (``Evidence.log_events``, populated
+        at upload time by the existing, unmodified ``LogIntelligenceEngine``
+        -- see ``ChatLogUploadService.upload``/``InvestigationEngine.
+        add_file_evidence``). Never a new parser, never an LLM, never a
+        paraphrase: every timestamp, message, and identifier value quoted
+        here is copied verbatim from a real ``LogEvent``/
+        ``ExtractedEntity`` already computed by that engine.
+
+        OBSERVED vs. INFERRED vs. UNKNOWN (§17/21 of the Chat + Log
+        Intelligence integration): every claim this method makes is
+        OBSERVED -- a direct fact read off the parsed events (a
+        timestamp, a severity, a message, a literal "retry"/"timeout"
+        keyword match, which entity values exist). It never claims a
+        causal relationship ("the timeout CAUSED the failure") or a root
+        cause -- the closest it comes is naming the first ERROR/FATAL
+        event as a candidate "failure point," explicitly hedged
+        ("does not by itself establish why"), never asserted as
+        confirmed. Cross-source correlation (the closing paragraph,
+        reusing the exact same real, already-retrieved Documentation/
+        Historical/Known-Bug/TFS/Wiki matches ``_compose_knowledge_
+        synthesis`` uses) is explicitly hedged too ("useful for
+        investigation, but does not by itself prove the same root cause
+        applies") -- historical similarity is never presented as proof.
+
+        Returns ``None`` only when every uploaded log's parser produced
+        zero events at all (e.g. a genuinely empty or unparseable
+        upload) -- the caller then falls back to the existing tier-based
+        text, unchanged."""
+        events: list[tuple[str, "LogEvent"]] = [
+            (evidence.title, event) for evidence in log_evidence for event in evidence.log_events
+        ]
+        if not events:
+            return None
+
+        sections: list[str] = []
+        file_count = len(log_evidence)
+        sections.append(
+            f"Your uploaded log{'s' if file_count != 1 else ''} ({file_count} file{'s' if file_count != 1 else ''}) "
+            f"contain{'s' if file_count == 1 else ''} {len(events)} parsed event(s)."
+        )
+
+        timestamped = sorted((pair for pair in events if pair[1].timestamp is not None), key=lambda pair: pair[1].timestamp)
+        if timestamped:
+            lines = [
+                f"{event.timestamp.strftime('%H:%M:%S')}  {event.level.value}  {event.message[:160] or event.raw_line[:160]}"
+                for _, event in timestamped[: self._LOG_ANALYSIS_MAX_TIMELINE_EVENTS]
+            ]
+            more = len(timestamped) - len(lines)
+            timeline_text = "Timeline (observed, in order):\n" + "\n".join(lines)
+            if more > 0:
+                timeline_text += f"\n... and {more} more event(s)."
+            sections.append(timeline_text)
+
+        errors = [event for _, event in events if event.level in (LogLevel.ERROR, LogLevel.FATAL)]
+        warnings = [event for _, event in events if event.level == LogLevel.WARN]
+        if errors:
+            quoted = "; ".join(f'"{e.message[:120] or e.raw_line[:120]}"' for e in errors[: self._LOG_ANALYSIS_MAX_QUOTED_EVENTS])
+            sections.append(f"{len(errors)} ERROR/FATAL-level event(s) observed: {quoted}.")
+        if warnings:
+            quoted = "; ".join(f'"{e.message[:120] or e.raw_line[:120]}"' for e in warnings[: self._LOG_ANALYSIS_MAX_QUOTED_EVENTS])
+            sections.append(f"{len(warnings)} WARN-level event(s) observed: {quoted}.")
+
+        retry_count = sum(
+            1 for _, e in events if any(k in (e.message or e.raw_line).lower() for k in self._LOG_ANALYSIS_RETRY_KEYWORDS)
+        )
+        timeout_count = sum(
+            1 for _, e in events if any(k in (e.message or e.raw_line).lower() for k in self._LOG_ANALYSIS_TIMEOUT_KEYWORDS)
+        )
+        if retry_count:
+            sections.append(f"{retry_count} event(s) mention a retry.")
+        if timeout_count:
+            sections.append(f"{timeout_count} event(s) mention a timeout.")
+
+        if timestamped:
+            first_error = next(((title, e) for title, e in timestamped if e.level in (LogLevel.ERROR, LogLevel.FATAL)), None)
+            if first_error is not None:
+                title, e = first_error
+                sections.append(
+                    f"Observed: the first ERROR/FATAL-level event (in \"{title}\") occurs at "
+                    f"{e.timestamp.strftime('%H:%M:%S')}: \"{e.message[:160] or e.raw_line[:160]}\". This does not by "
+                    f"itself establish why it occurred -- treat it as a starting point for investigation, not a "
+                    f"confirmed failure point."
+                )
+
+        entities_by_type: dict[str, set[str]] = {}
+        for _, event in events:
+            for entity in event.entities:
+                entities_by_type.setdefault(entity.entity_type.value, set()).add(entity.value)
+        if entities_by_type:
+            id_lines = ", ".join(
+                f"{etype}: {', '.join(sorted(values)[:5])}" for etype, values in sorted(entities_by_type.items())
+            )
+            sections.append(f"Identifiers found: {id_lines}.")
+
+        # Cross-source correlation -- the exact same real, already-
+        # retrieved evidence _compose_knowledge_synthesis uses, never a
+        # second retrieval, explicitly hedged (historical similarity is
+        # never proof -- see docstring above).
+        min_score, min_score_secondary = self._KNOWLEDGE_SYNTHESIS_MIN_SCORE, self._KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY
+        hist_matches = [m for m in strategy.historical_investigations if m.score >= min_score]
+        bug_matches = [m for m in strategy.known_bugs if m.score >= min_score_secondary]
+        tfs = strategy.tfs_matches
+        wiki = strategy.wiki_matches
+        tfs_matches = [m for m in (tfs.matches if tfs is not None and tfs.available else []) if m.score >= min_score_secondary]
+        wiki_matches = [m for m in (wiki.matches if wiki is not None and wiki.available else []) if m.score >= min_score_secondary]
+        correlation_bits: list[str] = []
+        if hist_matches:
+            correlation_bits.append(
+                "historical case" + ("s" if len(hist_matches) > 1 else "") + f' ({", ".join(f"{m.title!r}" for m in hist_matches[:2])})'
+            )
+        if bug_matches:
+            correlation_bits.append(f'known bug ({bug_matches[0].title!r})')
+        if tfs_matches and tfs_matches[0].tfs_case is not None:
+            correlation_bits.append(f'a TFS case ({tfs_matches[0].tfs_case.title!r})')
+        if wiki_matches and wiki_matches[0].wiki_page is not None:
+            correlation_bits.append(f'a Wiki page ({wiki_matches[0].wiki_page.title!r})')
+        if correlation_bits:
+            sections.append(
+                "ResolveIQ found " + ", ".join(correlation_bits) + " with similar symptoms. This similarity is useful "
+                "for investigation, but does not by itself prove the same root cause applies to your current log."
+            )
+        else:
+            sections.append("No closely matching historical case, known bug, TFS item, or Wiki page was found.")
+
+        return "\n\n".join(sections)
 
     def _compose_answer_without_structured_resolution(self, strategy: "InvestigationStrategy") -> tuple[str, str | None]:
         """Defensive fallback for a build where the relationship engine

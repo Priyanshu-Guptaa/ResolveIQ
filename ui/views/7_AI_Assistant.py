@@ -235,7 +235,8 @@ with st.chat_message("assistant"):
     if context_bits:
         st.caption(" · ".join(context_bits))
 
-    if response.get("answer_kind") == "knowledge":
+    answer_kind = response.get("answer_kind")
+    if answer_kind == "knowledge":
         # Chat Knowledge-Synthesis feature -- an informational answer is
         # not an investigation-confidence claim, so it must never be
         # shown next to a Possible/Likely/Confirmed badge (Step 18): the
@@ -244,6 +245,10 @@ with st.chat_message("assistant"):
         # it is just not presented as if it graded the informational
         # answer's own certainty.
         st.caption("📄 Informational answer assembled from ResolveIQ's knowledge base")
+    elif answer_kind == "log_analysis":
+        # Chat + Log Intelligence integration -- same reasoning: a log
+        # analysis is not an investigation-confidence claim either.
+        st.caption("📎 Log analysis assembled from your uploaded log(s)")
     elif response.get("resolution_provenance"):
         st.markdown(_PROVENANCE_BADGE.get(response["resolution_provenance"], response["resolution_provenance"]))
 
@@ -259,7 +264,7 @@ with st.chat_message("assistant"):
     if structured:
         if structured.get("root_cause"):
             st.markdown(f"**Root cause:** {structured['root_cause']}")
-        if structured.get("confidence_rationale") and response.get("answer_kind") != "knowledge":
+        if structured.get("confidence_rationale") and answer_kind not in ("knowledge", "log_analysis"):
             # Investigation-confidence-tier language ("doesn't reach a
             # single strong, corroborated source") -- suppressed for a
             # knowledge answer for the same reason the badge above is

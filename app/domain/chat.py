@@ -336,19 +336,24 @@ class ChatResponse(BaseModel):
     text is quoted or directly referenced from ``structured_resolution``
     (or, when that isn't available, ``RecommendedSolution``)."""
     answer_kind: str | None = None
-    """Chat Knowledge-Synthesis feature -- ``"knowledge"`` when
+    """``"knowledge"`` (Chat Knowledge-Synthesis feature) when
     ``answer_text`` came from ``ChatOrchestrator.
     _compose_knowledge_synthesis`` (a documentation/historical/known-bug/
     TFS/Wiki citation answer for an informational or historical
     question, used only when the investigation-confidence tier is
-    POSSIBLE/UNKNOWN and no single strong resolution exists) rather than
-    the investigation-confidence-tier boilerplate. ``None`` in every
-    other case -- unchanged behavior. Never changes ``resolution_
-    provenance``'s own semantics: that field still always reflects the
-    real, underlying investigation-confidence tier RecommendationEngine
-    computed; this field only tells a caller (the UI) when NOT to present
-    that tier as if it were a claim about the informational answer's own
-    certainty (see Chat Knowledge-Synthesis feature report, Step 18)."""
+    POSSIBLE/UNKNOWN and no single strong resolution exists). ``"log_
+    analysis"`` (Chat + Log Intelligence integration) when it came from
+    ``ChatOrchestrator._compose_log_analysis_answer`` (a real, uploaded-
+    log-derived timeline/errors/identifiers/correlation answer -- fires
+    regardless of tier, since a timeline question is a fundamentally
+    different question type than a root-cause question). ``None`` in
+    every other case -- unchanged, tier-based boilerplate. Never changes
+    ``resolution_provenance``'s own semantics: that field still always
+    reflects the real, underlying investigation-confidence tier
+    RecommendationEngine computed; this field only tells a caller (the
+    UI) when NOT to present that tier as if it were a claim about this
+    particular answer's own certainty (see Chat Knowledge-Synthesis
+    feature report, Step 18)."""
     intent: QueryIntent
     active_context: RetrievalContext
     parsed_query: ParsedQuery

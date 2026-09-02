@@ -2238,3 +2238,149 @@ def test_dashboard_cc_regression_prefers_on_topic_historical_case_over_loosely_r
 
     assert response.answer_kind == "knowledge"
     assert "Grand Bahamas CC 8.4 MR1" in response.answer_text
+
+
+# --- L. Chat + Log Intelligence integration ---------------------------------
+# --- Real usage gap: an uploaded log's real, already-parsed LogEvent/     --
+# --- ExtractedEntity detail (timestamps, severities, messages, meter/     --
+# --- correlation identifiers) was never surfaced in Chat's own answer,   --
+# --- only aggregate counts (LogObservationSummary) -- "what happened in  --
+# --- this log?"/"show me the timeline" got the same generic boilerplate  --
+# --- as any other question.
+
+_L_METER_LOG = (
+    "2026-08-29 10:00:00 INFO Command request sent. meter_number=5017071 correlation_id=abc-123\n"
+    "2026-08-29 10:00:05 INFO Response received from collector. correlation_id=abc-123\n"
+    "2026-08-29 10:00:10 WARN Retry initiated for command. meter_number=5017071\n"
+    "2026-08-29 10:00:20 ERROR Timeout waiting for meter response. meter_number=5017071 correlation_id=abc-123\n"
+    "2026-08-29 10:00:25 ERROR CommandTimeoutException: no response received\n"
+)
+
+
+def test_analyze_this_log_produces_a_real_timeline_and_identifiers_not_boilerplate(bundle):
+    """The core Chat + Log Intelligence integration finding: a genuine
+    "analyze this log" question, with a real uploaded log, must produce
+    a real, evidence-grounded summary (timeline, errors, identifiers) --
+    not the generic tier-based boilerplate."""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _L_METER_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "Analyze this log.")
+
+    assert response.answer_kind == "log_analysis"
+    assert "5 parsed event(s)" in response.answer_text
+    assert "Timeline (observed, in order):" in response.answer_text
+    assert "10:00:00" in response.answer_text and "10:00:25" in response.answer_text
+    assert "ERROR/FATAL-level event(s) observed" in response.answer_text
+    assert "event(s) mention a retry" in response.answer_text
+    assert "event(s) mention a timeout" in response.answer_text
+    assert "Observed: the first ERROR/FATAL-level event" in response.answer_text
+    assert "does not by itself establish why it occurred" in response.answer_text
+    assert "Identifiers found:" in response.answer_text
+    assert "meter_number: 5017071" in response.answer_text
+    assert "correlation_id: abc-123" in response.answer_text
+    # never invents a confirmed root cause / never touches troubleshooting fields
+    # ("not a confirmed failure point" is the composer's own safe hedge,
+    # the same idiom as Rule 4's "not yet independently verified" --
+    # what must never appear is a bare positive claim).
+    assert "is confirmed" not in response.answer_text.lower()
+    assert "has been confirmed" not in response.answer_text.lower()
+    assert response.structured_resolution.resolution_candidates == []
+
+
+def test_show_me_the_timeline_and_what_errors_do_you_see_both_answer_from_the_log(bundle):
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _L_METER_LOG.encode())
+
+    timeline_response = orchestrator.handle_message(session.id, "Show me the timeline.")
+    assert timeline_response.answer_kind == "log_analysis"
+    assert "Timeline (observed, in order):" in timeline_response.answer_text
+
+    errors_response = orchestrator.handle_message(session.id, "What errors do you see?")
+    assert errors_response.answer_kind == "log_analysis"
+    assert "ERROR/FATAL-level event(s) observed" in errors_response.answer_text
+
+
+def test_log_analysis_question_without_any_log_falls_back_to_existing_behavior(bundle):
+    """No log uploaded at all -- "analyze this log" must fall back to
+    the existing, unmodified tier-based text, never fabricate a log
+    analysis from nothing."""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Analyze this log.")
+
+    assert response.answer_kind is None
+    assert response.answer_text == "I don't have enough evidence to determine the cause."
+
+
+def test_log_analysis_never_invents_troubleshooting_steps_thin_evidence(bundle):
+    """Rule 9's exact thin-evidence contract, re-verified with a log
+    attached: a log-analysis question must never cause an invented
+    generic troubleshooting action."""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _L_METER_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "What should I check next?")
+
+    text = response.answer_text.lower()
+    for invented in ("check power", "check wiring", "verify sim", "restart the device", "reboot the meter", "verify network"):
+        assert invented not in text
+
+
+def test_log_analysis_cross_source_correlation_is_hedged_not_treated_as_proof(bundle):
+    """"Is this a known issue?" with a log attached -- a real historical
+    match must be surfaced, explicitly hedged, never presented as
+    proof of the same root cause."""
+    log_upload_service = _real_chat_log_upload_service()
+    record = _save_hi(
+        bundle["knowledge_repo"], title="Meter stuck after timeout during command response",
+        description="Similar timeout symptom observed on a different meter.",
+        root_cause="", resolution="", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.72)]
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _L_METER_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "Is this a known issue?")
+
+    assert response.answer_kind == "log_analysis"
+    assert "Meter stuck after timeout during command response" in response.answer_text
+    assert "does not by itself prove the same root cause applies" in response.answer_text
+
+
+def test_log_analysis_malicious_content_is_shown_as_quoted_log_data_never_as_a_confirmed_claim(bundle):
+    """A log-analysis answer legitimately quotes the log's OWN real
+    error text verbatim (a user should see their own uploaded log's
+    real content back, including injected text if that's genuinely
+    what the log contains) -- that is data display, not an instruction
+    being obeyed. What must NEVER happen: the injected "CONFIRMED"
+    text elevating the real, structured investigation-confidence tier,
+    or any fabricated fact appearing OUTSIDE the quoted log excerpt
+    itself (e.g. as if ResolveIQ, not the log, were asserting it)."""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "malicious.log", _F39_MALICIOUS_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "What happened in this log?")
+
+    assert response.answer_kind == "log_analysis"
+    # The real, structured confidence tier is never manipulated by text
+    # inside a quoted log line -- it still reflects only what
+    # RecommendationEngine itself computed from real retrieval.
+    assert response.resolution_provenance is not None
+    assert response.resolution_provenance.value != "confirmed"
+    # No customer/ticket identity is fabricated anywhere in the answer
+    # (RegexEntityExtractor has no customer/ticket pattern at all --
+    # verified in an earlier phase -- so nothing here could originate
+    # one even by accident).
+    assert "customer:" not in response.answer_text.lower()
