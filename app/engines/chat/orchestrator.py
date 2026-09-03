@@ -56,7 +56,12 @@ from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
 from app.engines.chat.confidence_expansion import contains_unsupported_confidence_claim
 from app.engines.chat.knowledge_question import contains_knowledge_question, extract_concept_words, lexical_overlap
-from app.engines.chat.log_question import contains_log_analysis_question
+from app.engines.chat.log_question import (
+    contains_l2_task_note_question,
+    contains_l3_escalation_question,
+    contains_log_analysis_question,
+    contains_log_comparison_question,
+)
 from app.engines.chat.scope_expansion import contains_unsupported_scope_expansion
 from app.engines.chat.scope_question import split_out_scope_clause
 from app.engines.chat.troubleshooting_expansion import contains_unsupported_troubleshooting_action
@@ -852,18 +857,39 @@ class ChatOrchestrator:
         docstring for how callers should use it (never a change to
         ``resolution_provenance``'s own semantics).
 
-        Log-analysis questions are checked FIRST, ahead of the tier
+        Log-related questions are checked FIRST, ahead of the tier
         switch below, and fire regardless of tier: "analyze this log"/
         "show me the timeline"/"what errors do you see" are a
         fundamentally different question type than "what is the root
         cause" (Chat + Log Intelligence integration, §2) -- the tier-
         based text, even at LIKELY/CONFIRMED, has no way to answer them
         at all, since it was never designed to describe a timeline or
-        list specific log lines."""
-        if log_evidence and contains_log_analysis_question(question):
-            log_synthesis = self._compose_log_analysis_answer(log_evidence, strategy)
-            if log_synthesis is not None:
-                return log_synthesis, None, "log_analysis"
+        list specific log lines. Comparison/L2/L3 are checked before the
+        general log-analysis composer since they are more specific
+        question shapes (L2/L3 Investigation Copilot phase, §7/11/12)."""
+        if log_evidence:
+            if len(log_evidence) >= 2 and contains_log_comparison_question(question):
+                comparison = self._compose_log_comparison_answer(log_evidence, strategy)
+                if comparison is not None:
+                    return comparison, None, "log_analysis"
+            if contains_l2_task_note_question(question):
+                notes = self._compose_l2_task_notes(log_evidence, strategy)
+                if notes is not None:
+                    return notes, None, "log_analysis"
+            if contains_l3_escalation_question(question):
+                escalation = self._compose_l3_escalation_summary(log_evidence, strategy)
+                if escalation is not None:
+                    return escalation, None, "log_analysis"
+            if contains_log_analysis_question(question) or contains_log_comparison_question(question):
+                # A comparison-phrased question with fewer than two real
+                # files (the branch above's own gate) still deserves a
+                # real answer about the one log that IS present, never a
+                # bare "insufficient evidence" -- see §7's own note that
+                # multi-log handling is additive, not a replacement for
+                # the single-log case.
+                log_synthesis = self._compose_log_analysis_answer(log_evidence, strategy)
+                if log_synthesis is not None:
+                    return log_synthesis, None, "log_analysis"
 
         structured = strategy.structured_resolution
         if structured is None:
@@ -1082,6 +1108,19 @@ class ChatOrchestrator:
     _LOG_ANALYSIS_MAX_QUOTED_EVENTS = 5
     _LOG_ANALYSIS_RETRY_KEYWORDS = ("retry", "retries", "retrying", "retried")
     _LOG_ANALYSIS_TIMEOUT_KEYWORDS = ("timeout", "timed out", "time out", "time-out")
+    _LOG_ANALYSIS_REQUEST_KEYWORDS = ("request sent", "command sent", "command request", "sending request", "request initiated")
+    _LOG_ANALYSIS_RESPONSE_KEYWORDS = ("response received", "received response", "acknowledg", "command accepted", "reply received")
+    _LOG_CORRELATION_ENTITY_TYPES = ("correlation_id", "request_id", "command_log_id", "session_id")
+    _LOG_METER_ENTITY_TYPES = ("meter_number", "serial_number", "endpoint_id")
+    """The only entity types this codebase's real, existing
+    ``RegexEntityExtractor`` actually recognizes that plausibly identify
+    "which meter/endpoint" (§8 of the L2/L3 Investigation Copilot phase)
+    or "which correlating transaction" (§4/§5) -- see that module's own
+    ``_PATTERN_REGISTRY``. Deliberately does NOT invent a Collector ID/
+    Device ID/Customer Account Number grouping (§15 named these, but no
+    real extractor pattern produces them) -- grouping by an entity type
+    nothing actually extracts would silently do nothing, which is worse
+    than being explicit that it isn't supported yet."""
     """Literal, closed keyword lists -- a mechanical text search over the
     log's own real message/raw_line content, never an inferred causal
     signal. See ``_compose_log_analysis_answer``'s own docstring for why
@@ -1168,15 +1207,7 @@ class ChatOrchestrator:
             sections.append(f"{timeout_count} event(s) mention a timeout.")
 
         if timestamped:
-            first_error = next(((title, e) for title, e in timestamped if e.level in (LogLevel.ERROR, LogLevel.FATAL)), None)
-            if first_error is not None:
-                title, e = first_error
-                sections.append(
-                    f"Observed: the first ERROR/FATAL-level event (in \"{title}\") occurs at "
-                    f"{e.timestamp.strftime('%H:%M:%S')}: \"{e.message[:160] or e.raw_line[:160]}\". This does not by "
-                    f"itself establish why it occurred -- treat it as a starting point for investigation, not a "
-                    f"confirmed failure point."
-                )
+            sections.append(self._compose_failure_candidates_section(timestamped))
 
         entities_by_type: dict[str, set[str]] = {}
         for _, event in events:
@@ -1187,6 +1218,14 @@ class ChatOrchestrator:
                 f"{etype}: {', '.join(sorted(values)[:5])}" for etype, values in sorted(entities_by_type.items())
             )
             sections.append(f"Identifiers found: {id_lines}.")
+
+        correlation_section = self._compose_correlation_section(events)
+        if correlation_section is not None:
+            sections.append(correlation_section)
+
+        meter_section = self._compose_multi_meter_section(events)
+        if meter_section is not None:
+            sections.append(meter_section)
 
         # Cross-source correlation -- the exact same real, already-
         # retrieved evidence _compose_knowledge_synthesis uses, never a
@@ -1219,6 +1258,299 @@ class ChatOrchestrator:
             sections.append("No closely matching historical case, known bug, TFS item, or Wiki page was found.")
 
         return "\n\n".join(sections)
+
+    def _classify_event_role(self, event: "LogEvent") -> str:
+        """L2/L3 Investigation Copilot phase (§4/§5) -- a purely
+        mechanical keyword/level classification of one event's likely
+        role in a request/response exchange. Never a claim about what
+        actually happened beyond "this event's own text/level matches
+        this closed keyword set" -- the caller is responsible for every
+        OBSERVED/INFERRED distinction built on top of this."""
+        text = (event.message or event.raw_line).lower()
+        if event.level in (LogLevel.ERROR, LogLevel.FATAL):
+            return "error"
+        if any(k in text for k in self._LOG_ANALYSIS_TIMEOUT_KEYWORDS):
+            return "timeout"
+        if any(k in text for k in self._LOG_ANALYSIS_RETRY_KEYWORDS):
+            return "retry"
+        if any(k in text for k in self._LOG_ANALYSIS_REQUEST_KEYWORDS):
+            return "request"
+        if any(k in text for k in self._LOG_ANALYSIS_RESPONSE_KEYWORDS):
+            return "response"
+        return "other"
+
+    @staticmethod
+    def _group_events_by_identifier(
+        events: "list[tuple[str, LogEvent]]", entity_types: "tuple[str, ...]"
+    ) -> "dict[tuple[str, str], list[tuple[str, LogEvent]]]":
+        """Groups ``(filename, LogEvent)`` pairs by every recognized
+        ``ExtractedEntity`` whose type is in ``entity_types`` -- an
+        event carrying more than one qualifying entity is grouped under
+        each of them (never double-counted as "the same event" across
+        different real identifiers). Purely mechanical: the grouping key
+        is a real, already-extracted entity value, never inferred."""
+        groups: dict[tuple[str, str], list[tuple[str, "LogEvent"]]] = {}
+        for title, event in events:
+            for entity in event.entities:
+                if entity.entity_type.value in entity_types:
+                    groups.setdefault((entity.entity_type.value, entity.value), []).append((title, event))
+        return groups
+
+    def _compose_failure_candidates_section(self, timestamped: "list[tuple[str, LogEvent]]") -> str:
+        """L2/L3 Investigation Copilot phase (§6) -- replaces the prior,
+        simpler "first ERROR = candidate failure point" sentence with
+        several distinct, separately-labeled OBSERVED candidates (first
+        abnormal event, first ERROR/FATAL, first retry trigger, first
+        timeout, and the log's final event with an explicit recovery-vs-
+        terminal-failure note) -- never collapsed into one, and never
+        promoted to a confirmed root cause. ``timestamped`` is already
+        sorted chronologically and non-empty (guaranteed by the only
+        caller)."""
+        candidates: list[str] = []
+
+        def _add(label: str, pair: "tuple[str, LogEvent] | None") -> None:
+            if pair is None:
+                return
+            title, event = pair
+            candidates.append(
+                f'OBSERVED: {label} at {event.timestamp.strftime("%H:%M:%S")} (in "{title}"): '
+                f'"{(event.message or event.raw_line)[:140]}".'
+            )
+
+        _add(
+            "the first abnormal (WARN or worse) event",
+            next(((t, e) for t, e in timestamped if e.level in (LogLevel.WARN, LogLevel.ERROR, LogLevel.FATAL)), None),
+        )
+        first_error = next(((t, e) for t, e in timestamped if e.level in (LogLevel.ERROR, LogLevel.FATAL)), None)
+        _add("the first ERROR/FATAL-level event", first_error)
+        _add("the first retry trigger", next(((t, e) for t, e in timestamped if self._classify_event_role(e) == "retry"), None))
+        _add("the first timeout", next(((t, e) for t, e in timestamped if self._classify_event_role(e) == "timeout"), None))
+
+        _, last_event = timestamped[-1]
+        if last_event.level in (LogLevel.INFO, LogLevel.DEBUG, LogLevel.TRACE, LogLevel.UNKNOWN) and first_error is not None:
+            candidates.append(
+                f'OBSERVED: the final parsed event (at {last_event.timestamp.strftime("%H:%M:%S")}) is '
+                f"{last_event.level.value}-level, after an earlier error -- this MAY indicate recovery, but the log "
+                f"alone does not confirm the operation ultimately succeeded."
+            )
+        elif last_event.level in (LogLevel.ERROR, LogLevel.FATAL):
+            candidates.append(
+                f'OBSERVED: the final parsed event (at {last_event.timestamp.strftime("%H:%M:%S")}) is '
+                f"{last_event.level.value}-level -- this log ends on a failure; whether that is the transaction's "
+                f"true terminal state is not established beyond what was captured here."
+            )
+
+        return (
+            "Failure candidates (each is an OBSERVED fact about the log, never a confirmed root cause):\n"
+            + "\n".join(candidates)
+        )
+
+    def _compose_correlation_section(self, events: "list[tuple[str, LogEvent]]") -> str | None:
+        """L2/L3 Investigation Copilot phase (§4/§5) -- groups events by
+        a real, shared correlating identifier (correlation ID, request
+        ID, command-log ID, or session ID -- the only entity types this
+        codebase's extractor actually recognizes for this purpose) and
+        reports the OBSERVED grouping plus, only when the group's own
+        event roles genuinely suggest a request/response or
+        request/failure shape, one clearly-labeled INFERRED sentence.
+        Deliberately never a CONFIRMED tier here: that would require
+        cross-checking against the existing, frozen ``reconstruct_flow``/
+        wiki-documented scenario data, which this method does not have
+        access to (``ChatOrchestrator`` holds no ``LogKnowledgeRepository``
+        reference) -- see this phase's own report for why that
+        integration was not attempted."""
+        groups = self._group_events_by_identifier(events, self._LOG_CORRELATION_ENTITY_TYPES)
+        multi_event_groups = {key: group for key, group in groups.items() if len(group) >= 2}
+        if not multi_event_groups:
+            return None
+
+        lines: list[str] = []
+        for (etype, value), group in sorted(multi_event_groups.items())[:5]:
+            group_sorted = sorted(group, key=lambda pair: (pair[1].timestamp is None, pair[1].timestamp))
+            roles = [self._classify_event_role(e) for _, e in group_sorted]
+            lines.append(f"OBSERVED: {len(group_sorted)} event(s) share {etype}={value!r}, roles in order: {', '.join(roles)}.")
+            if "request" in roles and roles[-1] == "response":
+                lines.append(
+                    f"INFERRED: these {etype}={value!r} events appear to belong to the same request/response "
+                    f"transaction, based on sharing this identifier and their time order -- not confirmed by "
+                    f"documentation."
+                )
+            elif ("request" in roles or "retry" in roles) and roles[-1] in ("error", "timeout"):
+                lines.append(
+                    f"INFERRED: the transaction for {etype}={value!r} appears to have ended in failure, based on "
+                    f"sharing this identifier and their time order -- not confirmed by documentation."
+                )
+        return "Correlation:\n" + "\n".join(lines)
+
+    def _compose_multi_meter_section(self, events: "list[tuple[str, LogEvent]]") -> str | None:
+        """L2/L3 Investigation Copilot phase (§8) -- when a log genuinely
+        contains more than one distinct meter/endpoint identifier
+        (meter number, serial number, or endpoint ID -- see
+        ``_LOG_METER_ENTITY_TYPES``'s own docstring for why no other
+        identifier type is used here), reports a real per-identifier
+        breakdown. Returns ``None`` for a single-identifier (or
+        zero-identifier) log -- that case is already covered by the
+        "Identifiers found" line, and a one-row "multi-meter" table
+        would be misleading noise."""
+        groups = self._group_events_by_identifier(events, self._LOG_METER_ENTITY_TYPES)
+        if len(groups) < 2:
+            return None
+        lines = []
+        for (etype, value), group in sorted(groups.items()):
+            error_count = sum(1 for _, e in group if e.level in (LogLevel.ERROR, LogLevel.FATAL))
+            retry_count = sum(1 for _, e in group if self._classify_event_role(e) == "retry")
+            lines.append(f"{value} ({etype}): {len(group)} event(s), {error_count} error(s), {retry_count} retry mention(s).")
+        return f"{len(groups)} distinct meter/endpoint identifier(s) found in this log:\n" + "\n".join(lines)
+
+    def _compose_log_comparison_answer(self, log_evidence: "list[Evidence]", strategy: "InvestigationStrategy") -> str | None:
+        """L2/L3 Investigation Copilot phase (§7) -- multi-log
+        comparison, preserving per-file identity throughout rather than
+        pooling every file's events into one timeline. Returns ``None``
+        (caller falls through to the regular single-log/tier-based path)
+        only when every file produced zero events."""
+        per_file: list[tuple[str, list[LogEvent]]] = [
+            (evidence.title, evidence.log_events) for evidence in log_evidence if evidence.log_events
+        ]
+        if not per_file:
+            return None
+
+        sections: list[str] = []
+        per_file_errors: dict[str, set[str]] = {}
+        per_file_ids: dict[str, set[str]] = {}
+        for title, file_events in per_file:
+            errors = [e for e in file_events if e.level in (LogLevel.ERROR, LogLevel.FATAL)]
+            ids = {f"{ent.entity_type.value}={ent.value}" for e in file_events for ent in e.entities}
+            per_file_errors[title] = {(e.message or e.raw_line)[:120] for e in errors}
+            per_file_ids[title] = ids
+            summary = [f"{len(file_events)} event(s), {len(errors)} error(s)/fatal(s)"]
+            if errors:
+                summary.append(f'first error: "{(errors[0].message or errors[0].raw_line)[:140]}"')
+            if ids:
+                summary.append(f"identifiers: {', '.join(sorted(ids)[:5])}")
+            sections.append(f'"{title}": ' + "; ".join(summary) + ".")
+
+        titles = list(per_file_errors.keys())
+        common_errors = set.intersection(*per_file_errors.values()) if len(per_file_errors) > 1 else set()
+        common_ids = set.intersection(*per_file_ids.values()) if len(per_file_ids) > 1 else set()
+        if common_ids:
+            sections.append(f"Common identifiers across all files: {', '.join(sorted(common_ids)[:5])}.")
+        if common_errors:
+            sections.append(f"Common error text across all files: {', '.join(repr(e) for e in sorted(common_errors)[:3])}.")
+        for title in titles:
+            unique_errors = per_file_errors[title] - set.union(*(v for k, v in per_file_errors.items() if k != title)) if len(titles) > 1 else per_file_errors[title]
+            if unique_errors:
+                sections.append(f'Errors seen only in "{title}": {", ".join(repr(e) for e in sorted(unique_errors)[:3])}.')
+        if not common_errors and not common_ids:
+            sections.append("No common identifiers or error text were found across the uploaded files.")
+        sections.append(
+            "This comparison is based only on the parsed events/identifiers above -- differing outcomes are not "
+            "by themselves proof of differing root causes."
+        )
+        return "\n\n".join(sections)
+
+    def _compose_l2_task_notes(self, log_evidence: "list[Evidence]", strategy: "InvestigationStrategy") -> str | None:
+        """L2/L3 Investigation Copilot phase (§11) -- a structured L2
+        task-note format, built ENTIRELY from already-computed real data
+        (the same log events/entities and the same real, already-
+        retrieved ``strategy`` evidence every other composer in this
+        class uses). Every field that has no real, supporting data says
+        so explicitly ("Not established from current evidence") rather
+        than being omitted or guessed -- per this phase's own explicit
+        instruction never to fabricate a missing field."""
+        events: list[tuple[str, "LogEvent"]] = [
+            (evidence.title, event) for evidence in log_evidence for event in evidence.log_events
+        ]
+        if not events:
+            return None
+        structured = strategy.structured_resolution
+        errors = [e for _, e in events if e.level in (LogLevel.ERROR, LogLevel.FATAL)]
+        timestamped = sorted((p for p in events if p[1].timestamp is not None), key=lambda p: p[1].timestamp)
+        entities_by_type: dict[str, set[str]] = {}
+        for _, event in events:
+            for entity in event.entities:
+                entities_by_type.setdefault(entity.entity_type.value, set()).add(entity.value)
+        affected = ", ".join(f"{t}: {', '.join(sorted(v)[:5])}" for t, v in sorted(entities_by_type.items())) or "Not established from current evidence."
+        environment = "Not established from current evidence."
+        if structured is not None and structured.applicability is not None:
+            app = structured.applicability
+            bits = [b for b in (app.technology_name, ", ".join(app.customer_names) or None) if b]
+            if bits:
+                environment = "; ".join(bits)
+        timeline_bits = (
+            f"{timestamped[0][1].timestamp.strftime('%H:%M:%S')} to {timestamped[-1][1].timestamp.strftime('%H:%M:%S')} "
+            f"({len(timestamped)} timestamped event(s))"
+            if timestamped
+            else "Not established from current evidence."
+        )
+        error_text = "; ".join(f'"{(e.message or e.raw_line)[:140]}"' for e in errors[:5]) or "No ERROR/FATAL-level events observed."
+        potential_cause = structured.root_cause if structured is not None and structured.root_cause else "Not established from current evidence."
+        checks = available_checks(structured) if structured is not None else []
+        next_action = "; ".join(checks) if checks else "No evidence-backed troubleshooting check is currently available."
+        correlation_line = self._compose_correlation_section(events)
+        failure_line = self._compose_failure_candidates_section(timestamped) if timestamped else "Not established from current evidence."
+
+        return "\n\n".join(
+            [
+                f"Issue: {log_evidence[0].title if len(log_evidence) == 1 else f'{len(log_evidence)} uploaded log files'} under investigation.",
+                f"Environment: {environment}",
+                f"Affected entities: {affected}",
+                f"Timeline: {timeline_bits}",
+                f"Errors: {error_text}",
+                f"Investigation performed: {len(events)} log event(s) parsed and analyzed by ResolveIQ's Log Intelligence Engine.",
+                f"Findings ({failure_line.splitlines()[0].rstrip(':')}):\n" + "\n".join(failure_line.splitlines()[1:]),
+                f"Potential cause: {potential_cause} (not confirmed by this log alone).",
+                (correlation_line or "Correlation: no shared correlating identifier was observed across multiple events."),
+                f"Next action for L2: {next_action}",
+                "Escalation to L3: recommended if the potential cause above is not established and the next action does not resolve the issue.",
+            ]
+        )
+
+    def _compose_l3_escalation_summary(self, log_evidence: "list[Evidence]", strategy: "InvestigationStrategy") -> str | None:
+        """L2/L3 Investigation Copilot phase (§12) -- same "never
+        fabricate a missing field" discipline as ``_compose_l2_task_
+        notes``, reorganized into the L3 escalation format. Reuses the
+        exact same underlying data, never a second computation of any
+        fact already established above."""
+        events: list[tuple[str, "LogEvent"]] = [
+            (evidence.title, event) for evidence in log_evidence for event in evidence.log_events
+        ]
+        if not events:
+            return None
+        structured = strategy.structured_resolution
+        errors = [e for _, e in events if e.level in (LogLevel.ERROR, LogLevel.FATAL)]
+        timestamped = sorted((p for p in events if p[1].timestamp is not None), key=lambda p: p[1].timestamp)
+        entities_by_type: dict[str, set[str]] = {}
+        for _, event in events:
+            for entity in event.entities:
+                entities_by_type.setdefault(entity.entity_type.value, set()).add(entity.value)
+        affected = ", ".join(f"{t}: {', '.join(sorted(v)[:5])}" for t, v in sorted(entities_by_type.items())) or "Not established from current evidence."
+        correlation_ids = ", ".join(
+            f"{t}={v}" for t, values in sorted(entities_by_type.items()) if t in self._LOG_CORRELATION_ENTITY_TYPES for v in sorted(values)[:3]
+        ) or "None identified."
+        min_score, min_score_secondary = self._KNOWLEDGE_SYNTHESIS_MIN_SCORE, self._KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY
+        hist_titles = [m.title for m in strategy.historical_investigations if m.score >= min_score][:3]
+        bug_titles = [m.title for m in strategy.known_bugs if m.score >= min_score_secondary][:2]
+        relevant_cases = ", ".join(hist_titles + bug_titles) or "None found above the relevance bar."
+        suspected_area = structured.root_cause if structured is not None and structured.root_cause else "Not established -- no root cause has been confirmed from current evidence."
+        failure_line = self._compose_failure_candidates_section(timestamped) if timestamped else "Not established from current evidence."
+
+        return "\n\n".join(
+            [
+                f"Problem statement: {log_evidence[0].title if len(log_evidence) == 1 else f'{len(log_evidence)} uploaded log files'} shows unresolved abnormal behavior; see Findings below.",
+                "Environment: Not established from current evidence." if structured is None or structured.applicability is None else f"Environment: {structured.applicability.technology_name or 'Not established from current evidence.'}",
+                f"Affected entities: {affected}",
+                f"Timeline: {timestamped[0][1].timestamp.strftime('%H:%M:%S')} to {timestamped[-1][1].timestamp.strftime('%H:%M:%S')} ({len(timestamped)} timestamped event(s))." if timestamped else "Timeline: Not established from current evidence.",
+                f"Error details: " + ("; ".join(f'"{(e.message or e.raw_line)[:140]}"' for e in errors[:5]) or "No ERROR/FATAL-level events observed."),
+                f"Correlation IDs / identifiers: {correlation_ids}",
+                f"Investigation performed: {len(events)} log event(s) parsed via ResolveIQ's Log Intelligence Engine; documentation, historical cases, known bugs, and TFS/Wiki were searched for correlation.",
+                f"Findings:\n" + "\n".join(failure_line.splitlines()[1:]) if timestamped else "Findings: Not established from current evidence.",
+                f"Suspected failure area: {suspected_area}",
+                f"Relevant historical cases / defects: {relevant_cases} (similarity only -- not proof of the same root cause).",
+                "What L2 already checked: log was uploaded and analyzed; evidence-backed checks (if any) were reviewed via Chat.",
+                "What L3 needs to investigate: the suspected failure area above, and whether the correlation IDs/identifiers listed connect to server-side or device-side logs not available to ResolveIQ.",
+                f"Attachments / log references: {', '.join(e.title for e in log_evidence)}.",
+            ]
+        )
 
     def _compose_answer_without_structured_resolution(self, strategy: "InvestigationStrategy") -> tuple[str, str | None]:
         """Defensive fallback for a build where the relationship engine

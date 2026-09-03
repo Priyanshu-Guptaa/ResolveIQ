@@ -54,6 +54,28 @@ LOG_ANALYSIS_PHRASES: list[str] = [
     "is this related to a known issue",
     "have we seen this before",
     "have we seen it before",
+    "what caused the timeout",
+    "why did the command fail",
+    "did the retry succeed",
+    "was the retry successful",
+    "which request caused the failure",
+    "show me the request",
+    "show me the response",
+    "show me the request/response flow",
+    "show me the request response flow",
+    "what is the likely failure point",
+    "what is the failure point",
+    "which meter is affected",
+    "which meters are affected",
+    "are multiple meters showing the same problem",
+    "find all correlation ids",
+    "find all correlation id",
+    "find all command ids",
+    "find all command id",
+    "show me all errors related to this meter",
+    "does the log indicate a communication problem",
+    "what happened to the meter",
+    "what happened to meter",
 ]
 """Note: the last four entries deliberately overlap with
 ``knowledge_question.HISTORICAL_PHRASES`` -- when a log is attached,
@@ -78,3 +100,66 @@ def contains_log_analysis_question(question: str) -> bool:
     actually exists for this turn before treating this as "answer from
     the log" -- this function only classifies the QUESTION."""
     return any(phrase_present(phrase, question) for phrase in LOG_ANALYSIS_PHRASES)
+
+
+LOG_COMPARISON_PHRASES: list[str] = [
+    "compare these logs",
+    "compare these two logs",
+    "compare the logs",
+    "which one failed",
+    "which log failed",
+    "what is common between them",
+    "what is common between these",
+    "show differences",
+    "show me the differences",
+    "why did meter a succeed",
+    "why did one succeed and the other fail",
+]
+"""L2/L3 Investigation Copilot phase -- multi-log comparison questions
+(§7). Deliberately a SEPARATE classifier/answer format from
+``LOG_ANALYSIS_PHRASES``: ``ChatOrchestrator._compose_log_comparison_
+answer`` fires only when BOTH this classifier matches AND at least two
+uploaded files are present -- a comparison question with only one file
+uploaded falls through to the regular single-log analysis, never a
+fabricated comparison against nothing."""
+
+
+def contains_log_comparison_question(question: str) -> bool:
+    """True on an exact ``LOG_COMPARISON_PHRASES`` match -- see that
+    list's own docstring for the gating contract."""
+    return any(phrase_present(phrase, question) for phrase in LOG_COMPARISON_PHRASES)
+
+
+L2_TASK_NOTE_PHRASES: list[str] = [
+    "give me l2 task notes",
+    "give me an l2 task note",
+    "give me an l2 task-note summary",
+    "l2 task notes",
+    "l2 task note summary",
+    "l2 summary",
+    "task note summary",
+]
+"""L2/L3 Investigation Copilot phase (§11) -- a structured note format,
+built entirely from already-computed real data (never fabricating a
+missing field -- see ``ChatOrchestrator._compose_l2_task_notes``'s own
+docstring)."""
+
+
+def contains_l2_task_note_question(question: str) -> bool:
+    return any(phrase_present(phrase, question) for phrase in L2_TASK_NOTE_PHRASES)
+
+
+L3_ESCALATION_PHRASES: list[str] = [
+    "prepare an l3 escalation",
+    "prepare l3 escalation",
+    "l3 escalation summary",
+    "l3 escalation",
+    "give me an l3 escalation",
+]
+"""L2/L3 Investigation Copilot phase (§12) -- see ``L2_TASK_NOTE_
+PHRASES``'s docstring for the same "never fabricate a missing field"
+discipline, applied to the L3 escalation format instead."""
+
+
+def contains_l3_escalation_question(question: str) -> bool:
+    return any(phrase_present(phrase, question) for phrase in L3_ESCALATION_PHRASES)

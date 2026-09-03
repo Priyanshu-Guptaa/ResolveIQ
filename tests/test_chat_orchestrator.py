@@ -2276,15 +2276,14 @@ def test_analyze_this_log_produces_a_real_timeline_and_identifiers_not_boilerpla
     assert "ERROR/FATAL-level event(s) observed" in response.answer_text
     assert "event(s) mention a retry" in response.answer_text
     assert "event(s) mention a timeout" in response.answer_text
-    assert "Observed: the first ERROR/FATAL-level event" in response.answer_text
-    assert "does not by itself establish why it occurred" in response.answer_text
+    assert "Failure candidates" in response.answer_text
+    assert "OBSERVED: the first ERROR/FATAL-level event" in response.answer_text
     assert "Identifiers found:" in response.answer_text
     assert "meter_number: 5017071" in response.answer_text
     assert "correlation_id: abc-123" in response.answer_text
+    assert "Correlation:" in response.answer_text
+    assert "correlation_id='abc-123'" in response.answer_text
     # never invents a confirmed root cause / never touches troubleshooting fields
-    # ("not a confirmed failure point" is the composer's own safe hedge,
-    # the same idiom as Rule 4's "not yet independently verified" --
-    # what must never appear is a bare positive claim).
     assert "is confirmed" not in response.answer_text.lower()
     assert "has been confirmed" not in response.answer_text.lower()
     assert response.structured_resolution.resolution_candidates == []
@@ -2384,3 +2383,153 @@ def test_log_analysis_malicious_content_is_shown_as_quoted_log_data_never_as_a_c
     # verified in an earlier phase -- so nothing here could originate
     # one even by accident).
     assert "customer:" not in response.answer_text.lower()
+
+
+# --- M. L2/L3 Investigation Copilot phase -----------------------------------
+
+_M_SUCCESS_FLOW_LOG = (
+    "2026-08-29 11:00:00 INFO Command request sent. correlation_id=xyz-999\n"
+    "2026-08-29 11:00:02 INFO Response received from collector. correlation_id=xyz-999\n"
+)
+_M_MULTI_METER_LOG = (
+    "2026-08-29 12:00:00 INFO Command request sent. meter_number=1111111\n"
+    "2026-08-29 12:00:05 ERROR Timeout waiting for meter response. meter_number=1111111\n"
+    "2026-08-29 12:00:10 INFO Command request sent. meter_number=2222222\n"
+    "2026-08-29 12:00:12 INFO Response received from collector. meter_number=2222222\n"
+    "2026-08-29 12:00:20 INFO Command request sent. meter_number=3333333\n"
+    "2026-08-29 12:00:25 ERROR Timeout waiting for meter response. meter_number=3333333\n"
+)
+_M_LOG_A = (
+    "2026-08-29 13:00:00 INFO Command request sent. meter_number=4444444\n"
+    "2026-08-29 13:00:05 ERROR CommandTimeoutException: no response received. meter_number=4444444\n"
+)
+_M_LOG_B = (
+    "2026-08-29 13:00:00 INFO Command request sent. meter_number=5555555\n"
+    "2026-08-29 13:00:02 INFO Response received from collector. meter_number=5555555\n"
+)
+
+
+def test_correlation_section_reports_a_successful_request_response_transaction(bundle):
+    """The positive counterpart to the earlier failure-ending
+    correlation test -- a request/response pair with no error must be
+    reported as INFERRED "same transaction", never as a failure."""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "flow.log", _M_SUCCESS_FLOW_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "Show me the request/response flow.")
+
+    assert response.answer_kind == "log_analysis"
+    assert "OBSERVED: 2 event(s) share correlation_id='xyz-999', roles in order: request, response." in response.answer_text
+    assert "same request/response transaction" in response.answer_text
+    assert "ended in failure" not in response.answer_text
+
+
+def test_multi_meter_section_reports_a_real_per_meter_breakdown(bundle):
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "multimeter.log", _M_MULTI_METER_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "Which meters are affected?")
+
+    assert response.answer_kind == "log_analysis"
+    assert "3 distinct meter/endpoint identifier(s) found in this log:" in response.answer_text
+    assert "1111111 (meter_number): 2 event(s), 1 error(s)" in response.answer_text
+    assert "2222222 (meter_number): 2 event(s), 0 error(s)" in response.answer_text
+    assert "3333333 (meter_number): 2 event(s), 1 error(s)" in response.answer_text
+
+
+def test_log_comparison_reports_per_file_summaries_and_unique_errors(bundle):
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "logA.log", _M_LOG_A.encode())
+    log_upload_service.upload(session.id, "logB.log", _M_LOG_B.encode())
+
+    response = orchestrator.handle_message(session.id, "Compare these logs.")
+
+    assert response.answer_kind == "log_analysis"
+    assert '"logA.log":' in response.answer_text
+    assert '"logB.log":' in response.answer_text
+    assert "1 error(s)/fatal(s)" in response.answer_text  # logA
+    assert "0 error(s)/fatal(s)" in response.answer_text  # logB
+    assert 'Errors seen only in "logA.log"' in response.answer_text
+    assert "not by themselves proof of differing root causes" in response.answer_text
+
+
+def test_log_comparison_question_with_only_one_log_falls_through_to_regular_analysis(bundle):
+    """§7's own gate: a comparison question needs at least two files --
+    with only one, the regular single-log analysis must still answer,
+    never an empty/fabricated comparison."""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "logA.log", _M_LOG_A.encode())
+
+    response = orchestrator.handle_message(session.id, "Compare these logs.")
+
+    assert response.answer_kind == "log_analysis"
+    assert "Timeline (observed, in order):" in response.answer_text  # the regular analysis format, not comparison
+
+
+def test_l2_task_notes_are_built_entirely_from_real_data(bundle):
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _L_METER_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "Give me L2 task notes.")
+
+    assert response.answer_kind == "log_analysis"
+    text = response.answer_text
+    assert "Issue:" in text and "meter.log" in text
+    assert "Affected entities:" in text and "meter_number: 5017071" in text
+    assert "Timeline:" in text and "10:00:00" in text
+    assert "Errors:" in text
+    assert "Investigation performed:" in text and "5 log event(s)" in text
+    assert "Findings" in text
+    assert "Potential cause:" in text and "not confirmed by this log alone" in text
+    assert "Next action for L2:" in text
+    assert "Escalation to L3:" in text
+    assert "is confirmed" not in text.lower()
+
+
+def test_l3_escalation_summary_is_built_entirely_from_real_data(bundle):
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _L_METER_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "Prepare an L3 escalation.")
+
+    assert response.answer_kind == "log_analysis"
+    text = response.answer_text
+    assert "Problem statement:" in text
+    assert "Affected entities:" in text and "meter_number: 5017071" in text
+    assert "Correlation IDs / identifiers:" in text and "correlation_id=abc-123" in text
+    assert "Suspected failure area:" in text
+    assert "Relevant historical cases / defects:" in text
+    assert "What L2 already checked:" in text
+    assert "What L3 needs to investigate:" in text
+    assert "Attachments / log references:" in text and "meter.log" in text
+    assert "is confirmed" not in text.lower()
+
+
+def test_l2_and_l3_never_fabricate_a_missing_field_when_nothing_is_established(bundle):
+    """The explicit "never fabricate a missing field" contract, with a
+    log that has no root cause and no historical/known-bug matches at
+    all -- every field must honestly say so."""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "thin.log", _F39_THIN_LOG.encode())
+
+    l2 = orchestrator.handle_message(session.id, "Give me L2 task notes.")
+    assert "Not established from current evidence" in l2.answer_text
+
+    session2 = orchestrator.create_session()
+    log_upload_service.upload(session2.id, "thin.log", _F39_THIN_LOG.encode())
+    l3 = orchestrator.handle_message(session2.id, "Prepare an L3 escalation.")
+    assert "Not established" in l3.answer_text
