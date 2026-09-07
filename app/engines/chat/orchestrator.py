@@ -55,7 +55,7 @@ from app.domain.investigation import InvestigationSession
 from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
 from app.engines.chat.confidence_expansion import contains_unsupported_confidence_claim
-from app.engines.chat.grounding_validator import validate as validate_grounding
+from app.engines.chat.grounding_validator import check_no_material_loss, validate as validate_grounding
 from app.engines.chat.knowledge_question import contains_knowledge_question, extract_concept_words, lexical_overlap
 from app.engines.chat.log_question import (
     contains_l2_task_note_question,
@@ -342,8 +342,8 @@ class ChatOrchestrator:
                 # attempt (mirrors _generate_answer's own bypass exactly).
                 job = self._enhancement_service.submit(  # type: ignore[union-attr]  -- guarded by _should_enhance_asynchronously
                     session_id,
-                    lambda sq=sanitized_question, st=structured_for_job, lo=log_observations, hs=had_scope, ht=had_troubleshooting: self._finalize_llm_answer(  # noqa: E501
-                        sq, st, lo, hs, ht
+                    lambda sq=sanitized_question, st=structured_for_job, lo=log_observations, hs=had_scope, ht=had_troubleshooting, da=answer_text: self._finalize_llm_answer(  # noqa: E501
+                        sq, st, lo, hs, ht, da
                     ),
                 )
                 enhancement_ref = ChatEnhancementRef(job_id=job.id, status=job.status)
@@ -570,22 +570,73 @@ class ChatOrchestrator:
         ``_generate_llm_answer``); it never affects the scope/
         troubleshooting-clause logic above, since it is a supplementary
         data section, not a fact that changes which sub-questions the
-        LLM is permitted to see."""
+        LLM is permitted to see.
+
+        Final LLM Orchestration Hardening -- the routing this method
+        follows changed from "try the LLM first, fall back to
+        _compose_answer only on failure/rejection" to "compose the
+        rich, evidence-grounded deterministic answer FIRST, always,
+        then let the LLM (when wired) attempt to IMPROVE it, accepting
+        that improvement only when it passes both the existing safety
+        gates AND a new completeness check." This project's own real,
+        live Ollama end-to-end testing found the exact failure this
+        fixes: for "What is process settings in CC?", the deterministic
+        knowledge synthesizer had real, cited documentation to answer
+        from, but the OLD routing never even computed that answer --
+        it tried the LLM first, which had no visibility into that
+        documentation at all (see ``_generate_llm_answer``'s own scope:
+        only ``StructuredResolution``, never Documentation/TFS/Wiki),
+        and safely-but-uselessly said "cannot be answered based on the
+        provided evidence." That LLM text passed every existing safety
+        gate (nothing fabricated) yet was strictly worse than the
+        answer ResolveIQ could already give. ``check_no_material_loss``
+        (``app.engines.chat.grounding_validator``) is the new,
+        deterministic, structural check for exactly this: does the
+        LLM's candidate answer still contain every source citation/
+        identifier/timestamp the rich deterministic answer already
+        established? If anything is missing, the LLM's answer is
+        rejected and the deterministic one is used instead -- "the LLM
+        call succeeded" is deliberately never treated as "the LLM
+        answer is acceptable" (this phase's own explicit instruction).
+        Never a second LLM call to judge the first one's quality --
+        only the same closed, regex/entity-extraction primitives
+        ``validate()`` already uses.
+
+        ``answer_kind``/``follow_up_question`` are now ALWAYS the
+        deterministic composer's own values, even when the LLM's
+        (checked, accepted) text is what is actually returned -- the
+        LLM enhances wording, it does not change what KIND of answer
+        this fundamentally is (a knowledge answer stays a knowledge
+        answer for UI purposes, e.g.)."""
         sanitized_question, had_scope, had_troubleshooting, structured = self._prepare_question(question, strategy)
+
+        # Domain-specific deterministic reasoning ALWAYS runs first
+        # (knowledge synthesis / troubleshooting synthesis / log
+        # analysis / L2/L3 / tier-based -- whichever _compose_answer
+        # itself already decides applies), regardless of whether an
+        # LLM is wired at all.
+        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence, investigation)
+        answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
 
         if (had_scope or had_troubleshooting) and not sanitized_question:
             # Nothing non-scope/non-troubleshooting is left to ask the
             # LLM at all.
-            answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence, investigation)
-            answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
             return answer_text, follow_up, answer_kind
 
         if self._llm is not None and structured is not None and self._llm.is_configured():
             try:
-                answer_text = self._attempt_llm_answer(sanitized_question, structured, log_observations)
-                if answer_text is not None:
-                    answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
-                    return answer_text, None, None
+                llm_answer = self._attempt_llm_answer(sanitized_question, structured, log_observations)
+                if llm_answer is not None:
+                    llm_answer = self._append_deterministic_statements(llm_answer, structured, had_scope, had_troubleshooting)
+                    missing = check_no_material_loss(answer_text, llm_answer)
+                    if not missing:
+                        return llm_answer, follow_up, answer_kind
+                    logger.warning(
+                        "LLM answer omitted %d real fact(s) present in the deterministic answer (%s); "
+                        "using the deterministic answer instead.",
+                        len(missing),
+                        "; ".join(missing),
+                    )
             except LLMProviderError as exc:
                 # Environmental/provider failure only (connection, timeout,
                 # HTTP error, malformed/empty response) -- never a bare
@@ -596,8 +647,6 @@ class ChatOrchestrator:
                 # other graceful-degradation path in this codebase
                 # (ExternalKnowledgeService, _reconcile_orphaned_columns).
                 logger.warning("LLM generation failed, falling back to deterministic answer: %s", exc)
-        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence, investigation)
-        answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
         return answer_text, follow_up, answer_kind
 
     def _prepare_question(
@@ -794,6 +843,7 @@ class ChatOrchestrator:
         log_observations: "LogObservationSummary | None",
         had_scope: bool,
         had_troubleshooting: bool,
+        deterministic_answer_text: str = "",
     ) -> str | None:
         """Chat Assistant Phase 37 -- the exact work an asynchronous
         enhancement job runs (see
@@ -807,13 +857,36 @@ class ChatOrchestrator:
         Returns ``None`` (meaning "no safe enhancement available," which
         ``ChatEnhancementService`` reports as REJECTED) when the answer
         was unsafe; lets ``LLMProviderError`` propagate so that service
-        can classify it as FAILED or TIMED_OUT instead."""
+        can classify it as FAILED or TIMED_OUT instead.
+
+        Final LLM Orchestration Hardening -- ``deterministic_answer_text``
+        is the same rich answer ``_compose_deterministic_answer`` already
+        produced (and the user already received synchronously) for this
+        turn; the new ``check_no_material_loss`` gate (identical to the
+        synchronous path's own -- see ``_generate_answer``'s docstring)
+        rejects an "enhancement" that would actually be LESS informative
+        than what the user already has. Defaults to ``""`` only so this
+        stays source-compatible with ``_should_enhance_asynchronously``'s
+        own precondition check, which never calls this method directly;
+        every real caller (``handle_message``'s async branch) always
+        supplies the real text."""
         if structured is None:  # pragma: no cover -- guarded by _should_enhance_asynchronously before a job is ever submitted
             return None
         answer_text = self._attempt_llm_answer(question, structured, log_observations)
         if answer_text is None:
             return None
-        return self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
+        answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
+        if deterministic_answer_text:
+            missing = check_no_material_loss(deterministic_answer_text, answer_text)
+            if missing:
+                logger.warning(
+                    "Async LLM enhancement omitted %d real fact(s) present in the deterministic answer (%s); "
+                    "rejecting the enhancement.",
+                    len(missing),
+                    "; ".join(missing),
+                )
+                return None
+        return answer_text
 
     def _should_enhance_asynchronously(self, strategy: "InvestigationStrategy") -> bool:
         """Chat Assistant Phase 37 -- True only when every precondition

@@ -475,3 +475,79 @@ def validate(
     high = [i for i in issues if i.severity == "high"]
     severity = "high" if high else ("low" if issues else "none")
     return GroundingResult(valid=not high, unsupported_claims=issues, repaired_text=repaired, severity=severity)
+
+
+_QUOTED_RE = re.compile(r'"([^"\n]{4,200})"')
+"""Every one of this codebase's real deterministic composers
+(``_compose_knowledge_synthesis``, ``_compose_troubleshooting_
+synthesis``, cross-source correlation in ``_compose_log_analysis_
+answer``) wraps a cited source TITLE in double quotes -- confirmed by
+reading each composer's own f-strings before writing this check, per
+this phase's own Step 1 audit instruction (e.g. ``f'"{primary_match.
+title}"'``, ``f'Similar historical case: "{match.title}"'``). A
+minimum 4 characters excludes an incidental short quoted fragment
+(rare in this codebase's own output) from being treated as a load-
+bearing citation."""
+
+
+def check_no_material_loss(deterministic_text: str, candidate_text: str) -> list[str]:
+    """Final LLM Orchestration Hardening, Step 10's own "practical
+    acceptance check": a deterministic, structural comparison of an
+    LLM-enhanced answer against the rich deterministic answer it is
+    meant to enhance -- never a second LLM call to judge quality (the
+    phase's own explicit instruction). Returns a list of human-
+    readable descriptions of what ``candidate_text`` is missing that
+    ``deterministic_text`` had; an empty list means no material loss
+    was detected, and the caller may accept ``candidate_text``.
+
+    Deliberately narrow, reusing exactly the same closed extraction
+    primitives ``validate()`` above already uses (``_extract_
+    identifiers``, ``_TIME_RE``) plus one new one (``_QUOTED_RE``, for
+    source-citation titles) -- NOT a generic text-similarity/ROUGE-
+    style score, which would be a judgment call this module explicitly
+    avoids making (see this module's own docstring on "not a universal
+    hallucination detector"). Checks exactly three concrete things a
+    rich deterministic answer can carry that a thin LLM replacement
+    routinely drops (this is the real, observed failure shape from
+    this project's own real-Ollama E2E testing -- a real qwen2.5:3b
+    call for a knowledge question that had real, cited documentation
+    in the deterministic answer instead said "cannot be answered based
+    on the provided evidence", silently discarding every citation):
+
+    1. Every quoted source-citation title in ``deterministic_text``
+       must still appear (verbatim) in ``candidate_text``.
+    2. Every real identifier ``deterministic_text`` cites must still
+       appear in ``candidate_text``.
+    3. Every real timestamp ``deterministic_text`` cites must still
+       appear in ``candidate_text``.
+
+    Deliberately does NOT also require the bare confidence-tier word
+    ("likely"/"possible"/etc.) to survive: this codebase's own tier-
+    based composer text uses that word as ordinary prose (e.g. "this
+    issue is likely related to..."), not as an extractable, quoted
+    fact -- a bare substring check would reject countless safe,
+    faithful rewordings that simply phrase the same tier differently,
+    which is exactly the false-positive class this module's own
+    docstring says this whole approach is designed to avoid. Rule 4's
+    existing ``contains_unsupported_confidence_claim`` gate (checked
+    separately, unconditionally, on every LLM answer) already
+    guarantees the tier itself can never be misrepresented -- this
+    function's job is narrower: don't let real, specific facts silently
+    vanish, not police every word choice."""
+    missing: list[str] = []
+
+    for title in {m.group(1) for m in _QUOTED_RE.finditer(deterministic_text)}:
+        if title not in candidate_text:
+            missing.append(f'source citation "{title}"')
+
+    deterministic_ids = _extract_identifiers(deterministic_text)
+    candidate_ids = _extract_identifiers(candidate_text)
+    for identifier in sorted(deterministic_ids - candidate_ids):
+        missing.append(f"identifier {identifier!r}")
+
+    deterministic_times = _known_times(deterministic_text)
+    candidate_times = _known_times(candidate_text)
+    for h, m, s in sorted(deterministic_times - candidate_times):
+        missing.append(f"timestamp {h}:{m}:{s}")
+
+    return missing

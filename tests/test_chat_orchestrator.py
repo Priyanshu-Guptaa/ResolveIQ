@@ -2890,3 +2890,146 @@ def test_troubleshooting_synthesis_falls_back_honestly_with_no_relevant_evidence
 
     assert "## What is observed" not in response.answer_text
     assert "## Likely causes" not in response.answer_text
+
+
+# --- O. Final LLM Orchestration Hardening -----------------------------------
+# --- The routing fix: _generate_answer now ALWAYS composes the rich      ---
+# --- deterministic answer first, and only accepts an LLM "enhancement"   ---
+# --- of it when check_no_material_loss (grounding_validator.py) confirms ---
+# --- nothing the deterministic answer established was silently dropped.
+
+
+def test_sync_thin_llm_answer_falls_back_to_rich_knowledge_synthesis(bundle):
+    """The exact real bug this phase fixes, reproduced deterministically
+    (this project's own real qwen2.5:3b end-to-end test found this
+    live): a real, cited documentation match exists, the LLM's answer
+    is safe (no fabrication) but omits the citation entirely -- the new
+    completeness gate rejects it and the user gets the rich,
+    citation-backed deterministic knowledge answer instead."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views in CRM.", 0.73)
+    ]
+    thin_answer = "The question cannot be answered based on the provided evidence."
+    llm = FakeLLMProvider(configured=True, response=thin_answer)
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "Tell me about dashboard in CC")
+
+    assert response.answer_kind == "knowledge"
+    assert "Access to Dashboard and Views in CRM" in response.answer_text
+    assert response.answer_text != thin_answer
+
+
+def test_sync_llm_enhancement_accepted_when_it_retains_the_required_citation(bundle):
+    """The positive control: an LLM answer that genuinely retains the
+    real citation is accepted -- the new gate rejects only material
+    loss, never a faithful rewording."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views in CRM.", 0.73)
+    ]
+    good_answer = 'You can access the Dashboard through "Access to Dashboard and Views in CRM" -- see the documentation for the steps.'
+    llm = FakeLLMProvider(configured=True, response=good_answer)
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "Tell me about dashboard in CC")
+
+    assert response.answer_text == good_answer
+    assert response.answer_kind == "knowledge"  # the LLM enhances wording, not what KIND of answer this is
+
+
+def test_sync_thin_llm_answer_falls_back_to_rich_log_analysis(bundle):
+    """The same fix for log-analysis questions: a thin, safe LLM answer
+    that omits the real timeline/identifiers is rejected in favor of
+    the rich, deterministic log-analysis text."""
+    log_upload_service = _real_chat_log_upload_service()
+    thin_answer = "The log shows an error occurred."
+    llm = FakeLLMProvider(configured=True, response=thin_answer)
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, llm, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _M_TIMED_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "Show me the timeline.")
+
+    assert response.answer_kind == "log_analysis"
+    assert "Timeline (observed, in order):" in response.answer_text
+    assert response.answer_text != thin_answer
+
+
+def test_sync_thin_llm_answer_falls_back_to_rich_troubleshooting_synthesis(bundle):
+    """The same fix for "why did this fail?" questions: a generic LLM
+    answer that omits the real ranked-hypothesis evidence is rejected
+    in favor of the rich deterministic troubleshooting synthesis."""
+    knowledge_repo = bundle["knowledge_repo"]
+    hi = _save_hi(
+        knowledge_repo, title="RF Mesh IP command timeout",
+        description="Meter 12345678 stopped responding after a command was sent.",
+        root_cause="", resolution="", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(hi, 0.82)]
+    thin_answer = "The request likely failed due to a communication issue."
+    llm = FakeLLMProvider(configured=True, response=thin_answer)
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(
+        session.id, "Meter 12345678 stopped responding after a command was sent -- why did this fail?"
+    )
+
+    assert "## Likely causes" in response.answer_text
+    assert response.answer_text != thin_answer
+
+
+def test_sync_llm_enhancement_still_accepted_when_deterministic_answer_has_no_citations(bundle):
+    """The tier-based LIKELY/CONFIRMED composer text never quotes a
+    title -- the new completeness gate must not become a de-facto ban
+    on all LLM enhancement; a generic-sounding but safe rewording is
+    still accepted when there is nothing structural to lose."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo)  # real root_cause/resolution -- reaches LIKELY, no quoted citations
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    llm = FakeLLMProvider(configured=True, response="Generated grounded answer.")
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "RF Mesh IP command timeout.")
+
+    assert response.answer_text == "Generated grounded answer."
+
+
+def test_async_enhancement_rejected_when_it_drops_evidence_present_in_deterministic_answer(bundle):
+    """The same new completeness gate applies to the asynchronous
+    enhancement path (_finalize_llm_answer): an enhancement that would
+    leave the user with LESS than what the deterministic answer they
+    already received established is rejected (REJECTED status), never
+    silently accepted merely because generation succeeded."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views in CRM.", 0.73)
+    ]
+    llm = GatedFakeLLMProvider(response="I don't have enough information to answer that.")
+    service = ChatEnhancementService(max_concurrent=1, max_queued=1)
+    orchestrator = _orchestrator_with_async_llm(bundle, llm, service)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "Tell me about dashboard in CC")
+
+    assert response.answer_kind == "knowledge"
+    assert "Access to Dashboard and Views in CRM" in response.answer_text  # the immediate deterministic answer
+
+    job_id = response.enhancement.job_id
+    llm.release.set()
+    assert _wait_until(lambda: service.get(job_id).status == EnhancementStatus.REJECTED)
+
+
+def test_async_enhancement_accepted_when_it_retains_the_required_evidence(bundle):
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views in CRM.", 0.73)
+    ]
+    good_answer = 'You can access the Dashboard via "Access to Dashboard and Views in CRM" -- see the documentation.'
+    llm = GatedFakeLLMProvider(response=good_answer)
+    service = ChatEnhancementService(max_concurrent=1, max_queued=1)
+    orchestrator = _orchestrator_with_async_llm(bundle, llm, service)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "Tell me about dashboard in CC")
+
+    job_id = response.enhancement.job_id
+    llm.release.set()
+    assert _wait_until(lambda: service.get(job_id).status == EnhancementStatus.COMPLETED)
+    finished = service.get(job_id)
+    assert "Access to Dashboard and Views in CRM" in finished.answer_text

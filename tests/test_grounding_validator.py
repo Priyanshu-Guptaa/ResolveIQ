@@ -6,7 +6,7 @@ tests against ``validate(answer_text, evidence_text, confidence=...)``.
 from __future__ import annotations
 
 from app.domain.provenance import ResolutionProvenance
-from app.engines.chat.grounding_validator import validate
+from app.engines.chat.grounding_validator import check_no_material_loss, validate
 
 
 def test_valid_meter_id_passes():
@@ -160,3 +160,52 @@ def test_prose_evidence_identifier_is_recognized_without_a_colon():
         "Investigation title: Meter 12345678 stopped reporting reads.",
     )
     assert result.valid
+
+
+# --- check_no_material_loss (Final LLM Orchestration Hardening, Step 10's ---
+# --- "practical acceptance check" -- an LLM answer that technically       --
+# --- generated successfully and contains no fabrication can still be      --
+# --- unacceptable because it silently drops real evidence a rich          --
+# --- deterministic answer already established.
+
+
+def test_check_no_material_loss_flags_a_dropped_source_citation():
+    """The exact real bug this phase fixes: a real, cited documentation
+    match exists in the deterministic answer, but the (safe, non-
+    fabricating) LLM answer never mentions it at all."""
+    deterministic = (
+        'Direct answer:\nBased on ResolveIQ\'s documentation "Access to Dashboard and Views in CRM": How to access.'
+    )
+    thin_llm_answer = "The question cannot be answered based on the provided evidence."
+    missing = check_no_material_loss(deterministic, thin_llm_answer)
+    assert any("Access to Dashboard and Views in CRM" in m for m in missing)
+
+
+def test_check_no_material_loss_is_empty_for_plain_tier_prose_with_no_citations():
+    """The tier-based CONFIRMED/LIKELY composer text never quotes a
+    title and rarely cites a bare identifier/timestamp -- a generic
+    LLM rewording of it must not be penalized for content that was
+    never structurally required in the first place."""
+    deterministic = (
+        "Based on the available evidence, this issue is likely related to: Collector lost network route to the "
+        "mesh gateway. This has not been independently verified."
+    )
+    generic_llm_answer = "Generated grounded answer."
+    assert check_no_material_loss(deterministic, generic_llm_answer) == []
+
+
+def test_check_no_material_loss_flags_dropped_identifiers_and_timestamps():
+    deterministic = (
+        "Timeline (observed, in order):\n10:00:00  INFO  event. meter_number: 12345678\n10:00:10  ERROR  event."
+    )
+    thin_llm_answer = "The log shows an error occurred."
+    missing = check_no_material_loss(deterministic, thin_llm_answer)
+    assert any("12345678" in m for m in missing)
+    assert any("10:00:00" in m for m in missing)
+    assert any("10:00:10" in m for m in missing)
+
+
+def test_check_no_material_loss_is_empty_when_the_llm_answer_retains_everything():
+    deterministic = 'Based on ResolveIQ\'s documentation "Access to Dashboard and Views in CRM": How to access.'
+    good_llm_answer = 'Here is how to access it, per ResolveIQ\'s documentation "Access to Dashboard and Views in CRM".'
+    assert check_no_material_loss(deterministic, good_llm_answer) == []
