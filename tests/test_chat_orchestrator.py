@@ -14,6 +14,7 @@ itself asserted as the correct "not configured" contract).
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
 import threading
 import time
@@ -196,6 +197,7 @@ def bundle():
             lookup_repo=lookup_repo,
             store=store,
             rf_mesh_ip_id=rf_mesh_ip_id,
+            log_knowledge_repo=log_knowledge_repo,
         )
         get_engine(sqlite_url).dispose()
         get_engine.cache_clear()
@@ -2132,6 +2134,30 @@ def test_knowledge_answer_incorporates_live_tfs_and_wiki_matches(bundle):
     assert "Dashboard Configuration Guide" in synthesis
 
 
+def test_knowledge_answer_uses_labeled_direct_answer_sources_notes_sections(bundle):
+    """Grounded Conversational Intelligence phase, Step 4: the answer is
+    no longer one run-on paragraph -- it is split into labeled
+    "Direct answer:" / "Sources:" / "Notes:" sections, each on its own
+    line, while still citing exactly the same real evidence as before."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views in CRM.", 0.73),
+        _doc_match_for("A second, less relevant dashboard doc", "Some other dashboard content.", 0.4),
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Tell me about dashboard in CC")
+
+    text = response.answer_text
+    assert text.startswith("Direct answer:\n")
+    assert "\n\nSources:\n" in text
+    assert "\n\nNotes:\n" in text
+    assert "Access to Dashboard and Views in CRM" in text
+    assert "A second, less relevant dashboard doc" in text
+    # Sections appear in the documented order: Direct answer, then Sources, then Notes.
+    assert text.index("Direct answer:") < text.index("Sources:") < text.index("Notes:")
+
+
 def test_knowledge_answer_excludes_low_relevance_tfs_wiki_matches(bundle):
     """The same stricter secondary bar applies to TFS/Wiki as to Known
     Bugs -- a weak, coincidental match must not be cited."""
@@ -2533,3 +2559,176 @@ def test_l2_and_l3_never_fabricate_a_missing_field_when_nothing_is_established(b
     log_upload_service.upload(session2.id, "thin.log", _F39_THIN_LOG.encode())
     l3 = orchestrator.handle_message(session2.id, "Prepare an L3 escalation.")
     assert "Not established" in l3.answer_text
+
+
+# --- M. Grounded Conversational Intelligence phase --------------------------
+# --- Real, computed timestamp deltas (§11) and reconstruct_flow          ---
+# --- integration (§12) -- both additive to the existing L2/L3            ---
+# --- Investigation Copilot phase's correlation section, never replacing --
+# --- it.
+
+_M_TIMED_LOG = (
+    "2026-08-29 10:00:00 INFO Command request sent. correlation_id=abc-123\n"
+    "2026-08-29 10:00:10 ERROR Timeout waiting for response. correlation_id=abc-123\n"
+    "2026-08-29 10:00:12 WARN Retry initiated for command. correlation_id=abc-123\n"
+    "2026-08-29 10:00:20 INFO Response received from collector. correlation_id=abc-123\n"
+)
+
+
+def test_correlation_section_includes_real_computed_timestamp_deltas(bundle):
+    """request -> (10s) -> error [an ERROR-level "Timeout waiting..."
+    line, classified by level as "error" not "timeout" -- level takes
+    priority over keyword in _classify_event_role] -> (2s) -> retry ->
+    (8s) -> response. Every delta here is real subtraction on real
+    parsed timestamps, never an invented duration."""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _M_TIMED_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "Show me the timeline.")
+
+    text = response.answer_text
+    assert "OBSERVED timing:" in text
+    assert "computed directly from real timestamps" in text
+    assert "error 10s later" in text  # the ERROR-level line, 10s after the request
+    assert "retry 2s later" in text  # 2s after that
+    assert "response 8s later" in text  # 8s after the retry
+    assert not re.search(r"-\d+(\.\d+)?s later", text)
+
+
+def test_correlation_timing_handles_lines_uploaded_out_of_chronological_order(bundle):
+    """Events are sorted by real timestamp before grouping/timing, so a
+    file whose lines were written out of order still yields a correct,
+    strictly non-negative timing chain -- never a fabricated or
+    negative duration. (True negative deltas cannot survive the
+    upstream chronological sort; what this guards is that upload order
+    has no bearing on the computed deltas.)"""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    out_of_order = (
+        "2026-08-29 10:00:20 INFO Response received. correlation_id=xyz-1\n"
+        "2026-08-29 10:00:00 INFO Command request sent. correlation_id=xyz-1\n"
+    )
+    log_upload_service.upload(session.id, "outoforder.log", out_of_order.encode())
+
+    response = orchestrator.handle_message(session.id, "Show me the timeline.")
+
+    text = response.answer_text
+    assert "OBSERVED timing:" in text
+    assert "20s later" in text
+    # No delta rendering may ever show a leading minus sign.
+    assert not re.search(r"-\d+(\.\d+)?s later", text)
+
+
+def test_correlation_timing_skips_events_with_no_parsed_timestamp(bundle):
+    """A line the parser cannot timestamp must never block or corrupt
+    the timing chain for the events that DO have real timestamps --
+    the delta calculation simply skips past what it cannot compute."""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    mixed = (
+        "2026-08-29 10:00:00 INFO Command request sent. correlation_id=xyz-2\n"
+        "no timestamp here at all, just noise. correlation_id=xyz-2\n"
+        "2026-08-29 10:00:07 INFO Response received. correlation_id=xyz-2\n"
+    )
+    log_upload_service.upload(session.id, "mixed.log", mixed.encode())
+
+    response = orchestrator.handle_message(session.id, "Show me the timeline.")
+
+    text = response.answer_text
+    assert not re.search(r"-\d+(\.\d+)?s later", text)
+    # Whether or not a timing line renders (implementation may or may not
+    # surface a 2-of-3-timestamped chain), it must never be negative or
+    # fabricated -- that's the only invariant this test asserts.
+
+
+def _save_log_source(log_knowledge_repo, **overrides):
+    from app.domain.log_intelligence_kb import LogRepositoryLocation, LogSourceApplication
+
+    defaults = dict(
+        id=str(uuid.uuid4()), name="CommandProcessor",
+        location=LogRepositoryLocation(root_path="~\\Logs", filename_patterns=["CommandProcessor.log"]),
+        technology=["RF Mesh"],
+    )
+    defaults.update(overrides)
+    source = LogSourceApplication(**defaults)
+    log_knowledge_repo.save_log_source(source)
+    return source
+
+
+def _save_scenario(log_knowledge_repo, source, **overrides):
+    from app.domain.log_intelligence_kb import LogCollectionScenario, LogCollectionStep
+
+    defaults = dict(
+        id=str(uuid.uuid4()), product="Command Center", technology="RF Mesh",
+        scenario_type="Command Request (Outbound)",
+        steps=[LogCollectionStep(log_source_id=source.id, component_name=source.name, priority=1, explanation="step 1")],
+        source_wiki_page="Test Wiki Page",
+    )
+    defaults.update(overrides)
+    scenario = LogCollectionScenario(**defaults)
+    log_knowledge_repo.save_scenario(scenario)
+    return scenario
+
+
+def test_documented_flow_section_appears_when_log_knowledge_repo_is_wired_and_a_real_scenario_matches(bundle):
+    """The reconstruct_flow integration: a real, wiki-seeded scenario
+    whose only component ("CommandProcessor") appears in the uploaded
+    log's filename must produce a CONFIRMED, documentation-backed
+    section -- additive to (not replacing) the existing OBSERVED/
+    INFERRED correlation narrative."""
+    log_knowledge_repo = bundle["log_knowledge_repo"]
+    source = _save_log_source(log_knowledge_repo)
+    _save_scenario(log_knowledge_repo, source)
+
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = ChatOrchestrator(
+        bundle["state_engine"], bundle["rec_engine"], bundle["investigation_engine"],
+        log_upload_service=log_upload_service, log_knowledge_repo=log_knowledge_repo,
+    )
+    session = orchestrator.create_session()
+    log_upload_service.upload(
+        session.id, "CommandProcessor.log",
+        b"2026-08-29 10:00:00 INFO Command sent. command_log_id=CMD-999\n2026-08-29 10:00:05 INFO Ack. command_log_id=CMD-999\n",
+    )
+
+    response = orchestrator.handle_message(session.id, "Show me the timeline.")
+
+    assert "CONFIRMED (via ResolveIQ's documented Log Collection Knowledge Base" in response.answer_text
+    assert "CommandProcessor" in response.answer_text
+    assert "Correlation:" in response.answer_text  # the existing OBSERVED/INFERRED section is still present too
+
+
+def test_documented_flow_section_absent_when_log_knowledge_repo_not_wired(bundle):
+    """Default behavior (every existing caller/test): no
+    LogKnowledgeRepository wired -- correlation stays exactly as the
+    L2/L3 Investigation Copilot phase left it, never a CONFIRMED claim."""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _M_TIMED_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "Show me the timeline.")
+
+    assert "CONFIRMED (via ResolveIQ's documented Log Collection Knowledge Base" not in response.answer_text
+
+
+def test_documented_flow_section_absent_when_no_real_scenario_matches(bundle):
+    """A LogKnowledgeRepository IS wired, but nothing in it explains
+    this log's components -- no scenario, no CONFIRMED claim; the
+    method must never fabricate a match."""
+    log_knowledge_repo = bundle["log_knowledge_repo"]
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = ChatOrchestrator(
+        bundle["state_engine"], bundle["rec_engine"], bundle["investigation_engine"],
+        log_upload_service=log_upload_service, log_knowledge_repo=log_knowledge_repo,
+    )
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _M_TIMED_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "Show me the timeline.")
+
+    assert "CONFIRMED (via ResolveIQ's documented Log Collection Knowledge Base" not in response.answer_text

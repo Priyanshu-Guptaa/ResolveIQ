@@ -71,6 +71,7 @@ from app.engines.investigation.engine import InvestigationNotFoundError
 from app.engines.llm.prompt_builder import PromptBuilder, available_checks
 from app.engines.llm.provider import LLMProviderError
 from app.engines.log_intelligence.engine import LogIntelligenceEngine
+from app.engines.log_intelligence.flow import reconstruct_flow
 
 if TYPE_CHECKING:
     from app.domain.log_flow import LogObservationSummary
@@ -82,6 +83,7 @@ if TYPE_CHECKING:
     from app.engines.investigation.engine import InvestigationEngine
     from app.engines.llm.provider import LLMProvider
     from app.engines.recommendation.engine import RecommendationEngine
+    from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +185,7 @@ class ChatOrchestrator:
         enhancement_service: "ChatEnhancementService | None" = None,
         async_enabled: bool = False,
         log_upload_service: "ChatLogUploadService | None" = None,
+        log_knowledge_repo: "LogKnowledgeRepository | None" = None,
     ) -> None:
         self._state = state_engine
         self._recommend = recommendation_engine
@@ -223,6 +226,21 @@ class ChatOrchestrator:
         Workspace upload path), so it is already present the next time
         this method re-fetches that real investigation below; no
         orchestrator change was needed for that branch."""
+        self._log_knowledge_repo = log_knowledge_repo
+        """Grounded Conversational Intelligence phase -- None (default,
+        every existing caller/test unchanged) means
+        ``_compose_documented_flow_section`` never runs and correlation
+        stays exactly as the L2/L3 Investigation Copilot phase left it
+        (OBSERVED grouping + hedged INFERRED role narrative, never
+        CONFIRMED). Only wired via DI (app/api/dependencies.py, the
+        already-existing ``_log_knowledge_repository()`` singleton --
+        no new repository implementation) lets that method additionally
+        attempt the existing, frozen ``reconstruct_flow`` (app.engines.
+        log_intelligence.flow) for a genuinely wiki-documented,
+        CONFIRMED-tier component ordering when the log's own dominant
+        correlating identifier unambiguously matches a real scenario.
+        ``flow.py`` itself is never modified -- this is purely an
+        additional caller of its existing public function."""
 
     # --- Session lifecycle (thin passthrough to ConversationStateEngine) ----
 
@@ -315,7 +333,7 @@ class ChatOrchestrator:
                 had_scope,
                 had_troubleshooting,
                 structured_for_job,
-            ) = self._compose_deterministic_answer(text, strategy, log_evidence)
+            ) = self._compose_deterministic_answer(text, strategy, log_evidence, investigation_for_retrieval)
             if not ((had_scope or had_troubleshooting) and not sanitized_question):
                 # Something non-scope/non-troubleshooting remains to ask
                 # the LLM -- otherwise there is nothing for a job to
@@ -328,7 +346,9 @@ class ChatOrchestrator:
                 )
                 enhancement_ref = ChatEnhancementRef(job_id=job.id, status=job.status)
         else:
-            answer_text, follow_up, answer_kind = self._generate_answer(text, strategy, log_observations, log_evidence)
+            answer_text, follow_up, answer_kind = self._generate_answer(
+                text, strategy, log_observations, log_evidence, investigation_for_retrieval
+            )
 
         focus, referenced_investigation_id, referenced_tfs_id = self._derive_focus(strategy)
         self._state.record_assistant_turn(
@@ -486,6 +506,7 @@ class ChatOrchestrator:
         strategy: "InvestigationStrategy",
         log_observations: "LogObservationSummary | None" = None,
         log_evidence: "list[Evidence] | None" = None,
+        investigation: "InvestigationSession | None" = None,
     ) -> tuple[str, str | None, str | None]:
         """Tries LLM generation first when a provider is wired, enabled,
         and there's a real StructuredResolution to ground it in; falls
@@ -553,7 +574,7 @@ class ChatOrchestrator:
         if (had_scope or had_troubleshooting) and not sanitized_question:
             # Nothing non-scope/non-troubleshooting is left to ask the
             # LLM at all.
-            answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence)
+            answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence, investigation)
             answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
             return answer_text, follow_up, answer_kind
 
@@ -573,7 +594,7 @@ class ChatOrchestrator:
                 # other graceful-degradation path in this codebase
                 # (ExternalKnowledgeService, _reconcile_orphaned_columns).
                 logger.warning("LLM generation failed, falling back to deterministic answer: %s", exc)
-        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence)
+        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence, investigation)
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
         return answer_text, follow_up, answer_kind
 
@@ -703,7 +724,11 @@ class ChatOrchestrator:
         return answer_text
 
     def _compose_deterministic_answer(
-        self, question: str, strategy: "InvestigationStrategy", log_evidence: "list[Evidence] | None" = None
+        self,
+        question: str,
+        strategy: "InvestigationStrategy",
+        log_evidence: "list[Evidence] | None" = None,
+        investigation: "InvestigationSession | None" = None,
     ) -> tuple[str, str | None, str | None, str, bool, bool, "StructuredResolution | None"]:
         """Chat Assistant Phase 37 -- composes the same deterministic
         answer ``_generate_answer``'s own fallback branch would (real
@@ -723,7 +748,7 @@ class ChatOrchestrator:
         decision this answer was already built from, never a second,
         possibly-different one."""
         sanitized_question, had_scope, had_troubleshooting, structured = self._prepare_question(question, strategy)
-        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence)
+        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence, investigation)
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
         return answer_text, follow_up, answer_kind, sanitized_question, had_scope, had_troubleshooting, structured
 
@@ -845,7 +870,11 @@ class ChatOrchestrator:
     # --- Deterministic answer composition (§4) ---------------------------------
 
     def _compose_answer(
-        self, strategy: "InvestigationStrategy", question: str = "", log_evidence: "list[Evidence] | None" = None
+        self,
+        strategy: "InvestigationStrategy",
+        question: str = "",
+        log_evidence: "list[Evidence] | None" = None,
+        investigation: "InvestigationSession | None" = None,
     ) -> tuple[str, str | None, str | None]:
         """Returns ``(answer_text, follow_up, answer_kind)``.
         ``answer_kind`` is ``"log_analysis"`` when ``answer_text`` came
@@ -887,7 +916,7 @@ class ChatOrchestrator:
                 # bare "insufficient evidence" -- see §7's own note that
                 # multi-log handling is additive, not a replacement for
                 # the single-log case.
-                log_synthesis = self._compose_log_analysis_answer(log_evidence, strategy)
+                log_synthesis = self._compose_log_analysis_answer(log_evidence, strategy, investigation)
                 if log_synthesis is not None:
                     return log_synthesis, None, "log_analysis"
 
@@ -1051,7 +1080,18 @@ class ChatOrchestrator:
             reverse=True,
         )
 
-        sentences: list[str] = []
+        # Grounded Conversational Intelligence phase, Step 4: restructure
+        # into explicit, labeled sections instead of one run-on paragraph
+        # -- "Direct answer" / "Sources" / "Notes". Deliberately NOT the
+        # full 5-header set the phase names ("How it works" /
+        # "Configuration" are skipped): those two would need to segment
+        # a single retrieved excerpt into sub-topics that aren't
+        # reliably present or delineated in the real snippet text, and
+        # inventing an empty or duplicated section to fill the template
+        # would itself be a small fabrication. Every section below maps
+        # 1:1 to data this method already retrieved -- nothing new is
+        # synthesized, only labeled and separated for readability.
+        direct_answer: str
         primary_match, primary_kind = None, None
         if ranked:
             top_match, top_kind, top_overlap = ranked[0]
@@ -1066,43 +1106,50 @@ class ChatOrchestrator:
                 primary_match, primary_kind = top_match, top_kind
                 excerpt = truncate_extract(primary_match.snippet, 240)
                 if primary_kind == "documentation":
-                    sentences.append(f'Based on ResolveIQ\'s documentation "{primary_match.title}": {excerpt}')
+                    direct_answer = f'Based on ResolveIQ\'s documentation "{primary_match.title}": {excerpt}'
                 else:
-                    sentences.append(f'ResolveIQ has a related historical case on record, "{primary_match.title}": {excerpt}')
+                    direct_answer = f'ResolveIQ has a related historical case on record, "{primary_match.title}": {excerpt}'
             else:
                 # Real evidence exists but none of it actually shares the
                 # question's own subject -- an honest admission, never a
                 # confident-sounding answer built from a coincidentally
                 # highest-scoring but unrelated candidate.
                 subject = " ".join(concept_words) if concept_words else "this"
-                sentences.append(
+                direct_answer = (
                     f"I found some ResolveIQ content that scored as semantically similar to \"{subject}\", but none of "
                     f"it actually shares that subject -- I couldn't find documentation or a historical case that "
                     f"specifically covers \"{subject}\"."
                 )
+        else:
+            direct_answer = ""  # unreachable in practice: the caller already required at least one match to get here
 
+        source_lines: list[str] = []
         remaining_doc_titles = [f'"{m.title}"' for m in doc_matches if m is not primary_match][:2]
         if remaining_doc_titles:
-            sentences.append(f"Related documentation: {', '.join(remaining_doc_titles)}.")
+            source_lines.append(f"Related documentation: {', '.join(remaining_doc_titles)}.")
         remaining_hist_titles = [f'"{m.title}"' for m in hist_matches if m is not primary_match][:3]
         if remaining_hist_titles:
-            sentences.append(f"ResolveIQ has related historical cases on record: {', '.join(remaining_hist_titles)}.")
+            source_lines.append(f"ResolveIQ has related historical cases on record: {', '.join(remaining_hist_titles)}.")
         if bug_matches:
             titles = ", ".join(f'"{m.title}"' for m in bug_matches[:2])
-            sentences.append(f"Related known bugs on record: {titles}.")
+            source_lines.append(f"Related known bugs on record: {titles}.")
         if tfs_matches:
             titles = ", ".join(f'"{m.tfs_case.title}"' for m in tfs_matches[:2] if m.tfs_case is not None)
             if titles:
-                sentences.append(f"Live TFS also shows: {titles}.")
+                source_lines.append(f"Live TFS also shows: {titles}.")
         if wiki_matches:
             titles = ", ".join(f'"{m.wiki_page.title}"' for m in wiki_matches[:2] if m.wiki_page is not None)
             if titles:
-                sentences.append(f"Live Wiki also shows: {titles}.")
-        sentences.append(
-            "This is informational context assembled from ResolveIQ's knowledge base -- not a validated root "
-            "cause or resolution."
+                source_lines.append(f"Live Wiki also shows: {titles}.")
+
+        sections = [f"Direct answer:\n{direct_answer}"]
+        if source_lines:
+            sections.append("Sources:\n" + "\n".join(source_lines))
+        sections.append(
+            "Notes:\nThis is informational context assembled from ResolveIQ's knowledge base -- not a validated "
+            "root cause or resolution."
         )
-        return " ".join(sentences)
+        return "\n\n".join(sections)
 
     _LOG_ANALYSIS_MAX_TIMELINE_EVENTS = 20
     _LOG_ANALYSIS_MAX_QUOTED_EVENTS = 5
@@ -1128,7 +1175,10 @@ class ChatOrchestrator:
     retry/timeout occurred"."""
 
     def _compose_log_analysis_answer(
-        self, log_evidence: "list[Evidence]", strategy: "InvestigationStrategy"
+        self,
+        log_evidence: "list[Evidence]",
+        strategy: "InvestigationStrategy",
+        investigation: "InvestigationSession | None" = None,
     ) -> str | None:
         """Chat + Log Intelligence integration -- deterministic,
         evidence-only log-analysis answer built directly from the REAL,
@@ -1222,6 +1272,11 @@ class ChatOrchestrator:
         correlation_section = self._compose_correlation_section(events)
         if correlation_section is not None:
             sections.append(correlation_section)
+
+        if investigation is not None:
+            documented_flow_section = self._compose_documented_flow_section(events, investigation)
+            if documented_flow_section is not None:
+                sections.append(documented_flow_section)
 
         meter_section = self._compose_multi_meter_section(events)
         if meter_section is not None:
@@ -1345,6 +1400,32 @@ class ChatOrchestrator:
             + "\n".join(candidates)
         )
 
+    @staticmethod
+    def _format_timing_deltas(group_sorted: "list[tuple[str, LogEvent]]", roles: list[str]) -> str | None:
+        """Grounded Conversational Intelligence phase (§11) -- real,
+        computed time differences between CONSECUTIVE events in an
+        already-time-sorted, already-role-classified correlation group.
+        Pure arithmetic on real ``LogEvent.timestamp`` values already
+        parsed by the existing, unmodified engine -- never an invented
+        or estimated duration, and never rendered at all when two
+        consecutive events don't both carry a real timestamp (a gap in
+        timestamped coverage silently breaks the chain at that point,
+        rather than pretending the missing side has a duration)."""
+        bits: list[str] = []
+        for (_, prev_event), (_, curr_event), curr_role in zip(group_sorted, group_sorted[1:], roles[1:]):
+            if prev_event.timestamp is None or curr_event.timestamp is None:
+                continue
+            delta = (curr_event.timestamp - prev_event.timestamp).total_seconds()
+            if delta < 0:
+                # Out-of-order timestamps (a malformed/unsorted log) --
+                # never report a negative or fabricated duration.
+                continue
+            delta_text = f"{delta:.0f}s" if delta == int(delta) else f"{delta:.1f}s"
+            bits.append(f"{curr_role} {delta_text} later")
+        if not bits:
+            return None
+        return f"OBSERVED timing: {', then '.join(bits)} (computed directly from real timestamps)."
+
     def _compose_correlation_section(self, events: "list[tuple[str, LogEvent]]") -> str | None:
         """L2/L3 Investigation Copilot phase (§4/§5) -- groups events by
         a real, shared correlating identifier (correlation ID, request
@@ -1352,13 +1433,16 @@ class ChatOrchestrator:
         codebase's extractor actually recognizes for this purpose) and
         reports the OBSERVED grouping plus, only when the group's own
         event roles genuinely suggest a request/response or
-        request/failure shape, one clearly-labeled INFERRED sentence.
-        Deliberately never a CONFIRMED tier here: that would require
-        cross-checking against the existing, frozen ``reconstruct_flow``/
-        wiki-documented scenario data, which this method does not have
-        access to (``ChatOrchestrator`` holds no ``LogKnowledgeRepository``
-        reference) -- see this phase's own report for why that
-        integration was not attempted."""
+        request/failure shape, one clearly-labeled INFERRED sentence,
+        plus (Grounded Conversational Intelligence phase, §11) real,
+        computed timestamp deltas between consecutive events in the
+        group when timestamps support it. Deliberately never a
+        CONFIRMED tier here for the ROLE/relationship claim (that
+        requires ``_compose_documented_flow_section``'s real wiki-
+        scenario cross-check, only available when a
+        ``LogKnowledgeRepository`` is wired -- see that method's own
+        docstring); the TIMING claim, by contrast, is real arithmetic
+        and needs no such cross-check to be stated as fact."""
         groups = self._group_events_by_identifier(events, self._LOG_CORRELATION_ENTITY_TYPES)
         multi_event_groups = {key: group for key, group in groups.items() if len(group) >= 2}
         if not multi_event_groups:
@@ -1369,6 +1453,9 @@ class ChatOrchestrator:
             group_sorted = sorted(group, key=lambda pair: (pair[1].timestamp is None, pair[1].timestamp))
             roles = [self._classify_event_role(e) for _, e in group_sorted]
             lines.append(f"OBSERVED: {len(group_sorted)} event(s) share {etype}={value!r}, roles in order: {', '.join(roles)}.")
+            timing = self._format_timing_deltas(group_sorted, roles)
+            if timing is not None:
+                lines.append(timing)
             if "request" in roles and roles[-1] == "response":
                 lines.append(
                     f"INFERRED: these {etype}={value!r} events appear to belong to the same request/response "
@@ -1381,6 +1468,77 @@ class ChatOrchestrator:
                     f"sharing this identifier and their time order -- not confirmed by documentation."
                 )
         return "Correlation:\n" + "\n".join(lines)
+
+    _LOG_FLOW_ENTITY_TYPES = ("meter_number", "serial_number", "endpoint_id", "command_log_id")
+    """Grounded Conversational Intelligence phase (§12) -- deliberately
+    a narrower list than ``_LOG_CORRELATION_ENTITY_TYPES``: the
+    existing, frozen ``reconstruct_flow`` (app.engines.log_intelligence.
+    flow) resolves each matched event's PRODUCING COMPONENT via
+    ``LogSourceApplication``/``LogCollectionScenario`` records that are
+    themselves keyed by meter/endpoint/command-log identity (see that
+    module's own docstring) -- a bare correlation/request/session ID
+    has no such component mapping in the real Log Collection Knowledge
+    Base, so passing one to ``reconstruct_flow`` would only ever return
+    ``matched_component_count=0``, never a real scenario."""
+
+    def _compose_documented_flow_section(
+        self, events: "list[tuple[str, LogEvent]]", investigation: "InvestigationSession"
+    ) -> str | None:
+        """Grounded Conversational Intelligence phase (§12) -- attempts
+        the existing, frozen ``reconstruct_flow`` for a genuinely
+        wiki-documented, CONFIRMED-tier component ordering, additive to
+        (never a replacement for) ``_compose_correlation_section``'s own
+        OBSERVED/INFERRED narrative above. ``flow.py`` itself is not
+        modified; this only calls its existing public function with an
+        AUTO-SELECTED identifier.
+
+        Auto-selection discipline (this phase's own explicit
+        requirement -- "only auto-select when unambiguous"): among
+        ``_LOG_FLOW_ENTITY_TYPES`` groups with 2+ events, the candidate
+        is the one with the STRICTLY largest event count -- a tie for
+        the largest count means no single identifier obviously
+        dominates the log, so this method deliberately does nothing
+        rather than guess which one the user actually cares about.
+
+        Returns ``None`` (no extra section -- the correlation section
+        above already covers the log) whenever: no
+        ``LogKnowledgeRepository`` is wired (``self._log_knowledge_repo
+        is None``, the default), no candidate identifier is unambiguous,
+        or ``reconstruct_flow`` itself found no real wiki scenario
+        explaining the matched components (``scenario_id is None``) --
+        a "no scenario matched" result is not treated as a reason to
+        fabricate one."""
+        if self._log_knowledge_repo is None:
+            return None
+        groups = self._group_events_by_identifier(events, self._LOG_FLOW_ENTITY_TYPES)
+        candidates = [(key, group) for key, group in groups.items() if len(group) >= 2]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: len(item[1]), reverse=True)
+        if len(candidates) > 1 and len(candidates[0][1]) == len(candidates[1][1]):
+            return None  # ambiguous -- more than one identifier ties for "dominant"
+        (etype, value), _ = candidates[0]
+
+        flow = reconstruct_flow(
+            investigation, entity_type=etype, entity_value=value, log_knowledge_repo=self._log_knowledge_repo
+        )
+        if flow.scenario_id is None or flow.matched_component_count == 0:
+            return None
+
+        lines = [
+            f"CONFIRMED (via ResolveIQ's documented Log Collection Knowledge Base, scenario "
+            f"{flow.scenario_technology or 'unspecified'}/{flow.scenario_type or 'unspecified'}): the following "
+            f"component order applies to {etype}={value!r}:"
+        ]
+        for label, steps in (("Outbound", flow.outbound_steps), ("Inbound", flow.inbound_steps)):
+            for step in steps:
+                status = f"{len(step.events)} matching event(s) found" if step.has_log_entry else "no matching event found -- a gap in this log's coverage"
+                lines.append(f"  {label} step {step.order}: {step.component_name} -- {status}.")
+        if flow.unresolved_events:
+            lines.append(
+                f"  {len(flow.unresolved_events)} matching event(s) could not be placed in this documented flow."
+            )
+        return "\n".join(lines)
 
     def _compose_multi_meter_section(self, events: "list[tuple[str, LogEvent]]") -> str | None:
         """L2/L3 Investigation Copilot phase (§8) -- when a log genuinely
