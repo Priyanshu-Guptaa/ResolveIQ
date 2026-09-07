@@ -55,6 +55,7 @@ from app.domain.investigation import InvestigationSession
 from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
 from app.engines.chat.confidence_expansion import contains_unsupported_confidence_claim
+from app.engines.chat.grounding_validator import validate as validate_grounding
 from app.engines.chat.knowledge_question import contains_knowledge_question, extract_concept_words, lexical_overlap
 from app.engines.chat.log_question import (
     contains_l2_task_note_question,
@@ -66,6 +67,7 @@ from app.engines.chat.scope_expansion import contains_unsupported_scope_expansio
 from app.engines.chat.scope_question import split_out_scope_clause
 from app.engines.chat.troubleshooting_expansion import contains_unsupported_troubleshooting_action
 from app.engines.chat.troubleshooting_question import split_out_troubleshooting_clause
+from app.engines.chat.troubleshooting_synthesis_question import contains_troubleshooting_synthesis_question
 from app.engines.external_knowledge.extraction import truncate as truncate_extract
 from app.engines.investigation.engine import InvestigationNotFoundError
 from app.engines.llm.prompt_builder import PromptBuilder, available_checks
@@ -647,8 +649,24 @@ class ChatOrchestrator:
         provider failure -- connection, timeout, empty response,
         malformed response -- which every caller must also treat as
         "fall back to the deterministic answer," exactly as this
-        project always has."""
-        answer_text = self._generate_llm_answer(question, structured, log_observations)
+        project always has.
+
+        Final Hardening Pass, Objective 1 -- a fourth gate now runs
+        after the three below: ``app.engines.chat.grounding_validator.
+        validate``, checking every specific FACT VALUE the raw answer
+        cites (an identifier, a timestamp, a computed duration, an
+        error code, a case number, a configuration value) against
+        ``evidence_text`` (the exact ``user_prompt`` the model was
+        given -- see ``_generate_llm_answer``'s own docstring). A
+        HIGH-severity finding (any claim type except an unsupported
+        configuration value) rejects the whole answer, identically to
+        the three gates below. A LOW-severity finding (an unsupported
+        configuration value only -- Step 1F's own worked example) does
+        NOT reject: the specific unsupported sentence is replaced with
+        a safe, honest fallback clause, and the REPAIRED text is what
+        this method returns -- see ``GroundingResult.repaired_text``'s
+        own docstring for why a full rejection is not used there."""
+        answer_text, evidence_text = self._generate_llm_answer(question, structured, log_observations)
         if contains_unsupported_confidence_claim(answer_text, structured.confidence):
             # Chat Assistant Phase 49 -- deterministic post-generation
             # gate, checked first (before the scope/troubleshooting gates
@@ -721,6 +739,23 @@ class ChatOrchestrator:
                 "evidence-backed checks available; falling back to deterministic answer."
             )
             return None
+
+        # Final Hardening Pass, Objective 1 -- see this method's own
+        # docstring note above for the HIGH-severity-rejects/LOW-
+        # severity-repairs split.
+        grounding = validate_grounding(answer_text, evidence_text, confidence=structured.confidence)
+        if not grounding.valid:
+            logger.warning(
+                "LLM answer contained %d unsupported fact claim(s) (%s); falling back to deterministic answer.",
+                len(grounding.unsupported_claims),
+                ", ".join(sorted({c.claim_type for c in grounding.unsupported_claims})),
+            )
+            return None
+        if grounding.repaired_text is not None and grounding.repaired_text != answer_text:
+            logger.warning(
+                "LLM answer contained an unsupported configuration value; repaired in place."
+            )
+            answer_text = grounding.repaired_text
         return answer_text
 
     def _compose_deterministic_answer(
@@ -834,8 +869,18 @@ class ChatOrchestrator:
         question: str,
         structured: "StructuredResolution",
         log_observations: "LogObservationSummary | None" = None,
-    ) -> str:
-        """Chat Assistant Phase 31 -- ``question`` here is already the
+    ) -> tuple[str, str]:
+        """Returns ``(answer_text, evidence_text)`` -- Final Hardening
+        Pass, Objective 1/Step 4: ``evidence_text`` is the exact
+        ``user_prompt`` string the provider was actually given, handed
+        back so ``_attempt_llm_answer`` can pass it to the grounding
+        validator (``app.engines.chat.grounding_validator.validate``)
+        unchanged -- never a second, separately-reconstructed
+        approximation of what the model saw. Provider-agnostic: this
+        method still knows nothing about validation; it only stops
+        discarding a string it already built.
+
+        Chat Assistant Phase 31 -- ``question`` here is already the
         sanitized (scope-clause-stripped, and, since Phase 32, also
         troubleshooting-clause-stripped when no checks exist) text;
         this method additionally strips the same clauses from
@@ -865,7 +910,7 @@ class ChatOrchestrator:
             sanitized_problem, _ = split_out_troubleshooting_clause(sanitized_problem)
         prompt_structured = structured.model_copy(update={"problem": sanitized_problem or structured.problem})
         system_prompt, user_prompt = self._prompt_builder.build(question, prompt_structured, log_observations)
-        return self._llm.generate(user_prompt, system_prompt=system_prompt)
+        return self._llm.generate(user_prompt, system_prompt=system_prompt), user_prompt
 
     # --- Deterministic answer composition (§4) ---------------------------------
 
@@ -970,6 +1015,20 @@ class ChatOrchestrator:
             synthesis = self._compose_knowledge_synthesis(strategy, question)
             if synthesis is not None:
                 return synthesis, None, "knowledge"
+
+        # Final Hardening Pass, Objective 2 -- "why did this fail?"-style
+        # questions get the richer ranked-hypothesis answer instead of
+        # the single-paragraph tier boilerplate below, when real
+        # candidate evidence exists. answer_kind stays None (unlike the
+        # knowledge/log-analysis branches) deliberately: this answer is
+        # still fundamentally a POSSIBLE/UNKNOWN-tier investigative
+        # answer -- the normal confidence badge/rationale caption should
+        # keep showing, per Objective 2D's "preserve existing confidence
+        # semantics."
+        if contains_troubleshooting_synthesis_question(question):
+            synthesis = self._compose_troubleshooting_synthesis(strategy, question, log_evidence)
+            if synthesis is not None:
+                return synthesis, None, None
 
         if tier == ResolutionProvenance.POSSIBLE:
             text = f"A possible explanation is: {subject}." if subject else "A possible explanation may exist, but the evidence found is limited."
@@ -1150,6 +1209,165 @@ class ChatOrchestrator:
             "root cause or resolution."
         )
         return "\n\n".join(sections)
+
+    _TROUBLESHOOTING_SYNTHESIS_MAX_CANDIDATES = 3
+    """Same capping discipline as everywhere else in this codebase --
+    a ranked-hypothesis answer with a dozen entries is not more useful
+    than one with the top few; the rest are still real, just not the
+    strongest candidates."""
+
+    def _troubleshooting_observed_lines(self, structured: "StructuredResolution") -> list[str]:
+        """Final Hardening Pass, Objective 2A's "What is observed"
+        section -- real, quoted evidence only (``structured.symptoms``,
+        falling back to ``structured.problem``), never a new summary or
+        inference. Deliberately does not read ``log_evidence`` directly
+        here: log-shaped questions already have their own, much richer
+        OBSERVED section in ``_compose_log_analysis_answer`` -- this
+        method is reached only for the tier-based (non-log) troubleshooting
+        path, so it stays scoped to what ``StructuredResolution`` itself
+        carries, exactly like the rest of this composer."""
+        if structured.symptoms:
+            return [f"- {structured.symptoms}"]
+        if structured.problem:
+            return [f"- {structured.problem}"]
+        return ["- No specific symptom evidence is recorded for this investigation."]
+
+    @staticmethod
+    def _troubleshooting_contradicting_line(log_evidence: "list[Evidence] | None") -> str:
+        """Final Hardening Pass, Objective 2C: "Evidence against", or
+        the required honest default when none exists -- NEVER a
+        fabricated negative. The one real, deterministic signal this
+        codebase already establishes for "something suggests recovery"
+        is reused verbatim from ``_compose_log_analysis_answer``'s own
+        OBSERVED recovery hint (the chronologically LAST parsed event
+        being non-error after an earlier one was) -- never re-derived
+        independently, so the two composers never disagree about what
+        counts as a recovery signal."""
+        if log_evidence:
+            events = [event for evidence in log_evidence for event in evidence.log_events]
+            timestamped = sorted((e for e in events if e.timestamp is not None), key=lambda e: e.timestamp)
+            if timestamped and timestamped[-1].level not in (LogLevel.ERROR, LogLevel.FATAL):
+                has_earlier_error = any(e.level in (LogLevel.ERROR, LogLevel.FATAL) for e in timestamped[:-1])
+                if has_earlier_error:
+                    return (
+                        "The most recent observed log event is not an error, which MAY indicate recovery -- "
+                        "this alone does not establish that the issue is resolved."
+                    )
+        return "No contradicting evidence identified in the current evidence."
+
+    def _compose_troubleshooting_synthesis(
+        self,
+        strategy: "InvestigationStrategy",
+        question: str,
+        log_evidence: "list[Evidence] | None" = None,
+    ) -> str | None:
+        """Final Hardening Pass, Objective 2 -- a richer, ranked-
+        hypothesis deterministic answer for "why did this fail?"-style
+        questions (``contains_troubleshooting_synthesis_question``),
+        built ENTIRELY from evidence ``RecommendationEngine.generate()``
+        already retrieved (the exact same ``strategy.documentation``/
+        ``historical_investigations``/``known_bugs`` this method's
+        sibling ``_compose_knowledge_synthesis`` already uses -- no new
+        retrieval, no LLM, no paraphrase). Reuses that method's own
+        relevance bars/re-ranking (``_KNOWLEDGE_SYNTHESIS_MIN_SCORE``,
+        ``_KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY``, ``extract_concept_
+        words``/``lexical_overlap``) rather than inventing a second,
+        possibly-diverging relevance rule.
+
+        Confidence discipline (Objective 2D): NEVER fires at LIKELY or
+        CONFIRMED tier -- at those tiers ``structured.root_cause``/
+        ``resolution_candidates`` are already the real, specific,
+        established answer, and the existing tier-based text
+        (unmodified) already states it correctly; this method would
+        only add a weaker-sounding "possible causes" framing around an
+        already-settled fact. Each individual candidate's own "Likely"/
+        "Possible" label is a plain-English rendering of that
+        candidate's own real, already-computed ``KnowledgeMatch.score``
+        against the same secondary bar knowledge synthesis already
+        uses for "strong" relevance -- never a new confidence
+        calculation, never an LLM guess.
+
+        Known-bug/historical-case separation (Objective 2E/2F): every
+        candidate is labeled by its real source kind ("Relevant known
+        bug"/"Similar historical case"/"Related documentation"), never
+        asserted as *the* current root cause.
+
+        Returns ``None`` (Objective 2G) whenever no real candidate
+        clears the relevance bar at all, OR (after the same lexical
+        re-ranking ``_compose_knowledge_synthesis`` uses) every
+        candidate has zero real subject-word overlap with the
+        question -- the caller then falls through to the existing,
+        unmodified tier-based/L2-L3 text, which already states "what is
+        observed"/"what is not established" honestly rather than this
+        method manufacturing a hypothesis merely to look complete."""
+        structured = strategy.structured_resolution
+        if structured is None or structured.confidence in (
+            ResolutionProvenance.LIKELY,
+            ResolutionProvenance.CONFIRMED,
+        ):
+            return None
+
+        min_score = self._KNOWLEDGE_SYNTHESIS_MIN_SCORE
+        min_score_secondary = self._KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY
+        hist_matches = [m for m in strategy.historical_investigations if m.score >= min_score]
+        bug_matches = [m for m in strategy.known_bugs if m.score >= min_score]
+        doc_matches = [m for m in strategy.documentation if m.score >= min_score]
+        if not (hist_matches or bug_matches or doc_matches):
+            return None
+
+        concept_words = extract_concept_words(question)
+        kind_labels = {
+            "historical": "Similar historical case",
+            "known_bug": "Relevant known bug",
+            "documentation": "Related documentation",
+        }
+        pool = (
+            [(m, "historical") for m in hist_matches]
+            + [(m, "known_bug") for m in bug_matches]
+            + [(m, "documentation") for m in doc_matches]
+        )
+        ranked = sorted(
+            pool,
+            key=lambda item: (lexical_overlap(concept_words, f"{item[0].title} {item[0].snippet[:500]}"), item[0].score),
+            reverse=True,
+        )
+        if concept_words:
+            # Same discipline as _compose_knowledge_synthesis's own
+            # "task" regression fix -- a real word-overlap match is
+            # required whenever the question has extractable subject
+            # words at all; a merely-highest-scoring, zero-overlap
+            # candidate is never presented as a likely cause.
+            ranked = [
+                item for item in ranked if lexical_overlap(concept_words, f"{item[0].title} {item[0].snippet[:500]}") > 0
+            ]
+        if not ranked:
+            return None
+        candidates = ranked[: self._TROUBLESHOOTING_SYNTHESIS_MAX_CANDIDATES]
+
+        lines: list[str] = ["## What is observed"]
+        lines.extend(self._troubleshooting_observed_lines(structured))
+
+        lines.append("\n## Likely causes")
+        contradicting = self._troubleshooting_contradicting_line(log_evidence)
+        for idx, (match, kind) in enumerate(candidates, start=1):
+            label = "Likely" if match.score >= min_score_secondary else "Possible"
+            excerpt = truncate_extract(match.snippet, 220)
+            lines.append(f"\n### {idx}. {match.title}")
+            lines.append(f"Confidence: {label}")
+            lines.append(f'\nEvidence supporting:\n- {kind_labels[kind]}: "{match.title}" -- {excerpt}')
+            lines.append(f"\nEvidence against:\n- {contradicting}")
+
+        lines.append("\n## What is NOT confirmed")
+        lines.append("The root cause is not confirmed from the current evidence.")
+
+        lines.append("\n## Next action")
+        checks = available_checks(structured)
+        if checks:
+            lines.extend(f"- {check}" for check in checks)
+        else:
+            lines.append("No evidence-backed troubleshooting check is currently available.")
+
+        return "\n".join(lines)
 
     _LOG_ANALYSIS_MAX_TIMELINE_EVENTS = 20
     _LOG_ANALYSIS_MAX_QUOTED_EVENTS = 5

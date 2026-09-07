@@ -2732,3 +2732,161 @@ def test_documented_flow_section_absent_when_no_real_scenario_matches(bundle):
     response = orchestrator.handle_message(session.id, "Show me the timeline.")
 
     assert "CONFIRMED (via ResolveIQ's documented Log Collection Knowledge Base" not in response.answer_text
+
+
+# --- N. Final Hardening Pass ------------------------------------------------
+# --- Objective 1: LLM grounding validator, wired into the real          ---
+# --- _attempt_llm_answer path (integration-level -- unit tests for the  ---
+# --- validator function itself live in tests/test_grounding_validator.py).
+# --- Objective 2: troubleshooting synthesis (ranked, evidence-backed    ---
+# --- hypotheses for "why did this fail?"-style questions).
+
+
+def test_llm_answer_with_fabricated_identifier_falls_back_to_deterministic(bundle):
+    """A fabricated meter number (not present anywhere in the evidence
+    the LLM was actually given) must be caught by the new grounding
+    gate and cause a fallback to the existing deterministic answer --
+    never reach the simulated user."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo, description="Meter 12345678 stopped responding.")
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(configured=True, response="Meter 99999999 failed to report reads.")
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "Meter 12345678 stopped responding.")
+
+    assert response.answer_text != "Meter 99999999 failed to report reads."
+    assert "99999999" not in response.answer_text
+
+
+def test_llm_answer_citing_a_real_evidenced_identifier_is_not_rejected(bundle):
+    """The mirror-image positive control: an LLM answer that cites an
+    identifier genuinely present in the evidence must pass through
+    unmodified -- the grounding gate must not reject legitimate,
+    evidence-backed text."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo, description="Meter 12345678 stopped responding.")
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(configured=True, response="Meter 12345678 stopped responding, as recorded in the evidence.")
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "Meter 12345678 stopped responding.")
+
+    assert response.answer_text == "Meter 12345678 stopped responding, as recorded in the evidence."
+
+
+def test_llm_answer_with_unsupported_configuration_value_is_repaired_not_fully_rejected(bundle):
+    """Step 1F/1J: an unsupported configuration-value claim is
+    REPAIRED in place (the specific sentence replaced with a safe,
+    honest fallback), not a full-answer rejection -- the caller must
+    receive the repaired LLM text, not the unrelated deterministic
+    tier boilerplate."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo, description="Communication timeout observed.")
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(
+        configured=True,
+        response="Communication timeout observed. Set the timeout to 999 seconds to resolve this.",
+    )
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "Communication timeout observed.")
+
+    assert "999 seconds" not in response.answer_text
+    assert "not established from current evidence" in response.answer_text
+    # Still the (repaired) LLM text, not the unrelated deterministic tier boilerplate.
+    assert "Communication timeout observed." in response.answer_text
+
+
+def test_llm_answer_with_unsupported_root_cause_language_falls_back(bundle):
+    """A definitive-causation claim ("the root cause is...") at a
+    non-CONFIRMED tier is unsupported and must fall back -- the exact
+    Step 1H scenario, driven through the real orchestrator."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(
+        knowledge_repo, description="Logs show database-related errors.",
+        root_cause="", resolution="", next_step="",  # keeps this at POSSIBLE/UNKNOWN, not LIKELY
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = FakeLLMProvider(configured=True, response="The root cause is the collector database.")
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "Logs show database-related errors.")
+
+    assert response.answer_text != "The root cause is the collector database."
+
+
+def test_troubleshooting_synthesis_shows_observed_ranked_causes_and_next_action(bundle):
+    """Objective 2A/2E/2F: a "why did this fail?" question, with real
+    historical AND known-bug matches available, produces the richer
+    ranked-hypothesis format -- observed evidence, ranked causes each
+    with their own supporting/contradicting evidence and a per-
+    candidate confidence label, a "not confirmed" statement, and a
+    next-action section -- with known bugs and historical cases each
+    correctly labeled by their real source kind, never asserted as
+    *the* current root cause."""
+    knowledge_repo = bundle["knowledge_repo"]
+    hi = _save_hi(
+        knowledge_repo, title="RF Mesh IP command timeout",
+        description="Meter 12345678 stopped responding after a command was sent.",
+        root_cause="", resolution="", next_step="",
+    )
+    bug = _save_bug(knowledge_repo, title="Known RF Mesh IP collector bug", id=str(uuid.uuid4()))
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(hi, 0.82)]
+    bundle["store"].matches[KnowledgeCollection.KNOWN_BUGS] = [_bug_match_for(bug, 0.7)]
+
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(
+        session.id, "Meter 12345678 stopped responding after a command was sent -- why did this fail?"
+    )
+
+    text = response.answer_text
+    assert "## What is observed" in text
+    assert "## Likely causes" in text
+    assert "Confidence:" in text
+    assert "Evidence supporting:" in text
+    assert "Evidence against:" in text
+    assert "No contradicting evidence identified in the current evidence." in text
+    assert "## What is NOT confirmed" in text
+    assert "The root cause is not confirmed from the current evidence." in text
+    assert "## Next action" in text
+    # Known-bug/historical-case separation (2E/2F) -- real source-kind
+    # labels present, and the unsafe collapsed claims never used.
+    assert "Relevant known bug" in text or "Similar historical case" in text
+    assert "This is the bug" not in text
+    assert "This confirms the current issue" not in text
+
+
+def test_troubleshooting_synthesis_never_overrides_a_real_likely_tier(bundle):
+    """Objective 2D: at LIKELY/CONFIRMED tier, the existing tier-based
+    text (citing the real, established root cause) is already correct
+    -- the ranked-hypothesis format must never replace it, even for a
+    "why did this fail?"-shaped question."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo, title="RF Mesh IP command timeout")  # real root_cause/resolution -- reaches LIKELY
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "RF Mesh IP command timeout -- why did this fail?")
+
+    assert "## Likely causes" not in response.answer_text
+    assert "Collector lost network route to the mesh gateway" in response.answer_text  # the real, unmodified LIKELY text
+
+
+def test_troubleshooting_synthesis_falls_back_honestly_with_no_relevant_evidence(bundle):
+    """Objective 2G: with no real candidate evidence at all, the
+    ranked-hypothesis format must never fire merely to look complete
+    -- the caller falls through to the existing, unmodified honest
+    fallback text."""
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "Why did this fail?")
+
+    assert "## What is observed" not in response.answer_text
+    assert "## Likely causes" not in response.answer_text
