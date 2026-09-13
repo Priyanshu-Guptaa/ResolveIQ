@@ -209,3 +209,32 @@ def test_check_no_material_loss_is_empty_when_the_llm_answer_retains_everything(
     deterministic = 'Based on ResolveIQ\'s documentation "Access to Dashboard and Views in CRM": How to access.'
     good_llm_answer = 'Here is how to access it, per ResolveIQ\'s documentation "Access to Dashboard and Views in CRM".'
     assert check_no_material_loss(deterministic, good_llm_answer) == []
+
+
+def test_loose_identifier_patterns_never_match_ordinary_prose_after_meter():
+    """Real bug found via this project's own live Knowledge Answering
+    testing: "The AxeI meter is a ... smart meter model" wrongly
+    captured "model" as if it were a meter NUMBER, and "AxeI meter
+    stuck in Discovered" wrongly captured "stuck" -- both ordinary
+    English words following the word "meter" in plain prose, not real
+    identifiers, then wrongly required to survive verbatim into an
+    LLM's every rewording. A real identifier always contains a digit;
+    an ordinary following word never does."""
+    deterministic = (
+        'Based on ResolveIQ\'s documentation "AxeI Meter Overview": The AxeI meter is a Landis+Gyr RF Mesh smart '
+        "meter model used for residential electricity metering."
+    )
+    reworded = (
+        'The AxeI meter, described in ResolveIQ\'s documentation "AxeI Meter Overview", is a Landis+Gyr RF Mesh '
+        "device for residential electricity metering."
+    )
+    missing = check_no_material_loss(deterministic, reworded)
+    assert missing == []  # only the real citation was required -- "model"/"overview" are not identifiers
+
+
+def test_valid_meter_id_still_recognized_after_the_prose_false_positive_fix():
+    """The digit-requirement fix must not weaken real identifier
+    detection -- a genuine numeric meter ID in prose is still caught."""
+    result = validate("Meter 99999999 failed.", "Meter: 12345678")
+    assert not result.valid
+    assert any(c.claim_type == "identifier" and c.excerpt == "99999999" for c in result.unsupported_claims)

@@ -97,7 +97,17 @@ _HAVE_WE_SEEN_BEFORE_RE = re.compile(r"\bhave we seen\b.+\bbefore\b", re.IGNOREC
 still closed-form regexes anchored on the same fixed lead-in/trailing
 words as the phrase-list entries, never a free-form heuristic."""
 
-_WHAT_IS_RE = re.compile(r"\bwhat(?:'s| is)\s+(.+?)[?.!]?\s*$", re.IGNORECASE)
+_WHAT_IS_RE = re.compile(r"\bwhat(?:'s| is| are)\s+(.+?)[?.!]?\s*$", re.IGNORECASE)
+"""Knowledge Answering & Evidence Synthesis phase -- extended to also
+match "what ARE X" (e.g. "What are process settings in CC?"), a real
+gap this phase's own worked example exposed: the original regex only
+matched the singular "what is"/"what's", so a perfectly ordinary
+plural-noun definition question ("what ARE process settings") was
+never recognized as a knowledge question at all. The same reserved-
+investigation-lead-ins guard below still applies unchanged (a
+"the root cause"/"the resolution" prefix check is a prefix of its own
+plural form too, e.g. "the root causes".startswith("the root cause")
+is True), so this widening adds no new false-positive risk."""
 _RESERVED_INVESTIGATION_LEAD_INS: tuple[str, ...] = (
     "the root cause",
     "the likely root cause",
@@ -157,6 +167,24 @@ patterns actually use) -- conservative by construction, same as every
 other list in this module."""
 
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+
+
+def is_definitional_question(question: str) -> bool:
+    """Knowledge Answering & Evidence Synthesis phase -- True for the
+    narrow "what IS this thing" shape ("what is X", "what's X", "what
+    are X", "how does X work") this project's own real complaint (a
+    historical incident being presented as if it defined "AxeI meter")
+    was specifically about. Reuses the exact same closed regexes
+    ``contains_knowledge_question`` already matches against -- never a
+    second, independently-maintained pattern -- so this can never
+    diverge from what actually counts as a knowledge question in the
+    first place. Used by ``ChatOrchestrator._compose_knowledge_
+    synthesis`` to decide whether an extra, explicit "a historical case
+    is not a definition" caveat is required when the best available
+    evidence is historical rather than authoritative documentation."""
+    if _WHAT_IS_RE.search(question) or _HOW_DOES_WORK_RE.search(question):
+        return True
+    return False
 
 
 def extract_concept_words(question: str) -> list[str]:

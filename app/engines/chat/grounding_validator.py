@@ -266,14 +266,31 @@ def _extract_identifiers(text: str) -> set[str]:
     PATTERNS``'s own docstring for why symmetry matters here). Values
     are uppercased for comparison only, so "cmd-999" and "CMD-999" are
     recognized as the same real identifier regardless of which case the
-    evidence happened to use versus how the model echoed it."""
+    evidence happened to use versus how the model echoed it.
+
+    Real bug found via this project's own live Knowledge Answering
+    testing: the loose patterns' separator-optional design (needed so
+    "Meter 99999999 failed" is recognized without a colon) also matched
+    ordinary English continuation words in plain prose -- "The AxeI
+    METER is a ... METER MODEL" captured "model" as if it were a meter
+    NUMBER, and "AxeI meter STUCK in Discovered" captured "stuck", both
+    then wrongly treated as required facts an LLM enhancement had to
+    echo back verbatim. Every real identifier example anywhere in this
+    project (meter/serial/endpoint/command-log/request/correlation/
+    session) contains at least one digit -- an ordinary English word
+    following "meter"/"serial"/etc. never does -- so loose-pattern
+    matches are now filtered to require one, closing this false-
+    positive class without narrowing the strict, colon/equals-anchored
+    patterns at all (those already can't match a bare English word)."""
     values = {
         e.value.upper()
         for e in RegexEntityExtractor().extract(text)
         if e.entity_type in _IDENTIFIER_ENTITY_TYPES
     }
     for pattern in _LOOSE_IDENTIFIER_PATTERNS.values():
-        values.update(m.group(1).upper() for m in pattern.finditer(text))
+        values.update(
+            m.group(1).upper() for m in pattern.finditer(text) if any(c.isdigit() for c in m.group(1))
+        )
     return values
 
 

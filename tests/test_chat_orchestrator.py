@@ -2134,11 +2134,12 @@ def test_knowledge_answer_incorporates_live_tfs_and_wiki_matches(bundle):
     assert "Dashboard Configuration Guide" in synthesis
 
 
-def test_knowledge_answer_uses_labeled_direct_answer_sources_notes_sections(bundle):
-    """Grounded Conversational Intelligence phase, Step 4: the answer is
-    no longer one run-on paragraph -- it is split into labeled
-    "Direct answer:" / "Sources:" / "Notes:" sections, each on its own
-    line, while still citing exactly the same real evidence as before."""
+def test_knowledge_answer_uses_labeled_answer_evidence_notconfirmed_sections(bundle):
+    """Knowledge Answering & Evidence Synthesis phase, Step 9: the
+    answer is split into labeled "## Answer" / "## Why I'm saying
+    this" / "## Relevant evidence" / "## What is not confirmed"
+    sections, each on its own line, while still citing exactly the
+    same real evidence as before."""
     bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
         _doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views in CRM.", 0.73),
         _doc_match_for("A second, less relevant dashboard doc", "Some other dashboard content.", 0.4),
@@ -2149,13 +2150,19 @@ def test_knowledge_answer_uses_labeled_direct_answer_sources_notes_sections(bund
     response = orchestrator.handle_message(session.id, "Tell me about dashboard in CC")
 
     text = response.answer_text
-    assert text.startswith("Direct answer:\n")
-    assert "\n\nSources:\n" in text
-    assert "\n\nNotes:\n" in text
+    assert text.startswith("## Answer\n")
+    assert "\n\n## Why I'm saying this\n" in text
+    assert "\n\n## Relevant evidence\n" in text
+    assert "\n\n## What is not confirmed\n" in text
     assert "Access to Dashboard and Views in CRM" in text
     assert "A second, less relevant dashboard doc" in text
-    # Sections appear in the documented order: Direct answer, then Sources, then Notes.
-    assert text.index("Direct answer:") < text.index("Sources:") < text.index("Notes:")
+    # Sections appear in the documented order.
+    assert (
+        text.index("## Answer")
+        < text.index("## Why I'm saying this")
+        < text.index("## Relevant evidence")
+        < text.index("## What is not confirmed")
+    )
 
 
 def test_knowledge_answer_excludes_low_relevance_tfs_wiki_matches(bundle):
@@ -2847,14 +2854,15 @@ def test_troubleshooting_synthesis_shows_observed_ranked_causes_and_next_action(
 
     text = response.answer_text
     assert "## What is observed" in text
+    assert "## What this likely means" in text
     assert "## Likely causes" in text
     assert "Confidence:" in text
     assert "Evidence supporting:" in text
     assert "Evidence against:" in text
     assert "No contradicting evidence identified in the current evidence." in text
-    assert "## What is NOT confirmed" in text
+    assert "## What is not confirmed" in text
     assert "The root cause is not confirmed from the current evidence." in text
-    assert "## Next action" in text
+    assert "## What to check next" in text
     # Known-bug/historical-case separation (2E/2F) -- real source-kind
     # labels present, and the unsafe collapsed claims never used.
     assert "Relevant known bug" in text or "Similar historical case" in text
@@ -3033,3 +3041,197 @@ def test_async_enhancement_accepted_when_it_retains_the_required_evidence(bundle
     assert _wait_until(lambda: service.get(job_id).status == EnhancementStatus.COMPLETED)
     finished = service.get(job_id)
     assert "Access to Dashboard and Views in CRM" in finished.answer_text
+
+
+# --- P. Knowledge Answering & Evidence Synthesis ----------------------------
+# --- The real reported bug: a historical incident mentioning a product   ---
+# --- ("Empresa Electrica de Guatemala | ... | Focus AxeI meter           ---
+# --- discovered") was presented as if it DEFINED "AxeI meter" -- a       ---
+# --- historical case may prove something happened; it never establishes ---
+# --- what a product/concept IS.
+
+
+def test_axei_definition_prefers_authoritative_documentation_over_historical_case(bundle):
+    """Step 12: with BOTH a real Documentation match that actually
+    defines AxeI AND a historical case that merely mentions it (tied
+    lexical overlap -- both real-world titles contain "AxeI meter"),
+    the documentation must be the primary source, never the historical
+    incident (the new documentation-priority tiebreak, §5)."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "AxeI Meter Overview",
+            "The AxeI meter is a Landis+Gyr RF Mesh smart meter model used for residential electricity metering.",
+            0.7,
+        )
+    ]
+    record = _save_hi(
+        bundle["knowledge_repo"],
+        title="Empresa Electrica de Guatemala | Self Hosted | Focus AxeI meter discovered",
+        description="AxeI meter stuck in Discovered state after firmware push.",
+        root_cause="", resolution="", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.7)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is AxeI meter?")
+
+    assert response.answer_kind == "knowledge"
+    text = response.answer_text
+    assert 'Based on ResolveIQ\'s documentation "AxeI Meter Overview"' in text
+    assert "Landis+Gyr RF Mesh smart meter" in text
+    # The historical case is still cited for context, but clearly labeled -- never presented as the definition.
+    assert "(historical case)" in text
+    assert text.index("## Answer") < text.index("(historical case)")
+
+
+def test_axei_definition_honest_admission_when_only_historical_case_exists(bundle):
+    """The exact real reported bug, reproduced: NO authoritative
+    documentation exists for AxeI, only a historical case that happens
+    to mention it -- the answer must explicitly say a definition was
+    not found, never present the historical case as if it defined the
+    product, and never hallucinate a product property that isn't in
+    the evidence."""
+    record = _save_hi(
+        bundle["knowledge_repo"],
+        title="Empresa Electrica de Guatemala | Self Hosted | Focus AxeI meter discovered",
+        description="AxeI meter stuck in Discovered state after firmware push.",
+        root_cause="", resolution="", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.7)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is AxeI meter?")
+
+    assert response.answer_kind == "knowledge"
+    text = response.answer_text
+    assert "Empresa Electrica de Guatemala" in text  # still cited, for context
+    assert "not authoritative documentation" in text
+    assert "does not have documentation on record that specifically defines this" in text
+    # No hallucinated product properties -- the answer never invents what AxeI IS.
+    assert "AxeI is a" not in text
+    assert "AxeI meter is a" not in text
+
+
+def test_axei_troubleshooting_stuck_in_discovered_ranks_causes_from_evidence(bundle):
+    """Step 12's second scenario: a state-complaint + recovery request
+    ("stuck in discovered... how do I make it normal?") is recognized
+    as TROUBLESHOOTING (not answered as a bare definition question),
+    and produces ranked, evidence-backed causes -- never an unsupported
+    root cause, never the generic "possible explanation may exist"
+    boilerplate when real, on-topic evidence exists."""
+    knowledge_repo = bundle["knowledge_repo"]
+    hi = _save_hi(
+        knowledge_repo, title="Meters stuck in Discovered",
+        description="AxeI meters stuck in Discovered state after firmware push; root cause under investigation.",
+        root_cause="", resolution="", next_step="",
+    )
+    bug = _save_bug(
+        knowledge_repo, title="AxeI registration handshake known bug", id=str(uuid.uuid4()),
+        workaround="",  # keeps this at POSSIBLE/UNKNOWN, not LIKELY (same discipline as every _save_hi fixture above)
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(hi, 0.75)]
+    bundle["store"].matches[KnowledgeCollection.KNOWN_BUGS] = [_bug_match_for(bug, 0.7)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "AxeI meters are stuck in discovered how do I make it normal?")
+
+    text = response.answer_text
+    assert "## What is observed" in text
+    assert "## What this likely means" in text
+    assert "## Likely causes" in text
+    assert "Confidence:" in text
+    assert "The root cause is not confirmed from the current evidence." in text
+    assert "## What to check next" in text
+    assert response.debug is not None
+    assert response.debug["intent"] == "troubleshooting"
+    assert response.debug["state"] == "Discovered"
+
+
+def test_process_settings_cc_synthesizes_real_explanation_not_a_document_list(bundle):
+    """Step 13: the answer must be a synthesized explanation quoting
+    the real documentation, not a bare list of document titles."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "Process Settings in Command Center",
+            "Process settings in CC control how scheduled jobs run: interval, retry count, and enabled/disabled "
+            "state, configured under Admin > Process Settings.",
+            0.75,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is process settings in CC?")
+
+    assert response.answer_kind == "knowledge"
+    text = response.answer_text
+    assert "Process Settings in Command Center" in text
+    assert "interval, retry count, and enabled/disabled state" in text
+    assert "Admin > Process Settings" in text
+    assert text.startswith("## Answer\n")
+
+
+def test_dashboard_cc_synthesizes_real_explanation_historical_never_dominates(bundle):
+    """Step 14: a definition question about the CC Dashboard, with only
+    a loosely-related historical investigation also on record, must
+    synthesize from the real documentation -- the historical
+    investigation must not dominate a definition question."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "Dashboard Overview in Command Center",
+            "The CC Dashboard shows active investigations, recent activity, and quick actions for creating a new "
+            "investigation or searching knowledge.",
+            0.75,
+        )
+    ]
+    record = _save_hi(
+        bundle["knowledge_repo"], title="Dashboard nugets not populated after upgrade",
+        description="Dashboard widgets stopped refreshing after a CC upgrade.",
+        root_cause="", resolution="", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.4)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is Dashboard in CC?")
+
+    assert response.answer_kind == "knowledge"
+    text = response.answer_text
+    assert "Dashboard Overview in Command Center" in text
+    assert "active investigations, recent activity, and quick actions" in text
+    assert text.startswith('## Answer\nBased on ResolveIQ\'s documentation "Dashboard Overview in Command Center"')
+
+
+def test_follow_up_questions_retain_topic_then_new_chat_has_no_contamination(bundle):
+    """Step 15: a follow-up question changes intent (definition ->
+    configuration) while the topic/evidence stays the same, and a
+    subsequent New Chat must show zero contamination from the prior
+    topic."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "Process Settings in Command Center",
+            "Process settings in CC control how scheduled jobs run: interval, retry count, and enabled/disabled "
+            "state, configured under Admin > Process Settings.",
+            0.75,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    first = orchestrator.handle_message(session.id, "What is process settings in CC?")
+    assert first.debug["intent"] in ("entity_definition", "concept_explanation")
+    second = orchestrator.handle_message(session.id, "Where do I configure it?")
+    assert second.debug["intent"] == "configuration"
+    assert "Admin > Process Settings" in second.answer_text or "Process Settings in Command Center" in second.answer_text
+
+    # New Chat: a fresh session, different documentation topic -- no leakage from process settings.
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Dashboard Overview in Command Center", "The CC Dashboard shows active investigations.", 0.75)
+    ]
+    session2 = orchestrator.create_session()
+    third = orchestrator.handle_message(session2.id, "What is Dashboard in CC?")
+    assert "Process Settings" not in third.answer_text
+    assert "Dashboard Overview in Command Center" in third.answer_text

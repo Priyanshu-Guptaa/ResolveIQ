@@ -22,7 +22,42 @@ already uses (``knowledge_question.py``, ``log_question.py``,
 
 from __future__ import annotations
 
+import re
+
 from app.engines.shared.text_matching import phrase_present
+
+_STUCK_STATE_RE = re.compile(r"\b(?:stuck|stucked)\s+in\b", re.IGNORECASE)
+"""Knowledge Answering & Evidence Synthesis phase -- the real reported
+gap: "AxeI meters are stuck in discovered, how do I make it normal?"
+matched none of this module's original phrase list (all "why"/"what
+caused"/"what went wrong" explanation requests) -- a STATE complaint
+("stuck in <state>") is just as clearly a troubleshooting request, and
+just as clearly needs the ranked-hypothesis answer, not the bare
+tier-based boilerplate. Variable-middle (any state name), so a fixed
+phrase list can't express it -- a closed regex anchored on the fixed
+"stuck in" idiom itself, never a general heuristic."""
+
+_HOW_TO_RECOVER_PHRASES: list[str] = [
+    "how do i make it normal",
+    "how do i make this normal",
+    "how do i fix this",
+    "how do i fix it",
+    "how do i resolve this",
+    "how do i resolve it",
+    "how can i fix this",
+    "how can i fix it",
+    "how can i resolve this",
+    "how can i resolve it",
+    "how do i clear this",
+    "how do i clear it",
+    "how do i recover this",
+    "how do i recover it",
+]
+"""The companion recovery-request half of the same real gap -- "how do
+I make it normal" is a request for a resolution, not an explanation,
+but it is exactly the kind of request this module's ranked-hypothesis
+answer (observed state + likely causes + next checks) is built to
+serve, same as the "why did this fail" phrases below."""
 
 TROUBLESHOOTING_SYNTHESIS_PHRASES: list[str] = [
     "why did this fail",
@@ -58,7 +93,12 @@ ACTION request ("what should I check") -- the latter stays exclusively
 
 def contains_troubleshooting_synthesis_question(question: str) -> bool:
     """True if ``question`` contains any whole-phrase match from
-    ``TROUBLESHOOTING_SYNTHESIS_PHRASES``. Conservative by
-    construction: only ever True on an exact, closed-list phrase
-    match, never a heuristic guess."""
-    return any(phrase_present(phrase, question) for phrase in TROUBLESHOOTING_SYNTHESIS_PHRASES)
+    ``TROUBLESHOOTING_SYNTHESIS_PHRASES``/``_HOW_TO_RECOVER_PHRASES``,
+    or the "stuck in <state>" regex. Conservative by construction:
+    only ever True on an exact, closed-list phrase match or that one
+    narrowly-scoped regex, never a heuristic guess."""
+    if any(phrase_present(phrase, question) for phrase in TROUBLESHOOTING_SYNTHESIS_PHRASES):
+        return True
+    if any(phrase_present(phrase, question) for phrase in _HOW_TO_RECOVER_PHRASES):
+        return True
+    return _STUCK_STATE_RE.search(question) is not None

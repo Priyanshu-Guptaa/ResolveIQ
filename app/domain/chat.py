@@ -392,3 +392,20 @@ class ChatResponse(BaseModel):
     real answer is still coming"; it means "a possibly-better phrasing
     may become available later via ``GET /chat/enhancements/{job_id}``,
     but what you already have is already correct.\""""
+
+    debug: dict | None = None
+    """Knowledge Answering & Evidence Synthesis phase, Step 18 -- an
+    internal retrieval/synthesis diagnostic (the classified
+    ``AnswerIntent``, extracted subject/state, which composer ran, and
+    -- for the knowledge/troubleshooting composers -- which candidate
+    was selected as primary and why the rest were excluded), so a poor
+    answer can be diagnosed as "wrong intent" / "wrong entity
+    extraction" / "poor retrieval" / "insufficient evidence" / "poor
+    synthesis" rather than only ever "the AI gave a bad answer". Plain
+    data (``app.engines.chat.query_intent.QueryContext.as_debug_dict``
+    plus a few orchestrator-level keys) -- never rendered by the UI by
+    default; a future debug view can opt into showing it, but today
+    nothing reads this field except tests and this docstring's own
+    contract that it always be populated when an answer was produced
+    from a real, classified question (never for the ambiguity-
+    clarification early-return, which has no intent to classify yet)."""

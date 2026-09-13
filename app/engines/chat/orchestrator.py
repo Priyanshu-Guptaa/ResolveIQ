@@ -56,13 +56,19 @@ from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
 from app.engines.chat.confidence_expansion import contains_unsupported_confidence_claim
 from app.engines.chat.grounding_validator import check_no_material_loss, validate as validate_grounding
-from app.engines.chat.knowledge_question import contains_knowledge_question, extract_concept_words, lexical_overlap
+from app.engines.chat.knowledge_question import (
+    contains_knowledge_question,
+    extract_concept_words,
+    is_definitional_question,
+    lexical_overlap,
+)
 from app.engines.chat.log_question import (
     contains_l2_task_note_question,
     contains_l3_escalation_question,
     contains_log_analysis_question,
     contains_log_comparison_question,
 )
+from app.engines.chat.query_intent import AnswerIntent, build_query_context, classify_intent
 from app.engines.chat.scope_expansion import contains_unsupported_scope_expansion
 from app.engines.chat.scope_question import split_out_scope_clause
 from app.engines.chat.troubleshooting_expansion import contains_unsupported_troubleshooting_action
@@ -362,6 +368,12 @@ class ChatOrchestrator:
         )
 
         structured = strategy.structured_resolution
+        query_context = build_query_context(text, has_log_evidence=bool(log_evidence))
+        debug_info = {
+            **query_context.as_debug_dict(),
+            "answer_kind": answer_kind,
+            "resolution_provenance": structured.confidence.value if structured is not None else None,
+        }
         return ChatResponse(
             answer_text=answer_text,
             answer_kind=answer_kind,
@@ -380,6 +392,7 @@ class ChatOrchestrator:
             wiki_matches=strategy.wiki_matches,
             investigation_id=response_investigation_id,
             enhancement=enhancement_ref,
+            debug=debug_info,
         )
 
     # --- Ambiguity (a small, new, deterministic rule -- see class docstring) -
@@ -1084,7 +1097,21 @@ class ChatOrchestrator:
         # specific, grounded answer -- this only fires for the case the
         # real bug report was about, where that text would otherwise be
         # uselessly generic despite real evidence sitting unused.
-        if contains_knowledge_question(question):
+        # Knowledge Answering & Evidence Synthesis phase -- widened to
+        # also fire for CONFIGURATION/HOW_TO-shaped questions ("Where
+        # do I configure it?"), a real gap this phase's own follow-up
+        # test found: contains_knowledge_question's closed phrase list
+        # (built for "tell me about"/"explain"/"what is" phrasing) never
+        # recognized a bare configuration/how-to request at all, so a
+        # perfectly reasonable follow-up fell all the way through to
+        # the generic "I don't have enough evidence" tier text instead
+        # of the real documentation this exact topic already has.
+        # classify_intent is the single source of truth for this
+        # distinction (never a second, independently-maintained check).
+        if contains_knowledge_question(question) or classify_intent(question) in (
+            AnswerIntent.CONFIGURATION,
+            AnswerIntent.HOW_TO,
+        ):
             synthesis = self._compose_knowledge_synthesis(strategy, question)
             if synthesis is not None:
                 return synthesis, None, "knowledge"
@@ -1203,27 +1230,48 @@ class ChatOrchestrator:
         # (candidate, kind, overlap) for every Documentation/Historical
         # candidate, ranked by real subject overlap first, score second --
         # never the other way around (see docstring above).
+        _KIND_PRIORITY = {"documentation": 1, "historical": 0}
+        """Knowledge Answering & Evidence Synthesis phase, §5: a
+        historical case may prove something HAPPENED; it does not
+        establish what a product/concept IS. Real subject overlap
+        still decides first (a doc that only shares one word can still
+        lose to a historical case that shares two, exactly as the
+        existing "process setting in emerge"/"dashboard CC" regressions
+        already require and this tiebreak never overrides) -- this
+        only breaks a genuine TIE in overlap, in which case authoritative
+        documentation is preferred over a historical incident, never
+        the reverse."""
         ranked: list[tuple["KnowledgeMatch", str, int]] = sorted(
             (
                 [(m, "documentation", lexical_overlap(concept_words, f"{m.title} {m.snippet[:500]}")) for m in doc_matches]
                 + [(m, "historical", lexical_overlap(concept_words, f"{m.title} {m.snippet[:500]}")) for m in hist_matches]
             ),
-            key=lambda item: (item[2], item[0].score),
+            key=lambda item: (item[2], _KIND_PRIORITY[item[1]], item[0].score),
             reverse=True,
         )
 
-        # Grounded Conversational Intelligence phase, Step 4: restructure
-        # into explicit, labeled sections instead of one run-on paragraph
-        # -- "Direct answer" / "Sources" / "Notes". Deliberately NOT the
-        # full 5-header set the phase names ("How it works" /
-        # "Configuration" are skipped): those two would need to segment
-        # a single retrieved excerpt into sub-topics that aren't
-        # reliably present or delineated in the real snippet text, and
-        # inventing an empty or duplicated section to fill the template
-        # would itself be a small fabrication. Every section below maps
-        # 1:1 to data this method already retrieved -- nothing new is
-        # synthesized, only labeled and separated for readability.
+        # Knowledge Answering & Evidence Synthesis phase -- restructured
+        # into "## Answer / ## Why I'm saying this / ## Relevant
+        # evidence / ## What is not confirmed", replacing the earlier
+        # "Direct answer/Sources/Notes" labels with the phase's own
+        # requested headers. The real, more important fix (§5 of this
+        # phase) is semantic, not cosmetic: a HISTORICAL match may still
+        # legitimately win here (unchanged ranking -- see the real
+        # "process setting in emerge"/"dashboard CC" regressions this
+        # re-ranking already fixed), but presenting one as if it
+        # answered a genuine "what IS this" question, with no
+        # acknowledgment that it is a past incident and not a
+        # definition, is exactly this project's own real reported
+        # failure ("a historical incident mentioning AxeI does not
+        # define what an AxeI meter is"). Every "## Relevant evidence"
+        # line now says what its source actually establishes (a
+        # definition vs. merely "this was observed/investigated"), and
+        # "## What is not confirmed" explicitly names that gap whenever
+        # a historical case stands in for an entity/product/concept
+        # definition question (``is_definitional_question``) with no
+        # authoritative documentation behind it.
         direct_answer: str
+        why_line: str
         primary_match, primary_kind = None, None
         if ranked:
             top_match, top_kind, top_overlap = ranked[0]
@@ -1239,8 +1287,13 @@ class ChatOrchestrator:
                 excerpt = truncate_extract(primary_match.snippet, 240)
                 if primary_kind == "documentation":
                     direct_answer = f'Based on ResolveIQ\'s documentation "{primary_match.title}": {excerpt}'
+                    why_line = f'ResolveIQ\'s documentation "{primary_match.title}" directly addresses this question.'
                 else:
                     direct_answer = f'ResolveIQ has a related historical case on record, "{primary_match.title}": {excerpt}'
+                    why_line = (
+                        f"No authoritative documentation cleared the relevance bar for this question -- the most "
+                        f'relevant record found is a historical case, "{primary_match.title}".'
+                    )
             else:
                 # Real evidence exists but none of it actually shares the
                 # question's own subject -- an honest admission, never a
@@ -1252,35 +1305,51 @@ class ChatOrchestrator:
                     f"it actually shares that subject -- I couldn't find documentation or a historical case that "
                     f"specifically covers \"{subject}\"."
                 )
+                why_line = f'No retrieved evidence actually shares the real subject of "{subject}" above the relevance bar.'
         else:
             direct_answer = ""  # unreachable in practice: the caller already required at least one match to get here
+            why_line = ""
 
         source_lines: list[str] = []
-        remaining_doc_titles = [f'"{m.title}"' for m in doc_matches if m is not primary_match][:2]
-        if remaining_doc_titles:
-            source_lines.append(f"Related documentation: {', '.join(remaining_doc_titles)}.")
-        remaining_hist_titles = [f'"{m.title}"' for m in hist_matches if m is not primary_match][:3]
-        if remaining_hist_titles:
-            source_lines.append(f"ResolveIQ has related historical cases on record: {', '.join(remaining_hist_titles)}.")
-        if bug_matches:
-            titles = ", ".join(f'"{m.title}"' for m in bug_matches[:2])
-            source_lines.append(f"Related known bugs on record: {titles}.")
-        if tfs_matches:
-            titles = ", ".join(f'"{m.tfs_case.title}"' for m in tfs_matches[:2] if m.tfs_case is not None)
-            if titles:
-                source_lines.append(f"Live TFS also shows: {titles}.")
-        if wiki_matches:
-            titles = ", ".join(f'"{m.wiki_page.title}"' for m in wiki_matches[:2] if m.wiki_page is not None)
-            if titles:
-                source_lines.append(f"Live Wiki also shows: {titles}.")
+        if primary_match is not None:
+            if primary_kind == "documentation":
+                source_lines.append(f'- "{primary_match.title}" (documentation) -- directly addresses this question.')
+            else:
+                source_lines.append(
+                    f'- "{primary_match.title}" (historical case) -- shows this subject was observed/investigated; '
+                    f"not a product/concept definition."
+                )
+        for m in doc_matches:
+            if m is not primary_match:
+                source_lines.append(f'- "{m.title}" (documentation) -- related documentation.')
+        for m in hist_matches[:3]:
+            if m is not primary_match:
+                source_lines.append(f'- "{m.title}" (historical case) -- a related case on record, not a definition.')
+        for m in bug_matches[:2]:
+            source_lines.append(f'- "{m.title}" (known bug) -- a related known bug on record, not a confirmed root cause.')
+        for m in tfs_matches[:2]:
+            if m.tfs_case is not None:
+                source_lines.append(f'- "{m.tfs_case.title}" (live TFS) -- a related work item.')
+        for m in wiki_matches[:2]:
+            if m.wiki_page is not None:
+                source_lines.append(f'- "{m.wiki_page.title}" (live Wiki) -- a related Wiki page.')
 
-        sections = [f"Direct answer:\n{direct_answer}"]
+        not_confirmed_lines = [
+            "This is informational context assembled from ResolveIQ's knowledge base -- not a validated root "
+            "cause or resolution."
+        ]
+        if primary_kind == "historical" and is_definitional_question(question):
+            not_confirmed_lines.append(
+                f'"{primary_match.title}" is a historical case, not authoritative documentation -- ResolveIQ does '
+                f"not have documentation on record that specifically defines this."
+            )
+
+        sections = [f"## Answer\n{direct_answer}"]
+        if why_line:
+            sections.append(f"## Why I'm saying this\n{why_line}")
         if source_lines:
-            sections.append("Sources:\n" + "\n".join(source_lines))
-        sections.append(
-            "Notes:\nThis is informational context assembled from ResolveIQ's knowledge base -- not a validated "
-            "root cause or resolution."
-        )
+            sections.append("## Relevant evidence\n" + "\n".join(source_lines))
+        sections.append("## What is not confirmed\n" + "\n".join(not_confirmed_lines))
         return "\n\n".join(sections)
 
     _TROUBLESHOOTING_SYNTHESIS_MAX_CANDIDATES = 3
@@ -1394,6 +1463,23 @@ class ChatOrchestrator:
             "known_bug": "Relevant known bug",
             "documentation": "Related documentation",
         }
+        kind_means_phrase = {
+            "known_bug": "a known bug",
+            "documentation": "documented behavior",
+            "historical": "a previously observed scenario",
+        }
+        _KIND_PRIORITY = {"known_bug": 2, "documentation": 1, "historical": 0}
+        """Knowledge Answering & Evidence Synthesis phase, retrieval
+        profile (Step 4) -- a real, disclosed, narrow substitute for a
+        full per-intent retrieval reordering: rather than re-querying
+        Chroma/TFS/Wiki differently per intent (a much larger, riskier
+        change touching working retrieval code), this tiebreaks
+        ALREADY-RETRIEVED troubleshooting candidates so a known bug
+        (a documented, confirmed defect) outranks an equally-relevant
+        historical case (a single past incident, not a documented
+        pattern) when their real lexical-overlap scores tie -- overlap
+        with the question's own subject always wins first; this only
+        breaks genuine ties, never overrides real relevance."""
         pool = (
             [(m, "historical") for m in hist_matches]
             + [(m, "known_bug") for m in bug_matches]
@@ -1401,7 +1487,11 @@ class ChatOrchestrator:
         )
         ranked = sorted(
             pool,
-            key=lambda item: (lexical_overlap(concept_words, f"{item[0].title} {item[0].snippet[:500]}"), item[0].score),
+            key=lambda item: (
+                lexical_overlap(concept_words, f"{item[0].title} {item[0].snippet[:500]}"),
+                _KIND_PRIORITY[item[1]],
+                item[0].score,
+            ),
             reverse=True,
         )
         if concept_words:
@@ -1420,6 +1510,13 @@ class ChatOrchestrator:
         lines: list[str] = ["## What is observed"]
         lines.extend(self._troubleshooting_observed_lines(structured))
 
+        top_match, top_kind = candidates[0]
+        lines.append("\n## What this likely means")
+        lines.append(
+            f'The available evidence points toward "{top_match.title}" ({kind_means_phrase[top_kind]}) as the most '
+            f"likely explanation, though this is not yet confirmed."
+        )
+
         lines.append("\n## Likely causes")
         contradicting = self._troubleshooting_contradicting_line(log_evidence)
         for idx, (match, kind) in enumerate(candidates, start=1):
@@ -1430,10 +1527,10 @@ class ChatOrchestrator:
             lines.append(f'\nEvidence supporting:\n- {kind_labels[kind]}: "{match.title}" -- {excerpt}')
             lines.append(f"\nEvidence against:\n- {contradicting}")
 
-        lines.append("\n## What is NOT confirmed")
+        lines.append("\n## What is not confirmed")
         lines.append("The root cause is not confirmed from the current evidence.")
 
-        lines.append("\n## Next action")
+        lines.append("\n## What to check next")
         checks = available_checks(structured)
         if checks:
             lines.extend(f"- {check}" for check in checks)
