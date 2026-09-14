@@ -59,6 +59,31 @@ but it is exactly the kind of request this module's ranked-hypothesis
 answer (observed state + likely causes + next checks) is built to
 serve, same as the "why did this fail" phrases below."""
 
+_WHAT_HAPPENS_IF_WRONG_RE = re.compile(
+    r"\bwhat happens if\b.{0,60}?\b(?:is|are|'s|gets?|becomes?)\s+"
+    r"(?:wrong|incorrect|misconfigured|(?:set|configured)(?:\s+up)?\s+incorrectly)\b",
+    re.IGNORECASE,
+)
+"""Real-Corpus Answer Quality & Final Chat Hardening phase, §8 -- "What
+happens if process settings are wrong?" is a real, common support
+question (a request for the CONSEQUENCE of a misconfiguration) that
+previously classified UNKNOWN and rendered the generic tier-based
+text: it matches none of ``contains_knowledge_question``'s phrase list
+(no "what is"/"tell me about"), none of ``troubleshooting_question.
+contains_troubleshooting_question``'s ("what should I check"), and
+none of this module's own EXPLANATION-shaped phrases ("why did X
+fail"). Variable-middle (any subject between "what happens if" and
+"is/are wrong"), so a fixed phrase list can't express it -- a closed
+regex anchored on the fixed "what happens if"/"wrong"/"incorrect"/
+"misconfigured" scaffolding, never a general heuristic. Deliberately
+added HERE (not only to ``query_intent.classify_intent``) so the SAME
+match drives both the debug-facing intent label (TROUBLESHOOTING, via
+``classify_intent``'s own call to this function) and the REAL composer
+dispatch (``ChatOrchestrator._compose_answer``'s ``contains_
+troubleshooting_synthesis_question(question)`` gate) -- never two
+independently-maintained copies of the same pattern that could
+silently diverge."""
+
 TROUBLESHOOTING_SYNTHESIS_PHRASES: list[str] = [
     "why did this fail",
     "why did it fail",
@@ -100,5 +125,7 @@ def contains_troubleshooting_synthesis_question(question: str) -> bool:
     if any(phrase_present(phrase, question) for phrase in TROUBLESHOOTING_SYNTHESIS_PHRASES):
         return True
     if any(phrase_present(phrase, question) for phrase in _HOW_TO_RECOVER_PHRASES):
+        return True
+    if _WHAT_HAPPENS_IF_WRONG_RE.search(question):
         return True
     return _STUCK_STATE_RE.search(question) is not None

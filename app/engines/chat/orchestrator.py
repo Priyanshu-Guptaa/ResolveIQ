@@ -70,11 +70,11 @@ from app.engines.chat.log_question import (
     contains_log_comparison_question,
 )
 from app.engines.chat.query_intent import AnswerIntent, build_query_context, classify_intent
-from app.engines.chat.retrieval_profile import RETRIEVAL_PROFILES, build_evidence_bundle, kind_priority
+from app.engines.chat.retrieval_profile import RETRIEVAL_PROFILES, build_evidence_bundle, has_majority_overlap, kind_priority
 from app.engines.chat.scope_expansion import contains_unsupported_scope_expansion
 from app.engines.chat.scope_question import split_out_scope_clause
 from app.engines.chat.troubleshooting_expansion import contains_unsupported_troubleshooting_action
-from app.engines.chat.troubleshooting_question import split_out_troubleshooting_clause
+from app.engines.chat.troubleshooting_question import contains_troubleshooting_question, split_out_troubleshooting_clause
 from app.engines.chat.troubleshooting_synthesis_question import contains_troubleshooting_synthesis_question
 from app.engines.external_knowledge.extraction import truncate as truncate_extract
 from app.engines.investigation.engine import InvestigationNotFoundError
@@ -350,8 +350,8 @@ class ChatOrchestrator:
                 # attempt (mirrors _generate_answer's own bypass exactly).
                 job = self._enhancement_service.submit(  # type: ignore[union-attr]  -- guarded by _should_enhance_asynchronously
                     session_id,
-                    lambda sq=sanitized_question, st=structured_for_job, lo=log_observations, hs=had_scope, ht=had_troubleshooting, da=answer_text: self._finalize_llm_answer(  # noqa: E501
-                        sq, st, lo, hs, ht, da
+                    lambda sq=sanitized_question, st=structured_for_job, lo=log_observations, hs=had_scope, ht=had_troubleshooting, da=answer_text, strat=strategy: self._finalize_llm_answer(  # noqa: E501
+                        sq, st, lo, hs, ht, da, strat
                     ),
                 )
                 enhancement_ref = ChatEnhancementRef(job_id=job.id, status=job.status)
@@ -500,9 +500,37 @@ class ChatOrchestrator:
                 )
         return ChatAmbiguity()
 
+    _NO_PRIOR_CONTEXT_CANDIDATES = (
+        "nothing has been referenced yet in this conversation",
+        "nothing has been established yet to resolve this against",
+    )
+    """The two literal sentinel strings ``ConversationStateEngine.
+    resolve_reference`` uses when a reference cue matched but there is
+    genuinely ZERO prior context to resolve it against -- a
+    fundamentally different situation from a real tie between multiple
+    real candidates (§9's own distinction). See
+    ``_compose_ambiguous_response``."""
+
     def _compose_ambiguous_response(self, ambiguity: ChatAmbiguity) -> tuple[str, str]:
         candidates = ", ".join(ambiguity.candidates) if ambiguity.candidates else "more than one real possibility"
         if ambiguity.kind == ChatAmbiguityKind.REFERENCE_AMBIGUOUS:
+            if len(ambiguity.candidates) == 1 and ambiguity.candidates[0] in self._NO_PRIOR_CONTEXT_CANDIDATES:
+                # Real-Corpus Answer Quality & Final Chat Hardening
+                # phase, §9 -- this is not a tie between real
+                # candidates at all; there is nothing established yet
+                # in this conversation to resolve the reference
+                # against. The old, generic "I found multiple possible
+                # interpretations" framing was actively misleading here
+                # (there was never more than one interpretation -- there
+                # was zero context), and gave the user nothing concrete
+                # to act on. A real, answerable clarifying question
+                # instead.
+                answer = (
+                    "I can look for similar historical cases, but I don't have a specific investigation, product, "
+                    "component, or issue to search against yet in this conversation."
+                )
+                follow_up = "Which product, component, or issue should I search for?"
+                return answer, follow_up
             answer = "I found multiple possible interpretations of that reference. Please clarify which one you mean."
         else:
             answer = f"I found multiple possible {ambiguity.slot_name} matches for this question. Please clarify which one you mean."
@@ -694,7 +722,26 @@ class ChatOrchestrator:
         # analysis / L2/L3 / tier-based -- whichever _compose_answer
         # itself already decides applies), regardless of whether an
         # LLM is wired at all.
-        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence, investigation)
+        #
+        # Real-Corpus Answer Quality & Final Chat Hardening phase --
+        # the ORIGINAL ``question`` is passed here, not ``sanitized_
+        # question``. ``sanitized_question`` exists ONLY to protect
+        # what the LLM sees (Rule 9's scope/troubleshooting-clause
+        # removal, Phases 31/32) -- every deterministic composer
+        # ``_compose_answer`` dispatches to is already safe by
+        # construction (never invents an action, only cites
+        # ``available_checks``/real evidence), so stripping the clause
+        # before the DETERMINISTIC path even sees it serves no safety
+        # purpose and was a real, discovered bug: "What should I check
+        # next?" with zero evidence-backed checks had its ENTIRE text
+        # removed before reaching ``_compose_troubleshooting_synthesis``,
+        # so a real, on-topic historical match was silently retrieved
+        # but never used, and the answer collapsed to the generic
+        # "A possible explanation may exist..." boilerplate despite
+        # strong evidence. ``sanitized_question`` is still exactly what
+        # reaches the LLM below -- this change touches only which text
+        # the deterministic composers themselves rank/match against.
+        answer_text, follow_up, answer_kind = self._compose_answer(strategy, question, log_evidence, investigation)
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
         # Evidence-Centered Knowledge Retrieval & Synthesis phase, §18 --
         # the real gate decision this method already makes, finally
@@ -948,9 +995,16 @@ class ChatOrchestrator:
         handed straight to ``_finalize_llm_answer`` if an enhancement job
         is scheduled, so that job makes the identical clause-splitting
         decision this answer was already built from, never a second,
-        possibly-different one."""
+        possibly-different one.
+
+        Real-Corpus Answer Quality & Final Chat Hardening phase -- same
+        fix as ``_generate_answer``'s own identical call: the ORIGINAL
+        ``question`` is passed to ``_compose_answer``, not
+        ``sanitized_question`` -- see that method's own docstring note
+        for why. ``sanitized_question`` is still returned unchanged and
+        still exactly what ``_finalize_llm_answer`` hands the LLM."""
         sanitized_question, had_scope, had_troubleshooting, structured = self._prepare_question(question, strategy)
-        answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence, investigation)
+        answer_text, follow_up, answer_kind = self._compose_answer(strategy, question, log_evidence, investigation)
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
         return answer_text, follow_up, answer_kind, sanitized_question, had_scope, had_troubleshooting, structured
 
@@ -962,6 +1016,7 @@ class ChatOrchestrator:
         had_scope: bool,
         had_troubleshooting: bool,
         deterministic_answer_text: str = "",
+        strategy: "InvestigationStrategy | None" = None,
     ) -> str | None:
         """Chat Assistant Phase 37 -- the exact work an asynchronous
         enhancement job runs (see
@@ -987,10 +1042,22 @@ class ChatOrchestrator:
         stays source-compatible with ``_should_enhance_asynchronously``'s
         own precondition check, which never calls this method directly;
         every real caller (``handle_message``'s async branch) always
-        supplies the real text."""
+        supplies the real text.
+
+        Real-Corpus Answer Quality & Final Chat Hardening phase, §17 --
+        ``strategy``, when given, is threaded through to ``_attempt_
+        llm_answer``/``_generate_llm_answer`` exactly like the
+        synchronous path, so the async enhancement job builds and
+        sends the SAME sanitized ``EvidenceBundle`` context to the LLM
+        -- sync/async parity, never two divergent LLM architectures.
+        Defaults to ``None`` (byte-identical to before this parameter
+        existed) only for source-compatibility with the same
+        precondition-check caller noted above; the real scheduling
+        closure in ``handle_message`` always captures and passes the
+        real ``strategy``."""
         if structured is None:  # pragma: no cover -- guarded by _should_enhance_asynchronously before a job is ever submitted
             return None
-        answer_text, _rejection_reason = self._attempt_llm_answer(question, structured, log_observations)
+        answer_text, _rejection_reason = self._attempt_llm_answer(question, structured, log_observations, strategy)
         if answer_text is None:
             return None
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
@@ -1107,13 +1174,15 @@ class ChatOrchestrator:
         CONTEXT" section -- real Documentation/Historical/Known-Bug
         excerpts the LLM previously had NO visibility into at all (only
         ``StructuredResolution`` reached it before this phase). Optional
-        and defaults to ``None``: the synchronous path
-        (``_generate_answer``) always has ``strategy`` in scope and
-        passes it; the asynchronous enhancement path
-        (``_finalize_llm_answer``) does not currently thread ``strategy``
-        through its background-job closure (see that method's own
-        docstring) and so omits this section -- a disclosed, narrower
-        completion for that one path, not a silent one."""
+        and defaults to ``None`` only for source-compatibility with
+        callers that predate this parameter. Real-Corpus Answer Quality
+        & Final Chat Hardening phase, §17 -- BOTH real callers now
+        supply it: the synchronous path (``_generate_answer``) always
+        has ``strategy`` in scope and passes it, and the asynchronous
+        enhancement path (``_finalize_llm_answer``) now threads it
+        through its background-job closure too (``handle_message``'s
+        scheduling lambda captures ``strat=strategy``) -- sync/async
+        parity, never two divergent LLM architectures."""
         sanitized_problem, _ = split_out_scope_clause(structured.problem)
         if not available_checks(structured):
             sanitized_problem, _ = split_out_troubleshooting_clause(sanitized_problem)
@@ -1132,6 +1201,196 @@ class ChatOrchestrator:
         return self._llm.generate(user_prompt, system_prompt=system_prompt), user_prompt
 
     # --- Deterministic answer composition (§4) ---------------------------------
+
+    def _tier_answer_is_off_topic(self, question: str, subject: str | None) -> bool:
+        """Real-Corpus Answer Quality & Final Chat Hardening phase --
+        the single most severe bug the real seeded corpus exposed:
+        ``RecommendationEngine``'s own root-cause/resolution matching
+        runs entirely independently of chat intent classification, and
+        can genuinely reach LIKELY (or even CONFIRMED) tier off a
+        single historical/known-bug record that has NOTHING to do with
+        the actual question asked (real example: "What is process
+        settings in CC?" reached LIKELY tier off an unrelated "IIS
+        worker process crash" known bug, purely because Chroma scored
+        it as the nearest semantic match) -- silently pre-empting
+        ``_compose_answer``'s knowledge-synthesis branch below, which
+        never even runs because CONFIRMED/LIKELY both ``return`` before
+        reaching it. This is the exact "task"/69%-similarity failure
+        shape this codebase has fixed twice before at the composer
+        level (see ``_compose_knowledge_synthesis``'s own docstring),
+        now discovered one layer up, at the confidence-TIER level.
+
+        True only when the question has real, extractable subject
+        words of its own AND the tier's own ``subject`` (root_cause or
+        primary resolution text) shares FEWER THAN HALF of them --
+        never a guess, never a semantic-similarity threshold, the same
+        ``extract_concept_words``/``lexical_overlap``/``retrieval_
+        profile.has_majority_overlap`` primitives every other relevance
+        check in this file already uses. A question with no extractable
+        subject (a thin follow-up) never triggers this -- there is
+        nothing to compare against, so the tier text is left alone,
+        matching this method's own long-standing default.
+
+        Real-Corpus Answer Quality & Final Chat Hardening phase --
+        upgraded from a bare "overlap == 0" check after a second real
+        corpus finding: "What is process settings in CC?" reached
+        LIKELY tier off "IIS worker PROCESS crash on multipart
+        uploads..." -- a single, coincidentally-shared generic word
+        ("process") gave a real overlap of 1 out of 3 concept words
+        ("process", "settings", "cc"), which the original bare
+        overlap>0 check treated as "on topic" and left the off-topic
+        answer untouched. The exact same majority-overlap discipline
+        ``retrieval_profile.has_majority_overlap`` already applies to
+        AUTHORITATIVE_DEFINITION/CONFIGURATION claims is reused here,
+        not re-derived, so both fixes agree on what "really shares the
+        subject" means.
+
+        Deliberately scoped to CONFIRMED/LIKELY only, and only
+        consulted by those two branches immediately before returning --
+        never touches POSSIBLE/UNKNOWN's own, already-correct fallback
+        to ``_compose_knowledge_synthesis`` a few lines below."""
+        concept_words = extract_concept_words(question)
+        if not concept_words or not subject:
+            return False
+        overlap = lexical_overlap(concept_words, subject)
+        return self._is_off_topic_overlap(overlap, len(concept_words))
+
+    _SHORT_QUESTION_WORD_COUNT = 3
+    """Real-Corpus Answer Quality & Final Chat Hardening phase -- the
+    empirically-found boundary between two real, opposite failure
+    shapes: a SHORT, subject-only question ("What is AxeI meter?", 2
+    concept words; "What is process settings in CC?", 3) has little
+    else to disambiguate a coincidentally-shared GENERIC word ("meter",
+    "process") from real relevance, so majority overlap is the right
+    bar there. A LONGER, more sentence-like investigative question
+    ("RF Mesh IP command timeout -- why did this fail?", 5 concept
+    words after stopword removal) legitimately shares only ONE
+    DISTINCTIVE word ("mesh") with a real, on-topic root cause phrased
+    in different vocabulary for the rest of the sentence -- requiring a
+    majority there produced a real, caught regression (``test_
+    troubleshooting_synthesis_never_overrides_a_real_likely_tier``).
+    This module cannot yet distinguish "generic" from "distinctive"
+    words directly (no such classification exists anywhere in this
+    codebase), so word COUNT is the practical, disclosed proxy: bare
+    ``overlap > 0`` for longer questions (matches this codebase's
+    pre-existing, already-tested default everywhere else), majority
+    overlap only for short ones, where the real corpus findings
+    actually were."""
+
+    def _is_off_topic_overlap(self, overlap: int, concept_word_count: int) -> bool:
+        """The one shared off-topic-overlap rule both ``_tier_answer_
+        is_off_topic`` and ``_compose_troubleshooting_synthesis``'s
+        ``force=True`` candidate filter use -- see ``_SHORT_QUESTION_
+        WORD_COUNT``'s own docstring for why the threshold exists."""
+        if concept_word_count <= self._SHORT_QUESTION_WORD_COUNT:
+            return not has_majority_overlap(overlap, concept_word_count)
+        return overlap <= 0
+
+    @staticmethod
+    def _is_knowledge_shaped_question(question: str) -> bool:
+        """The exact gate condition ``_compose_answer``'s POSSIBLE/
+        UNKNOWN branch has used since the Knowledge Answering &
+        Evidence Synthesis phase, extracted into one named, shared
+        method rather than re-typed at each of its call sites -- never
+        a second, independently-maintained condition. Deliberately
+        NOT used by the CONFIRMED/LIKELY off-topic override below --
+        see ``_is_purely_knowledge_shaped_question``'s own docstring
+        for why that override needs a stricter test."""
+        return contains_knowledge_question(question) or classify_intent(question) in (
+            AnswerIntent.CONFIGURATION,
+            AnswerIntent.HOW_TO,
+        )
+
+    _PURE_KNOWLEDGE_INTENTS = (
+        AnswerIntent.ENTITY_DEFINITION,
+        AnswerIntent.PRODUCT_EXPLANATION,
+        AnswerIntent.CONCEPT_EXPLANATION,
+        AnswerIntent.CONFIGURATION,
+        AnswerIntent.HOW_TO,
+        AnswerIntent.HISTORICAL_LOOKUP,
+    )
+    """Real-Corpus Answer Quality & Final Chat Hardening phase --
+    HISTORICAL_LOOKUP added: "What was the resolution in similar
+    cases?" is, by construction, a question about OTHER investigations,
+    so a CURRENT investigation's own off-topic LIKELY/CONFIRMED root
+    cause must not silently stand in for it either. Safe for the exact
+    same reason CONFIGURATION/HOW_TO already were: a compound,
+    genuinely-investigative question (e.g. "...and what should I check
+    first?") never classifies as HISTORICAL_LOOKUP in the first place --
+    ``classify_intent`` checks troubleshooting/root-cause phrasing
+    first, so this can never reintroduce the exact regression that
+    motivated switching this set away from raw ``contains_knowledge_
+    question`` (see ``_is_purely_knowledge_shaped_question``'s own
+    docstring)."""
+
+    def _compose_best_knowledge_answer(self, strategy: "InvestigationStrategy", question: str) -> str | None:
+        """Real-Corpus Answer Quality & Final Chat Hardening phase --
+        the one shared precedence order (CONFIGURATION/HOW_TO planner
+        -> HISTORICAL_LOOKUP planner -> generic knowledge synthesis)
+        every knowledge-shaped call site in this class now uses, never
+        three independently-maintained copies of the same ordering."""
+        configuration_synthesis = self._compose_configuration_synthesis(strategy, question)
+        if configuration_synthesis is not None:
+            return configuration_synthesis
+        historical_lookup_synthesis = self._compose_historical_lookup_synthesis(strategy, question)
+        if historical_lookup_synthesis is not None:
+            return historical_lookup_synthesis
+        return self._compose_knowledge_synthesis(strategy, question)
+
+    def _off_topic_tier_override(
+        self, strategy: "InvestigationStrategy", question: str, log_evidence: "list[Evidence] | None"
+    ) -> tuple[str, str | None, str | None] | None:
+        """Real-Corpus Answer Quality & Final Chat Hardening phase --
+        the single place both the CONFIRMED and LIKELY branches above
+        call once ``_tier_answer_is_off_topic`` has already determined
+        the tier's own root cause/resolution shares no real subject
+        with the question. Tries whichever REAL composer actually fits
+        the question's own intent -- a purely knowledge-shaped question
+        gets ``_compose_best_knowledge_answer``; a troubleshooting-
+        synthesis-shaped question (including the real corpus finding
+        this phase fixed, "What happens if X is wrong?") gets
+        ``_compose_troubleshooting_synthesis`` with ``force=True``,
+        bypassing that method's own LIKELY/CONFIRMED tier guard --
+        exactly the escape hatch that guard's own docstring now
+        documents, never a silent bypass. Returns ``None`` (caller
+        keeps the original tier text) when neither applies or neither
+        composer finds anything to say."""
+        if self._is_purely_knowledge_shaped_question(question):
+            synthesis = self._compose_best_knowledge_answer(strategy, question)
+            if synthesis is not None:
+                return synthesis, None, "knowledge"
+        elif contains_troubleshooting_synthesis_question(question) or contains_troubleshooting_question(question):
+            synthesis = self._compose_troubleshooting_synthesis(strategy, question, log_evidence, force=True)
+            if synthesis is not None:
+                return synthesis, None, None
+        return None
+
+    @staticmethod
+    def _is_purely_knowledge_shaped_question(question: str) -> bool:
+        """Real-Corpus Answer Quality & Final Chat Hardening phase --
+        the CONFIRMED/LIKELY off-topic override (``_tier_answer_is_
+        off_topic``) needs a STRICTER test than ``_is_knowledge_shaped_
+        question``: a real regression this phase's own first attempt
+        caused, found by the existing test suite, not guessed --
+        ``contains_knowledge_question`` matches on ANY substring phrase
+        (e.g. "has this happened before"), so a genuinely compound,
+        primarily-investigative question like "What is the root cause,
+        has this happened before, and what should I check first?" also
+        satisfies it, even though ``classify_intent`` itself -- whose
+        OWN ordering checks troubleshooting/root-cause phrasing BEFORE
+        ever considering a knowledge phrase match -- correctly resolves
+        that exact same question to TROUBLESHOOTING, never a knowledge
+        intent. Using raw ``contains_knowledge_question`` for the
+        override let it fire for that compound question's real,
+        legitimate LIKELY-tier answer (a genuine root cause that simply
+        doesn't share words with "root cause"/"check first" themselves)
+        and incorrectly replace it with a weaker knowledge-synthesis
+        attempt. This method instead trusts ``classify_intent``'s own,
+        already-ordered precedence completely: True only when the
+        question's SINGLE resolved intent is itself one of the five
+        purely-informational/configuration intents, never merely
+        "contains a knowledge phrase somewhere"."""
+        return classify_intent(question) in ChatOrchestrator._PURE_KNOWLEDGE_INTENTS
 
     def _compose_answer(
         self,
@@ -1203,6 +1462,10 @@ class ChatOrchestrator:
                 text += f" ({structured.confidence_rationale})"
             if primary is not None:
                 text += f" Recommended resolution: {primary.text}"
+            if self._tier_answer_is_off_topic(question, subject):
+                override = self._off_topic_tier_override(strategy, question, log_evidence)
+                if override is not None:
+                    return override
             return text, None, None
 
         if tier == ResolutionProvenance.LIKELY:
@@ -1217,6 +1480,10 @@ class ChatOrchestrator:
             text += " This has not been independently verified."
             if primary is not None:
                 text += f" A likely resolution, not yet independently verified: {primary.text}"
+            if self._tier_answer_is_off_topic(question, subject):
+                override = self._off_topic_tier_override(strategy, question, log_evidence)
+                if override is not None:
+                    return override
             return text, None, None
 
         # POSSIBLE and UNKNOWN both fall through to the tier boilerplate
@@ -1241,11 +1508,17 @@ class ChatOrchestrator:
         # of the real documentation this exact topic already has.
         # classify_intent is the single source of truth for this
         # distinction (never a second, independently-maintained check).
-        if contains_knowledge_question(question) or classify_intent(question) in (
-            AnswerIntent.CONFIGURATION,
-            AnswerIntent.HOW_TO,
-        ):
-            synthesis = self._compose_knowledge_synthesis(strategy, question)
+        if self._is_knowledge_shaped_question(question):
+            # Real-Corpus Answer Quality & Final Chat Hardening phase,
+            # §10 -- CONFIGURATION/HOW_TO and HISTORICAL_LOOKUP each get
+            # their own, more specific answer-planner template before
+            # falling back to the generic knowledge-synthesis shape;
+            # each returns None (never partially renders) whenever the
+            # question isn't its own intent or nothing clears the
+            # relevance bar, so this is a pure, safe precedence
+            # ordering, never a behavior change for anything that
+            # doesn't match.
+            synthesis = self._compose_best_knowledge_answer(strategy, question)
             if synthesis is not None:
                 return synthesis, None, "knowledge"
 
@@ -1258,7 +1531,29 @@ class ChatOrchestrator:
         # answer -- the normal confidence badge/rationale caption should
         # keep showing, per Objective 2D's "preserve existing confidence
         # semantics."
-        if contains_troubleshooting_synthesis_question(question):
+        #
+        # Real-Corpus Answer Quality & Final Chat Hardening phase --
+        # widened to also fire for ``contains_troubleshooting_question``
+        # ("what should I check"/"what should I check next"), a real
+        # gap the real seeded corpus exposed: "What should I check
+        # next?" found real, on-topic evidence (sufficiency STRONG) yet
+        # still fell through to the bare "A possible explanation may
+        # exist..." boilerplate, because only the EXPLANATION-shaped
+        # phrase list (``contains_troubleshooting_synthesis_question``)
+        # was wired here -- the ACTION-shaped phrase list (``contains_
+        # troubleshooting_question``, otherwise used only for LLM-
+        # prompt clause-splitting) was not. This composer's own "## What
+        # to check next" section already exists specifically to answer
+        # this question type. Both phrase lists are still mutually
+        # exclusive (see troubleshooting_synthesis_question.py's own
+        # docstring), so this is a pure OR-widening, never a behavior
+        # change for a question already matching the first list. When
+        # zero evidence-backed checks exist, ``_prepare_question`` has
+        # already stripped this clause out of ``question`` upstream
+        # (see ``_generate_answer``), so this widening only ever
+        # activates when the clause is still genuinely present in the
+        # text reaching this method.
+        if contains_troubleshooting_synthesis_question(question) or contains_troubleshooting_question(question):
             synthesis = self._compose_troubleshooting_synthesis(strategy, question, log_evidence)
             if synthesis is not None:
                 return synthesis, None, None
@@ -1528,6 +1823,168 @@ class ChatOrchestrator:
             sections.append("## Evidence conflict\n" + "\n".join(conflict_lines))
         return "\n\n".join(sections)
 
+    def _compose_configuration_synthesis(self, strategy: "InvestigationStrategy", question: str) -> str | None:
+        """Real-Corpus Answer Quality & Final Chat Hardening phase, §10
+        -- a dedicated answer planner for CONFIGURATION/HOW_TO
+        questions ("Where do I configure X?", "How do I configure X?"),
+        replacing the generic knowledge-synthesis "## Answer/## Why I'm
+        saying this/## Relevant evidence" shape with the requested
+        "## Answer/## Steps/## Important conditions/## Version-specific
+        notes/## Evidence/## What is not confirmed" structure. Built
+        entirely from the same, already-computed ``EvidenceBundle``
+        (``retrieval_profile.build_evidence_bundle``) the knowledge
+        composer and ``ChatResponse.debug`` both use -- never a new
+        retrieval call, never an LLM, never a paraphrase: "## Steps"
+        quotes the primary source's own excerpt verbatim rather than
+        inventing a numbered procedure from unstructured text (this
+        codebase's own "never fabricate structure that isn't really
+        there" discipline). Returns ``None`` (caller falls back to the
+        existing, unmodified ``_compose_knowledge_synthesis``) whenever
+        the question is not CONFIGURATION/HOW_TO-classified, or nothing
+        retrieved clears the relevance bar."""
+        context = build_query_context(question)
+        if context.intent not in (AnswerIntent.CONFIGURATION, AnswerIntent.HOW_TO):
+            return None
+        bundle = build_evidence_bundle(
+            question, context, strategy,
+            min_score=self._KNOWLEDGE_SYNTHESIS_MIN_SCORE, min_score_secondary=self._KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY,
+        )
+        primary_pool = bundle.authoritative_documentation or bundle.documentation
+        if not primary_pool and not bundle.historical_case_evidence:
+            return None
+        primary = primary_pool[0] if primary_pool else bundle.historical_case_evidence[0]
+        is_authoritative = primary in bundle.authoritative_documentation
+
+        if is_authoritative:
+            answer = f'Based on ResolveIQ\'s documentation "{primary.title}": {truncate_extract(primary.excerpt, 240)}'
+        else:
+            answer = (
+                f'ResolveIQ does not have authoritative documentation on record for this configuration question -- '
+                f'the most relevant record found is {"documentation" if primary.source_type == "documentation" else "a historical case"}, '
+                f'"{primary.title}": {truncate_extract(primary.excerpt, 240)}'
+            )
+
+        steps_lines = [f'- Per "{primary.title}": {truncate_extract(primary.excerpt, 300)}']
+        for item in primary_pool[1:3]:
+            steps_lines.append(f'- Also see "{item.title}": {truncate_extract(item.excerpt, 200)}')
+
+        conditions_lines: list[str] = []
+        if context.customer:
+            conditions_lines.append(f"- Customer context: {context.customer}")
+        if context.region:
+            conditions_lines.append(f"- Region context: {context.region}")
+        if not conditions_lines:
+            conditions_lines.append("- No customer/region-specific conditions are documented for this configuration.")
+
+        if context.version or context.technology:
+            version_line = "; ".join(v for v in (context.version, context.technology) if v)
+            version_lines = [f"- {version_line}"]
+        else:
+            version_lines = ["- No version-specific documentation was found for this configuration."]
+
+        evidence_lines = [f'- "{primary.title}" ({primary.source_type}) -- {primary.establishes}']
+        for item in (bundle.authoritative_documentation + bundle.documentation + bundle.historical_case_evidence)[:5]:
+            if item is not primary:
+                evidence_lines.append(f'- "{item.title}" ({item.source_type}) -- {item.establishes}')
+
+        not_confirmed_lines = [
+            "This configuration guidance is assembled from ResolveIQ's knowledge base -- not a validated resolution "
+            "for a specific incident."
+        ]
+        if not is_authoritative:
+            not_confirmed_lines.append(
+                f'"{primary.title}" is {"documentation with only partial overlap" if primary.source_type == "documentation" else "a historical case"}, '
+                f"not authoritative configuration documentation -- treat this as a lead to verify, not a confirmed step."
+            )
+        if bundle.contradictions:
+            not_confirmed_lines.append("ResolveIQ found conflicting documented configuration values -- see below.")
+
+        sections = [
+            f"## Answer\n{answer}",
+            "## Steps\n" + "\n".join(steps_lines),
+            "## Important conditions\n" + "\n".join(conditions_lines),
+            "## Version-specific notes\n" + "\n".join(version_lines),
+            "## Evidence\n" + "\n".join(evidence_lines),
+            "## What is not confirmed\n" + "\n".join(not_confirmed_lines),
+        ]
+        if bundle.contradictions:
+            conflict_lines = ["ResolveIQ found conflicting evidence:"]
+            for c in bundle.contradictions:
+                conflict_lines.append(f'- {c.description} "{c.source_a}" says: {c.claim_a}. "{c.source_b}" says: {c.claim_b}.')
+            sections.append("## Evidence conflict\n" + "\n".join(conflict_lines))
+        return "\n\n".join(sections)
+
+    _HISTORICAL_LOOKUP_MAX_CASES = 3
+    """Same capping discipline as every other ranked list in this
+    module -- the strongest few cases, not an unbounded dump."""
+
+    def _compose_historical_lookup_synthesis(self, strategy: "InvestigationStrategy", question: str) -> str | None:
+        """Real-Corpus Answer Quality & Final Chat Hardening phase, §10
+        -- a dedicated answer planner for HISTORICAL_LOOKUP questions
+        ("Has this happened before?", "What was the resolution in
+        similar cases?"), replacing the generic knowledge-synthesis
+        shape with "## Similar cases found/## What this tells us/## What
+        it does not establish" -- each case explicitly flagged
+        historical-recommendation-vs-current-resolution (§9's own
+        anti-pattern: never silently promoted to a confirmed fix).
+        Built entirely from the same ``EvidenceBundle`` every other
+        composer uses. Returns ``None`` when not HISTORICAL_LOOKUP-
+        classified or nothing retrieved clears the relevance bar."""
+        context = build_query_context(question)
+        if context.intent != AnswerIntent.HISTORICAL_LOOKUP:
+            return None
+        bundle = build_evidence_bundle(
+            question, context, strategy,
+            min_score=self._KNOWLEDGE_SYNTHESIS_MIN_SCORE, min_score_secondary=self._KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY,
+        )
+        if not bundle.historical_case_evidence:
+            return None
+        cases = bundle.historical_case_evidence[: self._HISTORICAL_LOOKUP_MAX_CASES]
+        recommendation_titles = {
+            c.supported_by[0]
+            for c in bundle.claims
+            if c.category == "recommendation" and c.supported_by
+        }
+
+        lines = ["## Similar cases found"]
+        for idx, item in enumerate(cases, start=1):
+            has_recommendation = item.title in recommendation_titles
+            lines.append(f"\n### {idx}. {item.title}")
+            lines.append(f"What happened: {truncate_extract(item.excerpt, 280)}")
+            if has_recommendation:
+                lines.append(
+                    "Historical outcome: a resolution/next step was recorded for this past case -- this is a "
+                    "HISTORICAL RECOMMENDATION, not a confirmed current resolution; it has not been independently "
+                    "verified for this situation."
+                )
+            else:
+                lines.append("Historical outcome: no recorded resolution/next step is on file for this case.")
+
+        lines.append("\n## What this tells us")
+        lines.append(
+            f"ResolveIQ found {len(bundle.historical_case_evidence)} historical case(s) that share this subject -- "
+            "these show the subject was previously observed/investigated."
+        )
+
+        lines.append("\n## What this does not establish")
+        not_establish = [
+            "None of these cases confirm the current situation has the same root cause -- similarity is not proof.",
+        ]
+        if recommendation_titles:
+            not_establish.append(
+                "A recorded historical resolution/next step is what a PAST case did, not a confirmed fix for the "
+                "current situation."
+            )
+        lines.extend(f"- {line}" for line in not_establish)
+
+        if bundle.contradictions:
+            lines.append("\n## Evidence conflict")
+            lines.append("ResolveIQ found conflicting evidence:")
+            for c in bundle.contradictions:
+                lines.append(f'- {c.description} "{c.source_a}" says: {c.claim_a}. "{c.source_b}" says: {c.claim_b}.')
+
+        return "\n".join(lines)
+
     _TROUBLESHOOTING_SYNTHESIS_MAX_CANDIDATES = 3
     """Same capping discipline as everywhere else in this codebase --
     a ranked-hypothesis answer with a dozen entries is not more useful
@@ -1578,6 +2035,8 @@ class ChatOrchestrator:
         strategy: "InvestigationStrategy",
         question: str,
         log_evidence: "list[Evidence] | None" = None,
+        *,
+        force: bool = False,
     ) -> str | None:
         """Final Hardening Pass, Objective 2 -- a richer, ranked-
         hypothesis deterministic answer for "why did this fail?"-style
@@ -1617,11 +2076,27 @@ class ChatOrchestrator:
         question -- the caller then falls through to the existing,
         unmodified tier-based/L2-L3 text, which already states "what is
         observed"/"what is not established" honestly rather than this
-        method manufacturing a hypothesis merely to look complete."""
+        method manufacturing a hypothesis merely to look complete.
+
+        ``force`` (Real-Corpus Answer Quality & Final Chat Hardening
+        phase) -- bypasses the LIKELY/CONFIRMED tier guard below, used
+        ONLY by ``_compose_answer``'s own off-topic override
+        (``_tier_answer_is_off_topic``) for the exact real corpus
+        finding that motivated it: "What happens if process settings
+        are wrong?" reached LIKELY tier off an unrelated known bug, and
+        this method's own tier guard -- built on the assumption that a
+        LIKELY/CONFIRMED root cause is already correct -- silently kept
+        the caller from ever trying a real, on-topic troubleshooting
+        hypothesis instead. ``force`` is never set by this method's own
+        normal callers (the default ``False`` preserves this contract
+        exactly as before for every existing test)."""
         structured = strategy.structured_resolution
-        if structured is None or structured.confidence in (
-            ResolutionProvenance.LIKELY,
-            ResolutionProvenance.CONFIRMED,
+        if structured is None or (
+            not force
+            and structured.confidence in (
+                ResolutionProvenance.LIKELY,
+                ResolutionProvenance.CONFIRMED,
+            )
         ):
             return None
 
@@ -1680,8 +2155,33 @@ class ChatOrchestrator:
             # required whenever the question has extractable subject
             # words at all; a merely-highest-scoring, zero-overlap
             # candidate is never presented as a likely cause.
+            #
+            # Real-Corpus Answer Quality & Final Chat Hardening phase --
+            # when ``force=True`` (this method was invoked ONLY because
+            # the tier's own answer was already off-topic), a bare
+            # overlap>0 bar is not enough: "What happens if process
+            # settings are wrong?" shares just the single generic word
+            # "process" with "IIS worker PROCESS crash..." (1 of 3
+            # concept words), which the normal >0 bar happily accepts
+            # -- but presenting that as "the most likely explanation"
+            # would just replace one confidently-wrong answer with
+            # another. Forced invocations require a REAL MAJORITY of
+            # the question's concept words (``retrieval_profile.has_
+            # majority_overlap``, the same bar §3's authority fix
+            # already established) -- an honest "insufficient evidence"
+            # is preferred over a confident, barely-related guess. The
+            # NORMAL (non-forced) path is completely unaffected: this
+            # stricter bar only ever applies when the caller has
+            # already established the alternative (the tier's own text)
+            # is ALSO off-topic.
+            min_overlap_ok = (
+                (lambda ov: not self._is_off_topic_overlap(ov, len(concept_words)))
+                if force
+                else (lambda ov: ov > 0)
+            )
             ranked = [
-                item for item in ranked if lexical_overlap(concept_words, f"{item[0].title} {item[0].snippet[:500]}") > 0
+                item for item in ranked
+                if min_overlap_ok(lexical_overlap(concept_words, f"{item[0].title} {item[0].snippet[:500]}"))
             ]
         if not ranked:
             return None

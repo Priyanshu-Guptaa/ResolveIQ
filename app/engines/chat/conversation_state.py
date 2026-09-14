@@ -37,6 +37,7 @@ fully and testably today:
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -130,6 +131,26 @@ _FOCUS_REFERENCE_CUES: tuple[tuple[str, str], ...] = (
 resolved against last_focus, except "problem" (the current investigation
 subject is always singular and always available once a conversation has
 started, so it never needs a prior-record pointer to resolve safely)."""
+
+_SIMILAR_CASES_QUALIFIER_RE = re.compile(r"\b(?:in|among)\s+(?:similar|other|past|prior|previous)\s+cases?\b", re.IGNORECASE)
+"""Real-Corpus Answer Quality & Final Chat Hardening phase -- "What was
+the resolution in similar cases?" is a real, required golden question
+(a self-contained HISTORICAL_LOOKUP request about OTHER past cases),
+but it also contains the literal substring "what was the resolution",
+a ``_FOCUS_REFERENCE_CUES`` entry meant for a genuinely different
+question -- "What was the resolution?" asking about THIS investigation's
+own already-established focus. In a fresh session with nothing
+established yet, that collision made ``resolve_reference`` return
+AMBIGUOUS with the unhelpful, generic "nothing has been established
+yet to resolve this against" candidate, which ``ChatOrchestrator``
+then rendered as "I found multiple possible interpretations of that
+reference" -- never even reaching the real, already-built
+HISTORICAL_LOOKUP path (see ``app.engines.chat.knowledge_question.
+HISTORICAL_PHRASES``'s own "in similar cases" entry). This regex is
+the one, narrow signal that distinguishes the two: any focus cue
+qualified by "in similar/other/past/prior cases" is asking about OTHER
+investigations, not this one, and must never be treated as a
+reference needing this conversation's own prior context."""
 
 
 class ConversationStateEngine:
@@ -449,6 +470,13 @@ class ConversationStateEngine:
 
         for phrase, focus in _FOCUS_REFERENCE_CUES:
             if phrase_present(phrase, text):
+                if _SIMILAR_CASES_QUALIFIER_RE.search(text):
+                    # "...in similar/other/past/prior cases" -- a real,
+                    # self-contained historical-lookup question about
+                    # OTHER investigations, not a reference to this
+                    # one's own established focus. See
+                    # _SIMILAR_CASES_QUALIFIER_RE's own docstring.
+                    continue
                 if focus == "problem":
                     return ReferenceResolution(state=ReferenceState.RESOLVED, cue=phrase, resolved_focus="problem")
                 if slots.last_focus == focus or slots.last_referenced_investigation_id or slots.last_referenced_tfs_id:

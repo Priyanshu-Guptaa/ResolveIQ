@@ -171,7 +171,7 @@ _CONCEPT_STOPWORDS: frozenset[str] = frozenset(
         "information", "documentation", "docs", "know", "known", "explain", "describe", "give", "overview",
         "summary", "for", "this", "that", "these", "those", "seen", "before", "happened", "related", "case",
         "cases", "previous", "prior", "past", "and", "or", "with", "can", "you", "us", "please", "there",
-        "i", "it", "its",
+        "i", "it", "its", "issue", "issues", "problem", "problems", "where",
     }
 )
 """Closed stopword list for ``extract_concept_words`` -- the fixed

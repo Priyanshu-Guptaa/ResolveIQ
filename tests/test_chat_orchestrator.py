@@ -3280,3 +3280,226 @@ def test_follow_up_questions_retain_topic_then_new_chat_has_no_contamination(bun
     third = orchestrator.handle_message(session2.id, "What is Dashboard in CC?")
     assert "Process Settings" not in third.answer_text
     assert "Dashboard Overview in Command Center" in third.answer_text
+
+
+# --- Real-Corpus Answer Quality & Final Chat Hardening phase ----------------
+# --- Real corpus finding: RecommendationEngine's own root-cause matching --
+# --- can reach LIKELY/CONFIRMED tier off a record that has NOTHING to do --
+# --- with a genuine knowledge/configuration question, silently pre-empting -
+# --- the knowledge-synthesis composer that never even runs at those tiers --
+
+
+def test_likely_tier_off_topic_root_cause_falls_back_to_knowledge_synthesis(bundle):
+    """The exact real bug: "What is process settings in CC?" reached
+    LIKELY tier off an unrelated known bug/historical match (real
+    corpus finding), even though real, on-topic Documentation existed.
+    The off-topic LIKELY answer must be replaced by the real knowledge
+    answer."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo, title="Unrelated IIS crash case", description="IIS worker process crash unrelated to this question.")
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Process Settings in Command Center", "Process settings in CC control how scheduled jobs run.", 0.75)
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is process settings in CC?")
+
+    assert response.resolution_provenance.value == "likely"  # the real, unmodified tier -- untouched
+    assert response.answer_kind == "knowledge"
+    # The real documentation is the PRIMARY, cited answer -- the composer's
+    # own existing "list related historical matches too" behavior (real,
+    # legitimate, unrelated to this fix) may still mention the historical
+    # case as a secondary, explicitly-caveated citation, so this only
+    # checks the actual answer paragraph, not total absence.
+    assert response.answer_text.startswith('## Answer\nBased on ResolveIQ\'s documentation "Process Settings in Command Center"')
+
+
+def test_confirmed_tier_off_topic_root_cause_falls_back_to_knowledge_synthesis(bundle):
+    """Same fix, CONFIRMED tier -- an off-topic confirmed root cause
+    must not be presented as if it answers a genuine, unrelated
+    knowledge question either."""
+    from app.domain.provenance import EvidenceKind, EvidenceReference, ResolutionProvenance
+    from app.domain.recommendation import InvestigationStage, InvestigationStrategy
+    from app.domain.structured_resolution import ApplicabilitySummary, StructuredResolution
+
+    structured = StructuredResolution(
+        source_kind="historical_investigation", source_id="hi-1", problem="Something else entirely",
+        symptoms="Something else entirely.",
+        applicability=ApplicabilitySummary(), root_cause="Collector lost network route to the mesh gateway.",
+        root_cause_evidence=[
+            EvidenceReference(kind=EvidenceKind.HISTORICAL_INVESTIGATION, source_id="hi-1", title="x", reason="r", score=0.9)
+        ],
+        resolution_candidates=[], validation_steps=[], confidence=ResolutionProvenance.CONFIRMED,
+        confidence_rationale="Cross-source corroboration.",
+    )
+    strategy = InvestigationStrategy(
+        current_stage=InvestigationStage.TRIAGE, stage_rationale="r", progress=0.0, progress_summary="s",
+        recommended_next_action="n", next_action_rationale="r", structured_resolution=structured,
+        documentation=[_doc_match_for("Process Settings in Command Center", "Process settings in CC control how scheduled jobs run.", 0.75)],
+    )
+    orchestrator = bundle["orchestrator"]
+
+    text, follow_up, answer_kind = orchestrator._compose_answer(strategy, "What is process settings in CC?")
+
+    assert answer_kind == "knowledge"
+    assert "Process Settings in Command Center" in text
+    assert "mesh gateway" not in text
+
+
+def test_likely_tier_on_topic_root_cause_is_never_overridden_by_knowledge_synthesis(bundle):
+    """Positive control -- a genuinely relevant LIKELY-tier root cause
+    that DOES share real subject words with the question must never
+    be replaced, even when unrelated documentation also exists."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(
+        knowledge_repo, title="AxeI meter collector timeout", description="AxeI meter lost network route to the collector.",
+        root_cause="AxeI meter collector lost network route.",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is AxeI meter?")
+
+    assert response.resolution_provenance.value == "likely"
+    assert response.answer_kind is None  # the original, on-topic tier-based text, untouched
+    assert "AxeI meter collector lost network route" in response.answer_text
+
+
+def test_what_should_i_check_next_uses_troubleshooting_synthesis_when_evidence_exists(bundle):
+    """Real corpus finding: "What should I check next?" found real,
+    on-topic evidence (a real documented check) yet still collapsed
+    into the generic "A possible explanation may exist..." boilerplate,
+    because only contains_troubleshooting_synthesis_question (not
+    contains_troubleshooting_question) was wired to the richer
+    composer. Must now use the ranked-hypothesis answer instead."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(
+        knowledge_repo, title="Post-work check: validate register reads after midnight",
+        description="Check that register reads are coming in after midnight for each meter.",
+        root_cause="", resolution="", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What should I check next?")
+
+    assert response.answer_text != (
+        "A possible explanation may exist, but the evidence found is limited. Evidence is not yet sufficient to "
+        "verify this -- treat it as a hypothesis to check, not a resolution to act on."
+    )
+    assert "## Likely causes" in response.answer_text
+    assert "Post-work check: validate register reads after midnight" in response.answer_text
+
+
+def test_ambiguous_response_with_no_prior_context_gives_helpful_clarification(bundle):
+    """Real-Corpus phase, §9 -- when a reference cue matches but
+    nothing has been established yet in a fresh session, the response
+    must be a real, answerable clarifying question, never the
+    misleading "I found multiple possible interpretations" framing (a
+    real, unfixed regression finding: there was never more than one
+    interpretation, there was zero context)."""
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What was the resolution?")
+
+    assert "multiple possible interpretations" not in response.answer_text
+    assert "product, component, or issue" in response.answer_text.lower()
+
+
+def test_async_enhancement_job_receives_the_same_evidence_bundle_context_as_sync(bundle):
+    """Real-Corpus Answer Quality & Final Chat Hardening phase, §17 --
+    sync/async parity: the async enhancement job's own LLM prompt must
+    include the same ADDITIONAL EVIDENCE CONTEXT section the
+    synchronous path already gets, built from the same strategy."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo, resolution="", next_step="")
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    llm = GatedFakeLLMProvider(response="This has happened before.")
+    service = ChatEnhancementService(max_concurrent=1, max_queued=1)
+    orchestrator = _orchestrator_with_async_llm(bundle, llm, service)
+    session = orchestrator.create_session()
+    response = orchestrator.handle_message(session.id, "Has this happened before?")
+
+    job_id = response.enhancement.job_id
+    llm.release.set()
+    assert _wait_until(lambda: service.get(job_id).status == EnhancementStatus.COMPLETED)
+
+    assert llm.last_prompt is not None
+    assert "ADDITIONAL EVIDENCE CONTEXT" in llm.last_prompt
+    assert "RF Mesh IP command timeout" in llm.last_prompt
+
+
+# --- Real-Corpus Answer Quality & Final Chat Hardening phase, §10 -----------
+# --- New per-intent answer planners: CONFIGURATION/HOW_TO, HISTORICAL_LOOKUP -
+
+
+def test_configuration_synthesis_produces_steps_and_conditions_sections(bundle):
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "Process Settings in Command Center",
+            "Process settings in CC control how scheduled jobs run: interval, retry count, enabled/disabled state, "
+            "configured under Admin > Process Settings.",
+            0.75,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Where do I configure process settings?")
+
+    assert response.answer_kind == "knowledge"
+    assert "## Steps" in response.answer_text
+    assert "## Important conditions" in response.answer_text
+    assert "## Version-specific notes" in response.answer_text
+    assert "Process Settings in Command Center" in response.answer_text
+
+
+def test_configuration_synthesis_returns_none_for_non_configuration_question(bundle):
+    from app.domain.recommendation import InvestigationStage, InvestigationStrategy
+
+    orchestrator = bundle["orchestrator"]
+    assert orchestrator._compose_configuration_synthesis(
+        InvestigationStrategy(
+            current_stage=InvestigationStage.TRIAGE, stage_rationale="r", progress=0.0, progress_summary="s",
+            recommended_next_action="n", next_action_rationale="r",
+        ),
+        "What is AxeI meter?",
+    ) is None
+
+
+def test_historical_lookup_synthesis_flags_recommendation_vs_observation(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    record_with_resolution = _save_hi(
+        knowledge_repo, title="Similar RF Mesh timeout case", description="Meter stopped responding to commands.",
+        resolution="Reset the collector queue.",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record_with_resolution, 0.85)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What was the resolution in similar cases?")
+
+    assert response.answer_kind == "knowledge"
+    assert "## Similar cases found" in response.answer_text
+    assert "## What this does not establish" in response.answer_text
+    assert "HISTORICAL RECOMMENDATION" in response.answer_text
+    assert "is the solution" not in response.answer_text.lower()
+
+
+def test_historical_lookup_synthesis_returns_none_for_non_historical_question(bundle):
+    from app.domain.recommendation import InvestigationStage, InvestigationStrategy
+
+    orchestrator = bundle["orchestrator"]
+    assert orchestrator._compose_historical_lookup_synthesis(
+        InvestigationStrategy(
+            current_stage=InvestigationStage.TRIAGE, stage_rationale="r", progress=0.0, progress_summary="s",
+            recommended_next_action="n", next_action_rationale="r",
+        ),
+        "What is AxeI meter?",
+    ) is None

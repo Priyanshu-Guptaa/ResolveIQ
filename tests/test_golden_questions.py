@@ -65,15 +65,12 @@ GOLDEN_QUESTIONS: list[GoldenQuestion] = [
     GoldenQuestion(3, "knowledge", "What is process settings in CC?", AnswerIntent.ENTITY_DEFINITION, ("process", "settings")),
     GoldenQuestion(4, "knowledge", "What are process settings in CC?", AnswerIntent.CONCEPT_EXPLANATION, ("process", "settings")),
     GoldenQuestion(5, "knowledge", "Where do I configure process settings?", AnswerIntent.CONFIGURATION, ("process", "settings")),
-    # #6 is a real, documented gap: "What happens if X is wrong?" is a
-    # legitimate consequence question but matches none of this
-    # codebase's existing closed phrase lists (not a knowledge-question
-    # lead-in, not a how-to, not a troubleshooting-synthesis phrase) --
-    # it classifies UNKNOWN today. See the final report's limitations
-    # section; not fixed in this phase (higher false-positive risk than
-    # the three narrow, sibling-phrase fixes made elsewhere in this
-    # file's discovery process).
-    GoldenQuestion(6, "knowledge", "What happens if process settings are wrong?", AnswerIntent.UNKNOWN, ("process", "settings")),
+    # #6 was a real, documented gap in the prior phase ("What happens
+    # if X is wrong?" matched none of this codebase's closed phrase
+    # lists) -- fixed this phase via _WHAT_HAPPENS_IF_WRONG_RE
+    # (troubleshooting_synthesis_question.py), a real corpus finding
+    # (Real-Corpus Answer Quality & Final Chat Hardening phase, §8).
+    GoldenQuestion(6, "knowledge", "What happens if process settings are wrong?", AnswerIntent.TROUBLESHOOTING, ("process", "settings")),
     GoldenQuestion(7, "knowledge", "What is Dashboard in CC?", AnswerIntent.ENTITY_DEFINITION, ("dashboard",)),
     GoldenQuestion(8, "knowledge", "Explain Dashboard in CC.", AnswerIntent.CONCEPT_EXPLANATION, ("dashboard",)),
     GoldenQuestion(21, "knowledge", "What is Zorblex 9000?", AnswerIntent.ENTITY_DEFINITION, ("zorblex",)),
@@ -94,11 +91,11 @@ GOLDEN_QUESTIONS: list[GoldenQuestion] = [
     GoldenQuestion(20, "troubleshooting", "What should L2 check?", AnswerIntent.UNKNOWN),
     GoldenQuestion(24, "troubleshooting", "How do I configure it?", AnswerIntent.CONFIGURATION, ("process", "settings", "configure"), context_text="What is process settings in CC?"),
     GoldenQuestion(
-        25, "troubleshooting", "What happens if it's wrong?", AnswerIntent.UNKNOWN,
-        (), context_text="What is process settings in CC?\nHow do I configure it?",
+        25, "troubleshooting", "What happens if it's wrong?", AnswerIntent.TROUBLESHOOTING,
+        ("process", "settings"), context_text="What is process settings in CC?\nHow do I configure it?",
     ),
     GoldenQuestion(23, "troubleshooting", "How do I configure the timeout?", AnswerIntent.CONFIGURATION, ("configure", "timeout")),
-    GoldenQuestion(6, "troubleshooting", "What happens if process settings are wrong?", AnswerIntent.UNKNOWN, ("process", "settings")),
+    GoldenQuestion(6, "troubleshooting", "What happens if process settings are wrong?", AnswerIntent.TROUBLESHOOTING, ("process", "settings")),
     GoldenQuestion(5, "troubleshooting", "Where do I configure process settings?", AnswerIntent.CONFIGURATION, ("process", "settings")),
     # --- historical (5) --------------------------------------------------
     GoldenQuestion(13, "historical", "Has this happened before?", AnswerIntent.HISTORICAL_LOOKUP),
@@ -130,16 +127,15 @@ GOLDEN_QUESTIONS: list[GoldenQuestion] = [
     GoldenQuestion(19, "l2_l3", "Prepare an L3 escalation.", AnswerIntent.UNKNOWN, has_log_evidence=False),
     # --- follow-up / context / isolation (5) ----------------------------
     GoldenQuestion(24, "followup", "How do I configure it?", AnswerIntent.CONFIGURATION, ("process", "settings", "configure"), context_text="What is process settings in CC?"),
-    # #25 itself still classifies UNKNOWN (see #6's own gap note above --
-    # "what happens if X is wrong" matches no closed phrase list yet),
-    # but the CONTEXT-CARRYING half of this worked example is what §17
-    # actually requires and this entry verifies: the subject correctly
-    # carries "process settings" forward via the anaphora-aware
-    # context_text merge (build_query_context's own "it"/"this"/"that"
-    # detection), even though the CURRENT turn's own words ("happens",
-    # "wrong") are also real and kept alongside it.
+    # #25 now correctly classifies TROUBLESHOOTING (see #6's own fix
+    # note above); the CONTEXT-CARRYING half of this worked example is
+    # what §17 actually requires and this entry verifies: the subject
+    # correctly carries "process settings" forward via the anaphora-
+    # aware context_text merge (build_query_context's own "it"/"this"/
+    # "that" detection), even though the CURRENT turn's own words
+    # ("happens", "wrong") are also real and kept alongside it.
     GoldenQuestion(
-        25, "followup", "What happens if it's wrong?", AnswerIntent.UNKNOWN,
+        25, "followup", "What happens if it's wrong?", AnswerIntent.TROUBLESHOOTING,
         ("process", "settings"), context_text="What is process settings in CC?\nHow do I configure it?",
     ),
     GoldenQuestion(26, "followup", "New Chat isolation.", covered_by="test_follow_up_questions_retain_topic_then_new_chat_has_no_contamination (tests/test_chat_orchestrator.py)"),
@@ -285,3 +281,80 @@ def test_golden_22_irrelevant_retrieved_documents_never_answered_as_if_relevant(
     bundle = build_evidence_bundle("what is process setting in emerge", context, strategy)
     assert bundle.all_evidence() == []
     assert bundle.sufficiency.value == "weak"
+
+
+# --- Real-Corpus Answer Quality & Final Chat Hardening phase ----------------
+# --- Golden Question Set expansion -- entries derived directly from real  --
+# --- bugs found by running the golden questions against the ACTUAL       --
+# --- ResolveIQ corpus (a read-only copy of data/resolveiq.db + data/     --
+# --- chroma), never a synthetic guess. Each names the exact real defect. --
+
+
+def test_golden_31_generic_shared_word_never_earns_authoritative_status():
+    """Real corpus finding: "SM Registration,Removal and Disposal for
+    Japanese Meters" shared only the generic word "meter" with "AxeI
+    meter" (1 of 2 concept words) and was still labeled
+    AUTHORITATIVE_DEFINITION before the majority-overlap fix. A
+    documentation match sharing FEWER than half the question's real
+    concept words must never be authoritative."""
+    context = build_query_context("What is AxeI meter?")
+    strategy = _strategy(
+        documentation=[_doc("SM Registration, Removal and Disposal for Japanese Meters", "Process for Japanese meter registration.", 0.7)]
+    )
+    bundle = build_evidence_bundle("What is AxeI meter?", context, strategy)
+    assert not bundle.has_authoritative_evidence()
+    assert bundle.documentation and bundle.documentation[0].authority.value == "documented_behavior"
+
+
+def test_golden_32_configuration_question_produces_steps_not_document_titles():
+    """#5/§10 -- "Where do I configure X?" must produce an actual
+    Steps/Important conditions/Version-specific notes structure, never
+    a bare list of document titles."""
+    from app.domain.enums import KnowledgeCollection as _KC
+    from app.engines.chat.orchestrator import ChatOrchestrator
+
+    strategy = _strategy(
+        documentation=[_doc("Process Settings in Command Center", "Process settings in CC control how scheduled jobs run, configured under Admin > Process Settings.", 0.75)]
+    )
+    text = ChatOrchestrator.__dict__["_compose_configuration_synthesis"].__get__(
+        object.__new__(ChatOrchestrator)
+    )(strategy, "Where do I configure process settings?")
+    assert text is not None
+    assert "## Steps" in text
+    assert "## Important conditions" in text
+    assert "## Version-specific notes" in text
+
+
+def test_golden_33_historical_lookup_question_produces_case_structure():
+    """#14/#29/§10 -- "What was the resolution in similar cases?" must
+    produce the per-case Similar-cases-found structure, never the
+    generic knowledge-synthesis shape."""
+    from app.engines.chat.orchestrator import ChatOrchestrator
+
+    strategy = _strategy(
+        historical_investigations=[_hist("Similar RF Mesh timeout case", "Meter stopped responding.", 0.8, resolution="Reset the collector queue.")]
+    )
+    text = ChatOrchestrator.__dict__["_compose_historical_lookup_synthesis"].__get__(
+        object.__new__(ChatOrchestrator)
+    )(strategy, "What was the resolution in similar cases?")
+    assert text is not None
+    assert "## Similar cases found" in text
+    assert "## What this does not establish" in text
+    assert "HISTORICAL RECOMMENDATION" in text
+
+
+def test_golden_34_in_similar_cases_reaches_historical_lookup_not_generic_ambiguity():
+    """§9 -- real corpus finding: "What was the resolution in similar
+    cases?" in a fresh session hit a pre-existing, unrelated reference-
+    ambiguity gate ("what was the resolution") before ever reaching
+    HISTORICAL_LOOKUP classification. Must now classify correctly."""
+    context = build_query_context("What was the resolution in similar cases?")
+    assert context.intent == AnswerIntent.HISTORICAL_LOOKUP
+
+
+def test_golden_35_what_should_i_check_next_is_troubleshooting_not_unknown():
+    """§8 -- "What should I check next?" (a real, common support
+    question) must classify as TROUBLESHOOTING, matched via
+    contains_troubleshooting_question, never left UNKNOWN."""
+    context = build_query_context("What should I check next?")
+    assert context.intent == AnswerIntent.TROUBLESHOOTING

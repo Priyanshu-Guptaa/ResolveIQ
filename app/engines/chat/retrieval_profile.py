@@ -132,7 +132,7 @@ _CONFIGURATION_INTENTS = (AnswerIntent.CONFIGURATION, AnswerIntent.HOW_TO)
 _TROUBLESHOOTING_INTENTS = (AnswerIntent.TROUBLESHOOTING, AnswerIntent.ROOT_CAUSE)
 
 
-def _authority_for_source(source_type: str, intent: AnswerIntent) -> SourceAuthority:
+def _authority_for_source(source_type: str, intent: AnswerIntent, has_majority_overlap: bool = True) -> SourceAuthority:
     """The single, closed mapping assigning ``SourceAuthority`` --
     never re-derived elsewhere. Real content from Documentation/Wiki
     can be AUTHORITATIVE for a definitional or configuration question
@@ -145,12 +145,38 @@ def _authority_for_source(source_type: str, intent: AnswerIntent) -> SourceAutho
     THIS incident. Historical Investigations are always
     HISTORICAL_OBSERVATION here (their resolution/next_step becomes a
     separate HISTORICAL_RECOMMENDATION claim -- see ``_claims_for_
-    item``); current log evidence is always CURRENT_OBSERVATION."""
+    item``); current log evidence is always CURRENT_OBSERVATION.
+
+    ``has_majority_overlap`` (Real-Corpus Answer Quality & Final Chat
+    Hardening phase) -- a real, live finding against the actual
+    ResolveIQ corpus: "What is AxeI meter?" against the real corpus
+    retrieved "SM Registration,Removal and Disposal for Japanese
+    Meters" as a Documentation candidate, sharing only the single,
+    generic word "meter" with the question's two concept words ("axei",
+    "meter") -- genuinely unrelated to AxeI, yet the plain overlap>0
+    filter (``build_evidence_bundle``'s own ranking gate) let it
+    through, and this function then unconditionally labeled it
+    AUTHORITATIVE_DEFINITION purely because it is Documentation and the
+    question is definitional. The exact same "task"/69%-similarity
+    failure shape this codebase has already fixed twice at the
+    composer-ranking level, discovered here at the AUTHORITY-
+    ASSIGNMENT level: a document sharing only the generic word, not the
+    distinctive one, must never be presented as if it AUTHORITATIVELY
+    defines/configures the subject. When ``has_majority_overlap`` is
+    False (the caller found the match shares FEWER than half the
+    question's real concept words), a would-be AUTHORITATIVE_DEFINITION/
+    AUTHORITATIVE_CONFIGURATION is downgraded one tier, to
+    DOCUMENTED_BEHAVIOR -- still real, still citable as related
+    documentation, just never claimed to settle the question. Every
+    other authority in this mapping is unaffected (never applies to
+    Known Bug/TFS/Historical/current-log at all, and this parameter's
+    own default is True so every existing caller that doesn't pass it
+    keeps its prior behavior unchanged)."""
     if source_type in ("documentation", "wiki"):
         if intent in _DEFINITIONAL_INTENTS:
-            return SourceAuthority.AUTHORITATIVE_DEFINITION
+            return SourceAuthority.AUTHORITATIVE_DEFINITION if has_majority_overlap else SourceAuthority.DOCUMENTED_BEHAVIOR
         if intent in _CONFIGURATION_INTENTS:
-            return SourceAuthority.AUTHORITATIVE_CONFIGURATION
+            return SourceAuthority.AUTHORITATIVE_CONFIGURATION if has_majority_overlap else SourceAuthority.DOCUMENTED_BEHAVIOR
         if intent in _TROUBLESHOOTING_INTENTS:
             return SourceAuthority.DOCUMENTED_TROUBLESHOOTING
         return SourceAuthority.DOCUMENTED_BEHAVIOR
@@ -161,6 +187,23 @@ def _authority_for_source(source_type: str, intent: AnswerIntent) -> SourceAutho
     if source_type == "log":
         return SourceAuthority.CURRENT_OBSERVATION
     return SourceAuthority.INFERENCE
+
+
+def has_majority_overlap(overlap: int, concept_word_count: int) -> bool:
+    """True when ``overlap`` covers STRICTLY MORE THAN half of the
+    question's real concept words, or when the question has no
+    extractable concept words at all (nothing to compare against, so
+    never penalized -- matches this module's existing "no concept
+    words means never rejected" rule elsewhere). 1-of-1 and 2-of-2 and
+    2-of-3 all count as majority; 1-of-2 and 1-of-3 do NOT -- the exact
+    real corpus finding this fixes: "axei meter" (2 concept words)
+    sharing only the generic "meter" (1-of-2) must never count as a
+    majority, since that is exactly the unrelated-document case this
+    function exists to reject. Integer comparison (``overlap * 2 >
+    concept_word_count``), never floating-point division."""
+    if concept_word_count <= 0:
+        return True
+    return overlap * 2 > concept_word_count
 
 
 _ESTABLISHES_TEXT: dict[SourceAuthority, str] = {
@@ -226,9 +269,9 @@ snippet."""
 
 
 def _knowledge_match_item(
-    match: "KnowledgeMatch", source_type: str, intent: AnswerIntent, overlap: int
+    match: "KnowledgeMatch", source_type: str, intent: AnswerIntent, overlap: int, concept_word_count: int = 0
 ) -> EvidenceItem:
-    authority = _authority_for_source(source_type, intent)
+    authority = _authority_for_source(source_type, intent, has_majority_overlap(overlap, concept_word_count))
     excerpt = truncate_extract(match.snippet, _EXCERPT_WINDOW)
     limitation = _LIMITATION_TEXT[authority]
     return EvidenceItem(
@@ -243,17 +286,24 @@ def _knowledge_match_item(
     )
 
 
-def _external_match_item(match, source_type: str, intent: AnswerIntent) -> EvidenceItem | None:
+def _external_match_item(match, source_type: str, intent: AnswerIntent, concept_words: list[str] | None = None) -> EvidenceItem | None:
     """``ExternalMatch`` (TFS/Wiki) -> ``EvidenceItem``. Returns
     ``None`` when the match carries neither ``tfs_case`` nor
     ``wiki_page`` (should not happen per ``ExternalMatch``'s own
     invariant, but this module never assumes an invariant it did not
     itself enforce -- see ``EvidenceBundle``'s "no arbitrary raw DB
-    objects" rule)."""
-    authority = _authority_for_source(source_type, intent)
-    limitation = _LIMITATION_TEXT[authority]
+    objects" rule). ``concept_words`` (Real-Corpus Answer Quality
+    phase) -- when given, a live Wiki page's authority gets the exact
+    same majority-overlap downgrade ``_knowledge_match_item`` applies
+    to Documentation (a Wiki page sharing only one generic word out of
+    several is never AUTHORITATIVE_DEFINITION/CONFIGURATION either);
+    TFS is unaffected since ``_authority_for_source`` never assigns
+    either authority to it regardless."""
+    concept_words = concept_words or []
     if source_type == "tfs" and match.tfs_case is not None:
         case = match.tfs_case
+        authority = _authority_for_source(source_type, intent)
+        limitation = _LIMITATION_TEXT[authority]
         text = case.resolution_text or case.description_text or ""
         return EvidenceItem(
             source_type="tfs",
@@ -267,6 +317,9 @@ def _external_match_item(match, source_type: str, intent: AnswerIntent) -> Evide
         )
     if source_type == "wiki" and match.wiki_page is not None:
         page = match.wiki_page
+        overlap = lexical_overlap(concept_words, f"{page.title} {page.excerpt}")
+        authority = _authority_for_source(source_type, intent, has_majority_overlap(overlap, len(concept_words)))
+        limitation = _LIMITATION_TEXT[authority]
         return EvidenceItem(
             source_type="wiki",
             title=page.title,
@@ -595,9 +648,10 @@ def build_evidence_bundle(
     hist_ranked = _filter_overlap(hist_ranked)
     bug_ranked = _filter_overlap(bug_ranked)
 
-    documentation_items = [_knowledge_match_item(m, "documentation", intent, ov) for m, ov in doc_ranked]
-    historical_items = [_knowledge_match_item(m, "historical", intent, ov) for m, ov in hist_ranked]
-    known_bug_items = [_knowledge_match_item(m, "known_bug", intent, ov) for m, ov in bug_ranked]
+    word_count = len(concept_words)
+    documentation_items = [_knowledge_match_item(m, "documentation", intent, ov, word_count) for m, ov in doc_ranked]
+    historical_items = [_knowledge_match_item(m, "historical", intent, ov, word_count) for m, ov in hist_ranked]
+    known_bug_items = [_knowledge_match_item(m, "known_bug", intent, ov, word_count) for m, ov in bug_ranked]
     # Which historical items actually recorded a resolution/next_step --
     # keyed by title (EvidenceItem carries no raw metadata by design;
     # see EvidenceItem's own "no arbitrary raw DB objects" rule), so
@@ -607,7 +661,7 @@ def build_evidence_bundle(
         m.title: bool(m.metadata.get("resolution") or m.metadata.get("next_step")) for m, _ov in hist_ranked
     }
     tfs_items = [item for m in tfs_pool if (item := _external_match_item(m, "tfs", intent)) is not None]
-    wiki_items = [item for m in wiki_pool if (item := _external_match_item(m, "wiki", intent)) is not None]
+    wiki_items = [item for m in wiki_pool if (item := _external_match_item(m, "wiki", intent, concept_words)) is not None]
     log_items = _log_evidence_items(log_evidence or [])
 
     # Documentation/Wiki items that are AUTHORITATIVE_DEFINITION/
