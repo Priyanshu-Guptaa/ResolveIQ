@@ -128,25 +128,48 @@ _KNOWN_STATES: tuple[str, ...] = (
 )
 _STATE_RE = re.compile(r"\b(" + "|".join(re.escape(s) for s in _KNOWN_STATES) + r")\b", re.IGNORECASE)
 
+_ANAPHORA_RE = re.compile(r"\b(it|this|that|them|these|those)\b", re.IGNORECASE)
+"""Closed, narrow set of bare anaphoric references -- Step 17's own
+signal that a follow-up question is standing in for a subject named in
+an earlier turn, rather than a genuinely new one. Used only by
+``build_query_context``'s ``context_text`` fallback/enrichment; never
+consulted anywhere the question already fully identifies its own
+subject without a pronoun."""
+
 
 @dataclass
 class QueryContext:
     """The deterministic "what is this question actually about"
-    object Step 3 asks for -- every field is either directly extracted
-    from the question's own text via a closed pattern, or ``None``
-    when it cannot be established (never guessed/invented, per this
-    phase's own explicit instruction)."""
+    object Step 3/5 asks for -- every field is either directly
+    extracted from the question's own text via a closed pattern, a
+    real EXACT-confidence match against this codebase's own governed
+    Customer/Region/Technology/Product/Component/Version tables (reused
+    from ``QueryUnderstandingEngine``/``ParsedQuery`` -- never a second,
+    independently-maintained entity matcher), or carried forward from
+    already-established conversation context -- never invented, never
+    guessed, per this phase's own explicit instruction."""
 
     intent: AnswerIntent
     subject: str | None
     """The question's own real content words, space-joined (reuses
-    ``extract_concept_words`` -- never a new extraction rule)."""
+    ``extract_concept_words`` -- never a new extraction rule). Falls
+    back to the accumulated conversation's own context text when the
+    CURRENT turn's question has no extractable subject words of its
+    own (e.g. "Where do I configure it?") -- see ``build_query_
+    context``'s ``context_text`` parameter -- so a follow-up question
+    inherits the real prior subject instead of losing it."""
     state: str | None = None
     """A recognized device/meter state (e.g. "Discovered") when the
     question's own text names one from the closed ``_KNOWN_STATES``
     list -- ``None`` otherwise, never inferred."""
     is_definitional: bool = False
     requested_information: str = ""
+    product: str | None = None
+    technology: str | None = None
+    version: str | None = None
+    component: str | None = None
+    customer: str | None = None
+    region: str | None = None
 
     def as_debug_dict(self) -> dict:
         """Step 18's own debug representation -- plain data, never
@@ -158,6 +181,12 @@ class QueryContext:
             "state": self.state,
             "is_definitional": self.is_definitional,
             "requested_information": self.requested_information,
+            "product": self.product,
+            "technology": self.technology,
+            "version": self.version,
+            "component": self.component,
+            "customer": self.customer,
+            "region": self.region,
         }
 
 
@@ -217,7 +246,12 @@ def classify_intent(
             return AnswerIntent.HOW_TO
         return AnswerIntent.UNKNOWN
 
-    if "has this happened before" in lowered or "seen this before" in lowered or "seen before" in lowered:
+    if (
+        "has this happened before" in lowered
+        or "seen this before" in lowered
+        or "seen before" in lowered
+        or "in similar cases" in lowered
+    ):
         return AnswerIntent.HISTORICAL_LOOKUP
 
     if is_definitional_question(question):
@@ -246,14 +280,68 @@ def extract_state(question: str) -> str | None:
     return match.group(1).title() if match else None
 
 
-def build_query_context(question: str, *, has_log_evidence: bool = False) -> QueryContext:
+def _exact_slot_name(slot: object | None) -> str | None:
+    """Reuses ``ParsedQuery``'s own ``ExtractedSlot``/``SlotConfidence``
+    contract: only an EXACT match populates ``QueryContext`` -- an
+    AMBIGUOUS or absent slot stays ``None`` here too, exactly mirroring
+    ``QueryUnderstandingEngine._build_retrieval_context``'s own
+    "existing-context-wins, EXACT-only" rule (see that method's
+    docstring) rather than a second, independently-invented threshold."""
+    if slot is None:
+        return None
+    from app.domain.query_understanding import SlotConfidence
+
+    if getattr(slot, "confidence", None) == SlotConfidence.EXACT:
+        return getattr(slot, "value_name", None)
+    return None
+
+
+def build_query_context(
+    question: str,
+    *,
+    has_log_evidence: bool = False,
+    parsed_query: object | None = None,
+    context_text: str = "",
+) -> QueryContext:
     """The single entry point ``ChatOrchestrator`` calls: classifies
     intent and extracts what can be established, in one deterministic
-    pass, never a second, independently-computed classification."""
+    pass, never a second, independently-computed classification.
+
+    ``parsed_query`` (Step 5) -- when given, is this codebase's own
+    real ``app.domain.query_understanding.ParsedQuery`` (already
+    computed once per turn by ``QueryUnderstandingEngine``, never
+    recomputed here) -- its EXACT-confidence Customer/Region/
+    Technology/Product/Component/Version slots populate the matching
+    ``QueryContext`` fields; an AMBIGUOUS or absent slot leaves the
+    field ``None``, never a guess among tied candidates.
+
+    ``context_text`` (Step 17) -- the conversation's own accumulated
+    raw text (``InvestigationSession.context_text``, already computed,
+    never a new field) -- used as a subject fallback/enrichment in two
+    cases: the current question has NO extractable concept words at
+    all, or it contains a bare anaphoric reference ("it"/"this"/
+    "that"/...) with nothing else specific enough to identify a
+    subject on its own (e.g. "How do I configure it?" -> its own real
+    concept words are just ``["configure"]`` -- real, but not a
+    SUBJECT; "it" is exactly the word standing in for one). In both
+    cases the prior turn's real concept words are merged in (prepended,
+    de-duplicated) rather than replacing whatever the current question
+    does contribute -- so "How do I configure it?" after "What is
+    process settings in CC?" carries the real subject forward as
+    "process settings configure", not just "configure". Never
+    consulted when ``context_text`` is empty (a fresh, first-turn
+    question is never altered by this)."""
     intent = classify_intent(question, has_log_evidence=has_log_evidence)
     concept_words = extract_concept_words(question)
+    if context_text and (not concept_words or _ANAPHORA_RE.search(question)):
+        context_words = extract_concept_words(context_text)
+        merged = list(context_words)
+        for word in concept_words:
+            if word not in merged:
+                merged.append(word)
+        concept_words = merged
     subject = " ".join(concept_words) if concept_words else None
-    state = extract_state(question)
+    state = extract_state(question) or (extract_state(context_text) if context_text else None)
     is_def = intent in (AnswerIntent.ENTITY_DEFINITION, AnswerIntent.PRODUCT_EXPLANATION)
     requested_information = {
         AnswerIntent.ENTITY_DEFINITION: "definition/purpose",
@@ -271,6 +359,34 @@ def build_query_context(question: str, *, has_log_evidence: bool = False) -> Que
         AnswerIntent.FOLLOW_UP: "follow-up on prior topic",
         AnswerIntent.UNKNOWN: "",
     }.get(intent, "")
+
+    product = technology = version = component = customer = region = None
+    if parsed_query is not None:
+        product = _exact_slot_name(getattr(parsed_query, "product", None))
+        technology_slot = getattr(parsed_query, "technology", None)
+        # Technology's own EXACT-or-PARTIAL rule (see ParsedQuery/
+        # QueryUnderstandingEngine._match_technology's docstring) is
+        # reused verbatim rather than re-deriving a new threshold.
+        if technology_slot is not None:
+            from app.domain.query_understanding import SlotConfidence as _SC
+
+            if getattr(technology_slot, "confidence", None) in (_SC.EXACT, _SC.PARTIAL):
+                technology = getattr(technology_slot, "value_name", None)
+        version = _exact_slot_name(getattr(parsed_query, "version", None))
+        component = _exact_slot_name(getattr(parsed_query, "component", None))
+        customer = _exact_slot_name(getattr(parsed_query, "customer", None))
+        region = _exact_slot_name(getattr(parsed_query, "region", None))
+
     return QueryContext(
-        intent=intent, subject=subject, state=state, is_definitional=is_def, requested_information=requested_information
+        intent=intent,
+        subject=subject,
+        state=state,
+        is_definitional=is_def,
+        requested_information=requested_information,
+        product=product,
+        technology=technology,
+        version=version,
+        component=component,
+        customer=customer,
+        region=region,
     )

@@ -999,3 +999,108 @@ def test_log_observations_never_introduces_an_available_check():
     )
     _, user_prompt = PromptBuilder().build("What should I check first?", structured, summary)
     assert "AVAILABLE EVIDENCE-BACKED CHECKS (already determined -- do not add others) ===\nNONE" in user_prompt
+
+
+# --- Evidence-Centered Knowledge Retrieval & Synthesis phase, §15 -----------
+# --- PromptBuilder now optionally receives a real EvidenceBundle --------
+
+
+def _bundle(**overrides):
+    from app.domain.evidence_bundle import EvidenceBundle
+
+    defaults = dict(question="q", intent="entity_definition")
+    defaults.update(overrides)
+    return EvidenceBundle(**defaults)
+
+
+def test_no_evidence_bundle_is_byte_identical_to_before_this_parameter_existed():
+    """§15's own additive contract, same as log_observations before it:
+    a caller that never passes evidence_bundle gets the exact same
+    output as before this parameter was added."""
+    system_prompt, user_prompt = PromptBuilder().build("What is the root cause?", _structured_resolution())
+    assert "ADDITIONAL EVIDENCE CONTEXT" not in user_prompt
+    assert len(system_prompt) <= 2400
+
+
+def test_empty_evidence_bundle_adds_no_section():
+    """An EvidenceBundle with nothing retrieved must not add an empty,
+    useless section to the prompt."""
+    _, user_prompt = PromptBuilder().build("What is AxeI meter?", _structured_resolution(), evidence_bundle=_bundle())
+    assert "ADDITIONAL EVIDENCE CONTEXT" not in user_prompt
+
+
+def test_evidence_bundle_with_real_evidence_renders_labeled_capped_section():
+    from app.domain.evidence_bundle import EvidenceItem, SourceAuthority
+
+    bundle = _bundle(
+        documentation=[
+            EvidenceItem(
+                source_type="documentation", title="AxeI Meter Overview", excerpt="AxeI meter is an RF mesh endpoint.",
+                relevance_score=0.8, authority=SourceAuthority.AUTHORITATIVE_DEFINITION, establishes="defines AxeI meter",
+            )
+        ],
+        historical_case_evidence=[
+            EvidenceItem(
+                source_type="historical", title="AxeI meter discovered case", excerpt="AxeI meter discovered.",
+                relevance_score=0.9, authority=SourceAuthority.HISTORICAL_OBSERVATION, establishes="observed",
+            )
+        ],
+    )
+    _, user_prompt = PromptBuilder().build("What is AxeI meter?", _structured_resolution(), evidence_bundle=bundle)
+    assert "ADDITIONAL EVIDENCE CONTEXT" in user_prompt
+    assert "AxeI Meter Overview" in user_prompt
+    assert "AxeI meter discovered case" in user_prompt
+    assert "historical" in user_prompt.lower()
+
+
+def test_evidence_bundle_current_log_evidence_is_never_duplicated_into_additional_evidence_context():
+    """current_log_evidence has its own, separately-governed LOG
+    OBSERVATIONS section (rule 10) -- it must never also appear under
+    ADDITIONAL EVIDENCE CONTEXT, which would risk the model treating
+    one fact as two independent corroborating sources."""
+    from app.domain.evidence_bundle import EvidenceItem, SourceAuthority
+
+    bundle = _bundle(
+        current_log_evidence=[
+            EvidenceItem(
+                source_type="log", title="collector.log", excerpt="5 parsed event(s).",
+                relevance_score=1.0, authority=SourceAuthority.CURRENT_OBSERVATION, establishes="observed in current log",
+            )
+        ]
+    )
+    _, user_prompt = PromptBuilder().build("Why did it fail?", _structured_resolution(), evidence_bundle=bundle)
+    assert "ADDITIONAL EVIDENCE CONTEXT" not in user_prompt
+
+
+def test_evidence_bundle_contradictions_render_under_conflicting_evidence_label():
+    from app.domain.evidence_bundle import Contradiction
+
+    bundle = _bundle(
+        contradictions=[
+            Contradiction(
+                description="Documented version information differs.", source_a="Guide A", claim_a="version 8.4",
+                source_b="Guide B", claim_b="version 9.1",
+            )
+        ]
+    )
+    _, user_prompt = PromptBuilder().build("What version is supported?", _structured_resolution(), evidence_bundle=bundle)
+    assert "ADDITIONAL EVIDENCE CONTEXT" in user_prompt
+    assert "CONFLICTING EVIDENCE" in user_prompt
+    assert "Guide A" in user_prompt and "Guide B" in user_prompt
+
+
+def test_evidence_bundle_never_leaks_raw_excerpt_beyond_its_own_cap():
+    from app.domain.evidence_bundle import EvidenceItem, SourceAuthority
+
+    long_excerpt = "X" * 1000
+    bundle = _bundle(
+        documentation=[
+            EvidenceItem(
+                source_type="documentation", title="Doc", excerpt=long_excerpt, relevance_score=0.8,
+                authority=SourceAuthority.DOCUMENTED_BEHAVIOR, establishes="describes",
+            )
+        ]
+    )
+    _, user_prompt = PromptBuilder().build("q", _structured_resolution(), evidence_bundle=bundle)
+    assert long_excerpt not in user_prompt
+    assert "X" * 200 in user_prompt  # capped, not omitted entirely

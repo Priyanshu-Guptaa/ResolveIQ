@@ -56,6 +56,7 @@ from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
 from app.engines.chat.confidence_expansion import contains_unsupported_confidence_claim
 from app.engines.chat.grounding_validator import check_no_material_loss, validate as validate_grounding
+from app.engines.chat.historical_expansion import contains_unsupported_resolution_claim
 from app.engines.chat.knowledge_question import (
     contains_knowledge_question,
     extract_concept_words,
@@ -69,6 +70,7 @@ from app.engines.chat.log_question import (
     contains_log_comparison_question,
 )
 from app.engines.chat.query_intent import AnswerIntent, build_query_context, classify_intent
+from app.engines.chat.retrieval_profile import RETRIEVAL_PROFILES, build_evidence_bundle, kind_priority
 from app.engines.chat.scope_expansion import contains_unsupported_scope_expansion
 from app.engines.chat.scope_question import split_out_scope_clause
 from app.engines.chat.troubleshooting_expansion import contains_unsupported_troubleshooting_action
@@ -353,10 +355,22 @@ class ChatOrchestrator:
                     ),
                 )
                 enhancement_ref = ChatEnhancementRef(job_id=job.id, status=job.status)
+            # §18 -- the real LLM attempt happens later, inside the
+            # background job (_finalize_llm_answer), not in this
+            # request -- "deferred" is the honest debug state here,
+            # never "attempted"/"accepted" (this request never called
+            # _attempt_llm_answer itself).
+            llm_debug = {
+                "llm_attempted": False,
+                "llm_accepted": False,
+                "llm_rejection_reason": None,
+                "llm_deferred": enhancement_ref is not None,
+            }
         else:
-            answer_text, follow_up, answer_kind = self._generate_answer(
+            answer_text, follow_up, answer_kind, llm_debug = self._generate_answer(
                 text, strategy, log_observations, log_evidence, investigation_for_retrieval
             )
+            llm_debug = {**llm_debug, "llm_deferred": False}
 
         focus, referenced_investigation_id, referenced_tfs_id = self._derive_focus(strategy)
         self._state.record_assistant_turn(
@@ -368,11 +382,56 @@ class ChatOrchestrator:
         )
 
         structured = strategy.structured_resolution
-        query_context = build_query_context(text, has_log_evidence=bool(log_evidence))
+        query_context = build_query_context(
+            text,
+            has_log_evidence=bool(log_evidence),
+            parsed_query=parsed,
+            context_text=investigation_for_retrieval.context_text,
+        )
+        # Evidence-Centered Knowledge Retrieval & Synthesis phase, §18 --
+        # the full EvidenceBundle, built once here purely for debug
+        # purposes (never a second source of truth for the answer text
+        # itself, which the composers above already produced from their
+        # own, equivalent bundle-driven ranking/authority/claims logic --
+        # see retrieval_profile.py's module docstring). Cheap: pure
+        # in-memory filtering/sorting over the same lists strategy
+        # already holds, no new I/O (§24). Never exposed to normal users
+        # by default -- see ChatResponse.debug's own docstring.
+        next_actions = available_checks(structured) if structured is not None else []
+        evidence_bundle = build_evidence_bundle(
+            text,
+            query_context,
+            strategy,
+            log_evidence=log_evidence,
+            min_score=self._KNOWLEDGE_SYNTHESIS_MIN_SCORE,
+            min_score_secondary=self._KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY,
+            next_actions=next_actions,
+        )
         debug_info = {
             **query_context.as_debug_dict(),
             "answer_kind": answer_kind,
             "resolution_provenance": structured.confidence.value if structured is not None else None,
+            "retrieval_profile": evidence_bundle.retrieval_profile,
+            "candidates": {
+                "documentation": len(strategy.documentation),
+                "historical": len(strategy.historical_investigations),
+                "known_bugs": len(strategy.known_bugs),
+                "tfs": len(strategy.tfs_matches.matches) if strategy.tfs_matches is not None else 0,
+                "wiki": len(strategy.wiki_matches.matches) if strategy.wiki_matches is not None else 0,
+            },
+            "selected_evidence": [item.title for item in evidence_bundle.all_evidence()],
+            "rejected_evidence": evidence_bundle.rejected_evidence,
+            "claims": [
+                {"text": c.text, "authority": c.authority.value, "category": c.category, "is_current": c.is_current}
+                for c in evidence_bundle.claims
+            ],
+            "contradictions": [
+                {"description": c.description, "source_a": c.source_a, "source_b": c.source_b}
+                for c in evidence_bundle.contradictions
+            ],
+            "sufficiency": evidence_bundle.sufficiency.value,
+            "answer_plan": answer_kind,
+            **llm_debug,
         }
         return ChatResponse(
             answer_text=answer_text,
@@ -522,7 +581,7 @@ class ChatOrchestrator:
         log_observations: "LogObservationSummary | None" = None,
         log_evidence: "list[Evidence] | None" = None,
         investigation: "InvestigationSession | None" = None,
-    ) -> tuple[str, str | None, str | None]:
+    ) -> tuple[str, str | None, str | None, dict]:
         """Tries LLM generation first when a provider is wired, enabled,
         and there's a real StructuredResolution to ground it in; falls
         back to the existing, untouched _compose_answer() in every
@@ -620,7 +679,14 @@ class ChatOrchestrator:
         (checked, accepted) text is what is actually returned -- the
         LLM enhances wording, it does not change what KIND of answer
         this fundamentally is (a knowledge answer stays a knowledge
-        answer for UI purposes, e.g.)."""
+        answer for UI purposes, e.g.).
+
+        Evidence-Centered Knowledge Retrieval & Synthesis phase, §18 --
+        now returns a 4th element, ``llm_debug`` (``{"llm_attempted",
+        "llm_accepted", "llm_rejection_reason"}``), the real gate
+        decision this method already made, for ``ChatResponse.debug``.
+        Its own only caller (``handle_message``) is updated to match;
+        no test calls this private method directly."""
         sanitized_question, had_scope, had_troubleshooting, structured = self._prepare_question(question, strategy)
 
         # Domain-specific deterministic reasoning ALWAYS runs first
@@ -630,26 +696,38 @@ class ChatOrchestrator:
         # LLM is wired at all.
         answer_text, follow_up, answer_kind = self._compose_answer(strategy, sanitized_question, log_evidence, investigation)
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
+        # Evidence-Centered Knowledge Retrieval & Synthesis phase, §18 --
+        # the real gate decision this method already makes, finally
+        # surfaced structurally (``ChatResponse.debug``) instead of only
+        # a log line. ``llm_attempted`` is True only when a real call to
+        # ``_attempt_llm_answer`` was made (never for the "nothing left
+        # to ask" bypass below, and never when no provider is wired).
+        llm_debug = {"llm_attempted": False, "llm_accepted": False, "llm_rejection_reason": None}
 
         if (had_scope or had_troubleshooting) and not sanitized_question:
             # Nothing non-scope/non-troubleshooting is left to ask the
             # LLM at all.
-            return answer_text, follow_up, answer_kind
+            return answer_text, follow_up, answer_kind, llm_debug
 
         if self._llm is not None and structured is not None and self._llm.is_configured():
             try:
-                llm_answer = self._attempt_llm_answer(sanitized_question, structured, log_observations)
+                llm_debug["llm_attempted"] = True
+                llm_answer, rejection_reason = self._attempt_llm_answer(sanitized_question, structured, log_observations, strategy)
                 if llm_answer is not None:
                     llm_answer = self._append_deterministic_statements(llm_answer, structured, had_scope, had_troubleshooting)
                     missing = check_no_material_loss(answer_text, llm_answer)
                     if not missing:
-                        return llm_answer, follow_up, answer_kind
+                        llm_debug["llm_accepted"] = True
+                        return llm_answer, follow_up, answer_kind, llm_debug
                     logger.warning(
                         "LLM answer omitted %d real fact(s) present in the deterministic answer (%s); "
                         "using the deterministic answer instead.",
                         len(missing),
                         "; ".join(missing),
                     )
+                    llm_debug["llm_rejection_reason"] = f"omitted {len(missing)} real fact(s) present in the deterministic answer"
+                else:
+                    llm_debug["llm_rejection_reason"] = rejection_reason
             except LLMProviderError as exc:
                 # Environmental/provider failure only (connection, timeout,
                 # HTTP error, malformed/empty response) -- never a bare
@@ -660,7 +738,8 @@ class ChatOrchestrator:
                 # other graceful-degradation path in this codebase
                 # (ExternalKnowledgeService, _reconcile_orphaned_columns).
                 logger.warning("LLM generation failed, falling back to deterministic answer: %s", exc)
-        return answer_text, follow_up, answer_kind
+                llm_debug["llm_rejection_reason"] = f"provider error: {exc}"
+        return answer_text, follow_up, answer_kind, llm_debug
 
     def _prepare_question(
         self, question: str, strategy: "InvestigationStrategy"
@@ -686,7 +765,8 @@ class ChatOrchestrator:
         question: str,
         structured: "StructuredResolution",
         log_observations: "LogObservationSummary | None",
-    ) -> str | None:
+        strategy: "InvestigationStrategy | None" = None,
+    ) -> tuple[str | None, str | None]:
         """Chat Assistant Phase 37 -- the single, centralized "try the
         LLM and validate its output" decision, extracted unchanged from
         ``_generate_answer`` so it can be shared by BOTH the existing
@@ -694,9 +774,10 @@ class ChatOrchestrator:
         (``_finalize_llm_answer``) -- never duplicated, never a second,
         potentially-diverging safety check.
 
-        Returns the validated answer text on success. Returns ``None``
-        specifically when generation succeeded but the RAW output failed
-        any of three deterministic post-generation gates -- Phase 49's
+        Returns ``(answer_text, rejection_reason)``. ``answer_text`` is
+        the validated answer text on success, ``None`` specifically
+        when generation succeeded but the RAW output failed any of
+        three deterministic post-generation gates -- Phase 49's
         confidence-upgrade gate (``contains_unsupported_confidence_
         claim``), Phase 35B's customer-scope-expansion gate
         (``contains_unsupported_scope_expansion``), or Phase 46's
@@ -706,7 +787,14 @@ class ChatOrchestrator:
         any deterministic statement is appended. The caller's job in
         every rejection case is to fall back to the deterministic
         answer, never to rewrite the rejected text into a new claim.
-        Raises ``LLMProviderError`` (unchanged, from
+        ``rejection_reason`` (Evidence-Centered Knowledge Retrieval &
+        Synthesis phase, §18) is ``None`` on success and a short,
+        human-readable string on every rejection path, so
+        ``ChatResponse.debug`` can surface ``llm_attempted``/``llm_
+        accepted``/``llm_rejection_reason`` truthfully instead of only
+        the pre-existing ``logger.warning`` call (kept, unchanged, on
+        every path -- this adds a structured signal alongside it, never
+        replaces it). Raises ``LLMProviderError`` (unchanged, from
         ``_generate_llm_answer``/``OllamaProvider``) for a genuine
         provider failure -- connection, timeout, empty response,
         malformed response -- which every caller must also treat as
@@ -728,7 +816,7 @@ class ChatOrchestrator:
         a safe, honest fallback clause, and the REPAIRED text is what
         this method returns -- see ``GroundingResult.repaired_text``'s
         own docstring for why a full rejection is not used there."""
-        answer_text, evidence_text = self._generate_llm_answer(question, structured, log_observations)
+        answer_text, evidence_text = self._generate_llm_answer(question, structured, log_observations, strategy)
         if contains_unsupported_confidence_claim(answer_text, structured.confidence):
             # Chat Assistant Phase 49 -- deterministic post-generation
             # gate, checked first (before the scope/troubleshooting gates
@@ -750,7 +838,7 @@ class ChatOrchestrator:
                 "LLM answer contained an unsupported confidence-upgrade claim "
                 "('confirmed'/'verified' below the Confirmed tier); falling back to deterministic answer."
             )
-            return None
+            return None, "unsupported confidence-upgrade claim"
         if contains_unsupported_scope_expansion(answer_text):
             # Chat Assistant Phase 35B -- deterministic post-generation
             # gate, checked on the RAW LLM text before any deterministic
@@ -774,7 +862,7 @@ class ChatOrchestrator:
                 "LLM answer contained an unsupported customer-scope expansion claim; "
                 "falling back to deterministic answer."
             )
-            return None
+            return None, "unsupported customer-scope expansion claim"
         if not available_checks(structured) and contains_unsupported_troubleshooting_action(answer_text):
             # Chat Assistant Phase 46 -- the troubleshooting analogue of
             # the gate directly above, gated on "zero evidence-backed
@@ -800,25 +888,42 @@ class ChatOrchestrator:
                 "LLM answer contained an unsupported generic troubleshooting action with no "
                 "evidence-backed checks available; falling back to deterministic answer."
             )
-            return None
+            return None, "unsupported generic troubleshooting action with no evidence-backed checks"
+        if contains_unsupported_resolution_claim(answer_text, structured.confidence):
+            # Evidence-Centered Knowledge Retrieval & Synthesis phase,
+            # §16 -- the historical-recommendation analogue of the
+            # confidence gate above: at POSSIBLE/UNKNOWN tier, any
+            # evidence this turn cites for "the fix" is at best a past
+            # case's own recorded action (a HISTORICAL_RECOMMENDATION
+            # claim, never promoted higher -- see retrieval_profile.py/
+            # evidence_bundle.py), so settled-fix language here is
+            # unsupported regardless of which specific case it
+            # paraphrases. Never fires at CONFIRMED/LIKELY tier, where a
+            # real current resolution genuinely exists.
+            logger.warning(
+                "LLM answer contained an unsupported settled-resolution claim below the Likely/"
+                "Confirmed tier; falling back to deterministic answer."
+            )
+            return None, "unsupported historical-recommendation-as-current-resolution claim"
 
         # Final Hardening Pass, Objective 1 -- see this method's own
         # docstring note above for the HIGH-severity-rejects/LOW-
         # severity-repairs split.
         grounding = validate_grounding(answer_text, evidence_text, confidence=structured.confidence)
         if not grounding.valid:
+            claim_types = ", ".join(sorted({c.claim_type for c in grounding.unsupported_claims}))
             logger.warning(
                 "LLM answer contained %d unsupported fact claim(s) (%s); falling back to deterministic answer.",
                 len(grounding.unsupported_claims),
-                ", ".join(sorted({c.claim_type for c in grounding.unsupported_claims})),
+                claim_types,
             )
-            return None
+            return None, f"grounding validation failed: unsupported {claim_types} claim(s)"
         if grounding.repaired_text is not None and grounding.repaired_text != answer_text:
             logger.warning(
                 "LLM answer contained an unsupported configuration value; repaired in place."
             )
             answer_text = grounding.repaired_text
-        return answer_text
+        return answer_text, None
 
     def _compose_deterministic_answer(
         self,
@@ -885,7 +990,7 @@ class ChatOrchestrator:
         supplies the real text."""
         if structured is None:  # pragma: no cover -- guarded by _should_enhance_asynchronously before a job is ever submitted
             return None
-        answer_text = self._attempt_llm_answer(question, structured, log_observations)
+        answer_text, _rejection_reason = self._attempt_llm_answer(question, structured, log_observations)
         if answer_text is None:
             return None
         answer_text = self._append_deterministic_statements(answer_text, structured, had_scope, had_troubleshooting)
@@ -955,6 +1060,7 @@ class ChatOrchestrator:
         question: str,
         structured: "StructuredResolution",
         log_observations: "LogObservationSummary | None" = None,
+        strategy: "InvestigationStrategy | None" = None,
     ) -> tuple[str, str]:
         """Returns ``(answer_text, evidence_text)`` -- Final Hardening
         Pass, Objective 1/Step 4: ``evidence_text`` is the exact
@@ -990,12 +1096,39 @@ class ChatOrchestrator:
         recomputed or reinterpreted here) is passed straight through to
         ``PromptBuilder.build()``, which renders it as its own labeled,
         untrusted-data section governed by rule 10 -- this method makes
-        no decision about it at all beyond forwarding it unchanged."""
+        no decision about it at all beyond forwarding it unchanged.
+
+        Evidence-Centered Knowledge Retrieval & Synthesis phase, §15 --
+        ``strategy``, when given, is used to build a real
+        ``EvidenceBundle`` (``retrieval_profile.build_evidence_bundle``,
+        the exact same construction ``ChatResponse.debug`` uses -- never
+        a second, divergent bundle) and pass it to ``PromptBuilder.
+        build()`` as a new, sanitized, capped "ADDITIONAL EVIDENCE
+        CONTEXT" section -- real Documentation/Historical/Known-Bug
+        excerpts the LLM previously had NO visibility into at all (only
+        ``StructuredResolution`` reached it before this phase). Optional
+        and defaults to ``None``: the synchronous path
+        (``_generate_answer``) always has ``strategy`` in scope and
+        passes it; the asynchronous enhancement path
+        (``_finalize_llm_answer``) does not currently thread ``strategy``
+        through its background-job closure (see that method's own
+        docstring) and so omits this section -- a disclosed, narrower
+        completion for that one path, not a silent one."""
         sanitized_problem, _ = split_out_scope_clause(structured.problem)
         if not available_checks(structured):
             sanitized_problem, _ = split_out_troubleshooting_clause(sanitized_problem)
         prompt_structured = structured.model_copy(update={"problem": sanitized_problem or structured.problem})
-        system_prompt, user_prompt = self._prompt_builder.build(question, prompt_structured, log_observations)
+        evidence_bundle = None
+        if strategy is not None:
+            query_context = build_query_context(question)
+            evidence_bundle = build_evidence_bundle(
+                question,
+                query_context,
+                strategy,
+                min_score=self._KNOWLEDGE_SYNTHESIS_MIN_SCORE,
+                min_score_secondary=self._KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY,
+            )
+        system_prompt, user_prompt = self._prompt_builder.build(question, prompt_structured, log_observations, evidence_bundle)
         return self._llm.generate(user_prompt, system_prompt=system_prompt), user_prompt
 
     # --- Deterministic answer composition (§4) ---------------------------------
@@ -1227,20 +1360,29 @@ class ChatOrchestrator:
             return None
 
         concept_words = extract_concept_words(question)
-        # (candidate, kind, overlap) for every Documentation/Historical
-        # candidate, ranked by real subject overlap first, score second --
-        # never the other way around (see docstring above).
-        _KIND_PRIORITY = {"documentation": 1, "historical": 0}
-        """Knowledge Answering & Evidence Synthesis phase, §5: a
-        historical case may prove something HAPPENED; it does not
-        establish what a product/concept IS. Real subject overlap
-        still decides first (a doc that only shares one word can still
-        lose to a historical case that shares two, exactly as the
-        existing "process setting in emerge"/"dashboard CC" regressions
-        already require and this tiebreak never overrides) -- this
-        only breaks a genuine TIE in overlap, in which case authoritative
-        documentation is preferred over a historical incident, never
-        the reverse."""
+        # Evidence-Centered Knowledge Retrieval & Synthesis phase, §4:
+        # this tiebreak now comes from the real, named, per-intent
+        # RETRIEVAL_PROFILES table (retrieval_profile.py) instead of a
+        # private two-entry dict local to this method -- the same
+        # table also governs _compose_troubleshooting_synthesis below
+        # and is independently unit-tested (tests/test_retrieval_
+        # profile.py). Every profile this codebase defines ranks
+        # "documentation"/"wiki" above "historical", so this substitution
+        # is behavior-preserving for this composer by construction, not
+        # by coincidence -- see RETRIEVAL_PROFILES's own docstring.
+        _KIND_PRIORITY = kind_priority(RETRIEVAL_PROFILES.get(classify_intent(question), RETRIEVAL_PROFILES[AnswerIntent.UNKNOWN]))
+        """(candidate, kind, overlap) for every Documentation/Historical
+        candidate, ranked by real subject overlap first, score second --
+        never the other way around (see docstring above). Knowledge
+        Answering & Evidence Synthesis phase, §5: a historical case may
+        prove something HAPPENED; it does not establish what a
+        product/concept IS. Real subject overlap still decides first (a
+        doc that only shares one word can still lose to a historical
+        case that shares two, exactly as the existing "process setting
+        in emerge"/"dashboard CC" regressions already require and this
+        tiebreak never overrides) -- this only breaks a genuine TIE in
+        overlap, in which case authoritative documentation is preferred
+        over a historical incident, never the reverse."""
         ranked: list[tuple["KnowledgeMatch", str, int]] = sorted(
             (
                 [(m, "documentation", lexical_overlap(concept_words, f"{m.title} {m.snippet[:500]}")) for m in doc_matches]
@@ -1343,6 +1485,38 @@ class ChatOrchestrator:
                 f'"{primary_match.title}" is a historical case, not authoritative documentation -- ResolveIQ does '
                 f"not have documentation on record that specifically defines this."
             )
+        # Evidence-Centered Knowledge Retrieval & Synthesis phase, §6: a
+        # historical case's own recorded resolution/next_step is a
+        # HISTORICAL_RECOMMENDATION, never a confirmed current
+        # resolution -- the anti-pattern this explicitly avoids is
+        # rendering it as "Changing X is the solution." Additive only:
+        # both regression fixtures for this composer pass resolution=""/
+        # next_step="" deliberately (to stay at POSSIBLE/UNKNOWN tier),
+        # so this never fires for them.
+        if primary_kind == "historical" and (primary_match.metadata.get("resolution") or primary_match.metadata.get("next_step")):
+            not_confirmed_lines.append(
+                f'"{primary_match.title}" has a recorded resolution/next step from that past case -- this is a '
+                f"historical recommendation, not a confirmed resolution for the current situation; it has not been "
+                f"independently verified here."
+            )
+
+        # §8: bounded, practical contradiction detection over the same
+        # Documentation/Wiki pool this answer already cites -- built
+        # from the real EvidenceBundle (retrieval_profile.py), never a
+        # second, divergent detector. Additive: fires only when two
+        # AUTHORITATIVE_* sources genuinely disagree on a version token
+        # or a "key = value" statement (see detect_contradictions's own
+        # docstring for exactly what is checked) -- never for the
+        # existing fixtures, which contain no such conflicting content.
+        context_for_bundle = build_query_context(question)
+        bundle = build_evidence_bundle(
+            question, context_for_bundle, strategy, min_score=min_score, min_score_secondary=min_score_secondary
+        )
+        conflict_lines: list[str] = []
+        if bundle.contradictions:
+            conflict_lines.append("ResolveIQ found conflicting evidence:")
+            for c in bundle.contradictions:
+                conflict_lines.append(f'- {c.description} "{c.source_a}" says: {c.claim_a}. "{c.source_b}" says: {c.claim_b}.')
 
         sections = [f"## Answer\n{direct_answer}"]
         if why_line:
@@ -1350,6 +1524,8 @@ class ChatOrchestrator:
         if source_lines:
             sections.append("## Relevant evidence\n" + "\n".join(source_lines))
         sections.append("## What is not confirmed\n" + "\n".join(not_confirmed_lines))
+        if conflict_lines:
+            sections.append("## Evidence conflict\n" + "\n".join(conflict_lines))
         return "\n\n".join(sections)
 
     _TROUBLESHOOTING_SYNTHESIS_MAX_CANDIDATES = 3
@@ -1468,18 +1644,22 @@ class ChatOrchestrator:
             "documentation": "documented behavior",
             "historical": "a previously observed scenario",
         }
-        _KIND_PRIORITY = {"known_bug": 2, "documentation": 1, "historical": 0}
-        """Knowledge Answering & Evidence Synthesis phase, retrieval
-        profile (Step 4) -- a real, disclosed, narrow substitute for a
-        full per-intent retrieval reordering: rather than re-querying
-        Chroma/TFS/Wiki differently per intent (a much larger, riskier
-        change touching working retrieval code), this tiebreaks
-        ALREADY-RETRIEVED troubleshooting candidates so a known bug
-        (a documented, confirmed defect) outranks an equally-relevant
-        historical case (a single past incident, not a documented
-        pattern) when their real lexical-overlap scores tie -- overlap
-        with the question's own subject always wins first; this only
-        breaks genuine ties, never overrides real relevance."""
+        # Evidence-Centered Knowledge Retrieval & Synthesis phase, §4:
+        # sourced from the real, named RETRIEVAL_PROFILES table
+        # (retrieval_profile.py) instead of a private dict. Pinned to
+        # the TROUBLESHOOTING profile specifically (known_bug >
+        # documentation > historical), not re-classified per question,
+        # because this composer has always applied ONE uniform tiebreak
+        # regardless of the TROUBLESHOOTING/ROOT_CAUSE sub-distinction
+        # -- RETRIEVAL_PROFILES[ROOT_CAUSE] genuinely differs (it ranks
+        # historical above documentation, reflecting that a root-cause
+        # question benefits more from a similar past incident than a
+        # generic doc), and silently switching between the two per
+        # question would be an unreviewed, untested behavior change to
+        # this already-hardened composer -- not something this phase's
+        # own "preserve existing tested behavior" instruction allows
+        # implicitly.
+        _KIND_PRIORITY = kind_priority(RETRIEVAL_PROFILES[AnswerIntent.TROUBLESHOOTING])
         pool = (
             [(m, "historical") for m in hist_matches]
             + [(m, "known_bug") for m in bug_matches]
@@ -1536,6 +1716,22 @@ class ChatOrchestrator:
             lines.extend(f"- {check}" for check in checks)
         else:
             lines.append("No evidence-backed troubleshooting check is currently available.")
+
+        # §8: same bounded, practical contradiction check as
+        # _compose_knowledge_synthesis, built from the real
+        # EvidenceBundle -- additive only, fires only on a genuine
+        # version/config-value conflict between two AUTHORITATIVE_*
+        # documentation sources (never on the historical/known-bug
+        # candidates this composer's own hypotheses are built from).
+        context_for_bundle = build_query_context(question)
+        bundle = build_evidence_bundle(
+            question, context_for_bundle, strategy, log_evidence=log_evidence, min_score=min_score, min_score_secondary=min_score_secondary
+        )
+        if bundle.contradictions:
+            lines.append("\n## Evidence conflict")
+            lines.append("ResolveIQ found conflicting evidence:")
+            for c in bundle.contradictions:
+                lines.append(f'- {c.description} "{c.source_a}" says: {c.claim_a}. "{c.source_b}" says: {c.claim_b}.')
 
         return "\n".join(lines)
 

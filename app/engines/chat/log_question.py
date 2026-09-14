@@ -45,6 +45,11 @@ LOG_ANALYSIS_PHRASES: list[str] = [
     "what happened after the failure",
     "is there a timeout",
     "are there retries",
+    # Evidence-Centered Knowledge Retrieval & Synthesis phase -- the
+    # singular-phrasing sibling of "are there retries" above, one of
+    # this phase's own required golden questions ("Was there a
+    # retry?").
+    "was there a retry",
     "did the meter respond",
     "what identifiers are present",
     "show me the timeline",

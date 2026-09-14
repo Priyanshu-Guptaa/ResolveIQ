@@ -1956,9 +1956,54 @@ def test_phase49_confirmed_tier_fixture_allows_confirmed_language(bundle):
     )
     llm = FakeLLMProvider(configured=True, response="This is confirmed based on two independent sources.")
     orchestrator = _orchestrator_with_llm(bundle, llm)
-    result = orchestrator._attempt_llm_answer("Has this happened before?", structured, None)
+    result, rejection_reason = orchestrator._attempt_llm_answer("Has this happened before?", structured, None)
 
     assert result == "This is confirmed based on two independent sources."  # never rejected
+    assert rejection_reason is None
+
+
+# --- Evidence-Centered Knowledge Retrieval & Synthesis phase, §16 -----------
+# --- app.engines.chat.historical_expansion's new gate, wired into        ---
+# --- _attempt_llm_answer exactly like its three siblings above           ---
+
+
+def test_settled_resolution_claim_is_rejected_below_likely_tier(bundle):
+    from app.domain.provenance import ResolutionProvenance
+    from app.domain.structured_resolution import ApplicabilitySummary, StructuredResolution
+
+    structured = StructuredResolution(
+        source_kind="historical_investigation", source_id="hi-1", problem="RF Mesh IP command timeout",
+        symptoms="Meters stopped responding.", applicability=ApplicabilitySummary(),
+        root_cause="", resolution_candidates=[], validation_steps=[], confidence=ResolutionProvenance.UNKNOWN,
+    )
+    llm = FakeLLMProvider(configured=True, response="The solution is to reset the collector queue.")
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    result, rejection_reason = orchestrator._attempt_llm_answer("What was the resolution in similar cases?", structured, None)
+
+    assert result is None
+    assert rejection_reason == "unsupported historical-recommendation-as-current-resolution claim"
+
+
+def test_settled_resolution_claim_is_allowed_at_likely_tier(bundle):
+    from app.domain.provenance import EvidenceKind, EvidenceReference, ResolutionProvenance
+    from app.domain.structured_resolution import ApplicabilitySummary, StructuredResolution
+
+    structured = StructuredResolution(
+        source_kind="historical_investigation", source_id="hi-1", problem="RF Mesh IP command timeout",
+        symptoms="Meters stopped responding.", applicability=ApplicabilitySummary(),
+        root_cause="Collector lost network route to the mesh gateway.",
+        root_cause_evidence=[
+            EvidenceReference(kind=EvidenceKind.HISTORICAL_INVESTIGATION, source_id="hi-1", title="x", reason="r", score=0.9)
+        ],
+        resolution_candidates=[], validation_steps=[], confidence=ResolutionProvenance.LIKELY,
+        confidence_rationale="Strong single-source match.",
+    )
+    llm = FakeLLMProvider(configured=True, response="The solution is to reset the collector queue.")
+    orchestrator = _orchestrator_with_llm(bundle, llm)
+    result, rejection_reason = orchestrator._attempt_llm_answer("What was the resolution in similar cases?", structured, None)
+
+    assert result == "The solution is to reset the collector queue."
+    assert rejection_reason is None
 
 
 # --- J. Chat Knowledge-Synthesis feature -------------------------------------

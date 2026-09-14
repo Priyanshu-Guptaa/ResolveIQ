@@ -80,7 +80,22 @@ HISTORICAL_PHRASES: list[str] = [
     "any past cases",
     "seen this before",
     "seen before",
+    "in similar cases",
 ]
+"""Evidence-Centered Knowledge Retrieval & Synthesis phase -- "in
+similar cases" added for one of this phase's own required golden
+questions, "What was the resolution in similar cases?". Deliberately
+checked here (unconditionally, before ``_WHAT_IS_RE``'s own reserved-
+lead-in guard below) rather than by widening ``_WHAT_IS_RE`` to also
+match "what WAS X": "the resolution in similar cases" still starts
+with the reserved lead-in "the resolution" (see
+``_RESERVED_INVESTIGATION_LEAD_INS``), so it would otherwise be
+rejected exactly like the ordinary, THIS-investigation question "What
+was the resolution?" (a real, existing, deliberately-different-answer
+test, ``test_what_was_the_resolution_preserves_context``) -- "in
+similar cases" is the one real signal that distinguishes "asking about
+OTHER cases" from "asking about the current investigation," so it is
+checked as its own, narrow, unconditional phrase instead."""
 """Closed list for the historical/experience mode (§2.B) -- distinct
 from ``INFORMATIONAL_PHRASES`` only for documentation purposes; both
 route to the same synthesizer (``ChatOrchestrator.
@@ -156,6 +171,7 @@ _CONCEPT_STOPWORDS: frozenset[str] = frozenset(
         "information", "documentation", "docs", "know", "known", "explain", "describe", "give", "overview",
         "summary", "for", "this", "that", "these", "those", "seen", "before", "happened", "related", "case",
         "cases", "previous", "prior", "past", "and", "or", "with", "can", "you", "us", "please", "there",
+        "i", "it", "its",
     }
 )
 """Closed stopword list for ``extract_concept_words`` -- the fixed
