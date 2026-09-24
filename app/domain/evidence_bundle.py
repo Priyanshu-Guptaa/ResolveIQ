@@ -133,14 +133,42 @@ class Claim(BaseModel):
     phrased as "the fix is..."; see the composers in
     ``ChatOrchestrator`` for the actual wording rules this enforces)."""
 
+    claim_id: str = ""
+    """Final Support-Quality Pass, §5 -- a stable, per-response
+    identifier ("claim-001", "claim-002", ...), assigned once by
+    ``retrieval_profile.build_evidence_bundle`` in the order claims are
+    constructed -- never reused across a different response, never
+    exposed to normal users by default (see ``ChatResponse.debug``'s
+    own docstring), but present so a specific final-answer statement
+    can be traced back to exactly which claim, which ``EvidenceItem``,
+    and which real source produced it. Defaults to ``""`` only for a
+    ``Claim`` constructed directly (e.g. in a unit test) before that
+    numbering pass runs."""
     text: str
     supported_by: list[str] = Field(default_factory=list)
     """Titles of the ``EvidenceItem``(s) that support this claim."""
+    source_ids: list[str] = Field(default_factory=list)
+    """The same ``EvidenceItem``(s)' own ``source_id`` values, parallel
+    to ``supported_by`` -- title is for display, ``source_ids`` is for
+    a debugging tool or a future validator to look up the exact
+    underlying record without a title-string match."""
     authority: SourceAuthority
     category: str
     """"definition" | "configuration" | "behavior" | "troubleshooting"
     | "root_cause" | "recommendation" | "observation" -- what KIND of
     claim this is, independent of confidence."""
+    confidence: float | None = None
+    """The supporting ``EvidenceItem``'s own ``relevance_score``, when
+    exactly one item supports this claim -- carried through for
+    traceability, never a new, independently-computed confidence
+    value. ``None`` when no single score applies."""
+    supported: bool = True
+    """True for every claim this module actually constructs (a Claim
+    is only ever built FROM a real, already-selected ``EvidenceItem``
+    -- there is no code path that builds an unsupported one today).
+    Kept as an explicit field, not merely implied, so a future
+    validator can check it without assuming the invariant holds
+    forever."""
     is_current: bool = False
     """True only for a claim about THIS investigation's own current
     evidence (CURRENT_OBSERVATION authority); False for anything

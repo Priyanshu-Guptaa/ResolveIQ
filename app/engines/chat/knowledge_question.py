@@ -171,7 +171,7 @@ _CONCEPT_STOPWORDS: frozenset[str] = frozenset(
         "information", "documentation", "docs", "know", "known", "explain", "describe", "give", "overview",
         "summary", "for", "this", "that", "these", "those", "seen", "before", "happened", "related", "case",
         "cases", "previous", "prior", "past", "and", "or", "with", "can", "you", "us", "please", "there",
-        "i", "it", "its", "issue", "issues", "problem", "problems", "where",
+        "i", "it", "its", "issue", "issues", "problem", "problems", "where", "if", "happens",
     }
 )
 """Closed stopword list for ``extract_concept_words`` -- the fixed
@@ -180,7 +180,18 @@ lead-in/trailing words every ``INFORMATIONAL_PHRASES``/
 function words. Never a general-purpose NLP stopword list (no attempt
 at completeness beyond what this project's own closed question
 patterns actually use) -- conservative by construction, same as every
-other list in this module."""
+other list in this module.
+
+Final Support-Quality Pass, §8 -- "if"/"happens" added after a real
+corpus finding: "What happens if process settings are wrong?" has only
+THREE real subject words ("process", "settings", "wrong"), but without
+these two in the stopword set ``extract_concept_words`` counted FIVE,
+pushing it past ``ChatOrchestrator._SHORT_QUESTION_WORD_COUNT`` and
+silently switching ``_tier_answer_is_off_topic`` from its intended
+majority-overlap rule to the lenient bare-``overlap > 0`` rule meant
+for longer, sentence-like questions. That let an unrelated known bug
+("IIS worker PROCESS crash...") sharing only the single generic word
+"process" pass as "on-topic" and be presented as the answer."""
 
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 

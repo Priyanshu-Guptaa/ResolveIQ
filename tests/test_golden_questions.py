@@ -86,9 +86,11 @@ GOLDEN_QUESTIONS: list[GoldenQuestion] = [
     ),
     GoldenQuestion(11, "troubleshooting", "Why did this meter fail?", AnswerIntent.ROOT_CAUSE, ("meter", "fail")),
     GoldenQuestion(12, "troubleshooting", "Why did this request fail?", AnswerIntent.ROOT_CAUSE, ("request", "fail")),
-    # #20 is a real, documented gap -- see the "log" category entries
-    # below and the final report's limitations section.
-    GoldenQuestion(20, "troubleshooting", "What should L2 check?", AnswerIntent.UNKNOWN),
+    # #20 was a real, documented gap in the prior phase -- fixed this
+    # phase via contains_l2_guidance_question (log_question.py), a real
+    # support-question classification gap (Final Support-Quality Pass,
+    # §2).
+    GoldenQuestion(20, "troubleshooting", "What should L2 check?", AnswerIntent.L2_GUIDANCE),
     GoldenQuestion(24, "troubleshooting", "How do I configure it?", AnswerIntent.CONFIGURATION, ("process", "settings", "configure"), context_text="What is process settings in CC?"),
     GoldenQuestion(
         25, "troubleshooting", "What happens if it's wrong?", AnswerIntent.TROUBLESHOOTING,
@@ -122,7 +124,7 @@ GOLDEN_QUESTIONS: list[GoldenQuestion] = [
     # --- L2/L3 (5) -----------------------------------------------------
     GoldenQuestion(18, "l2_l3", "Give me L2 task notes.", AnswerIntent.L2_TASK_NOTES, has_log_evidence=True),
     GoldenQuestion(19, "l2_l3", "Prepare an L3 escalation.", AnswerIntent.L3_ESCALATION, has_log_evidence=True),
-    GoldenQuestion(20, "l2_l3", "What should L2 check?", AnswerIntent.UNKNOWN, has_log_evidence=True),
+    GoldenQuestion(20, "l2_l3", "What should L2 check?", AnswerIntent.L2_GUIDANCE, has_log_evidence=True),
     GoldenQuestion(18, "l2_l3", "Give me L2 task notes.", AnswerIntent.UNKNOWN, has_log_evidence=False),
     GoldenQuestion(19, "l2_l3", "Prepare an L3 escalation.", AnswerIntent.UNKNOWN, has_log_evidence=False),
     # --- follow-up / context / isolation (5) ----------------------------
@@ -141,14 +143,35 @@ GOLDEN_QUESTIONS: list[GoldenQuestion] = [
     GoldenQuestion(26, "followup", "New Chat isolation.", covered_by="test_follow_up_questions_retain_topic_then_new_chat_has_no_contamination (tests/test_chat_orchestrator.py)"),
     GoldenQuestion(27, "followup", "Prompt injection.", covered_by="test_prompt_injection_cases_never_reach_the_llm_as_instructions (tests/test_chat_orchestrator.py)"),
     GoldenQuestion(28, "followup", "Malicious log content.", covered_by="test_log_content_does_not_fabricate_an_available_check (tests/test_chat_orchestrator.py)"),
+    # --- Final Support-Quality Pass, §10 -- L2 guidance expansion -------
+    GoldenQuestion(36, "troubleshooting", "What should L2 verify?", AnswerIntent.L2_GUIDANCE),
+    GoldenQuestion(37, "troubleshooting", "What should L2 investigate?", AnswerIntent.L2_GUIDANCE),
+    GoldenQuestion(38, "troubleshooting", "What should L2 look at?", AnswerIntent.L2_GUIDANCE),
+    GoldenQuestion(39, "troubleshooting", "What should L2 validate?", AnswerIntent.L2_GUIDANCE),
+    GoldenQuestion(40, "troubleshooting", "What should L2 do next?", AnswerIntent.L2_GUIDANCE),
+    GoldenQuestion(41, "troubleshooting", "What checks should L2 perform?", AnswerIntent.L2_GUIDANCE),
+    GoldenQuestion(42, "troubleshooting", "What should the support team check?", AnswerIntent.L2_GUIDANCE),
+    GoldenQuestion(43, "troubleshooting", "What should I check?", AnswerIntent.TROUBLESHOOTING),
+    GoldenQuestion(44, "troubleshooting", "What should I check next for this meter?", AnswerIntent.TROUBLESHOOTING, ("meter",)),
+    # Consequence-question variants (§8/§10) -- classify TROUBLESHOOTING
+    # via _WHAT_HAPPENS_IF_WRONG_RE; whether real evidence SUPPORTS a
+    # specific answer is a separate, sufficiency-level question (see
+    # test_golden_45_process_settings_consequence_is_honest_about_
+    # insufficient_evidence below), never conflated with classification.
+    GoldenQuestion(45, "troubleshooting", "What happens if this configuration is wrong?", AnswerIntent.TROUBLESHOOTING),
+    GoldenQuestion(46, "troubleshooting", "What should I do if this setting is incorrect?", AnswerIntent.UNKNOWN),
 ]
-"""40 entries (>= the 30 required, within the "prefer 40-50" range),
+"""46 entries (>= the 30 required, within the "prefer 40-50" range),
 spanning the 6 named categories with at least 5 in each. Several of
 the 30 originally-named items appear in more than one category bucket
 deliberately (e.g. #1 "What is AxeI meter?" is both a knowledge-
 definition question and the historical-lookup regression's own
 motivating example) -- this reflects how those questions actually
-function in this system, not padding."""
+function in this system, not padding. #46 is honestly recorded as
+UNKNOWN: "What should I do if X is incorrect?" (an ACTION request, not
+a "what happens" CONSEQUENCE request) matches none of this phase's new
+or existing closed phrase lists -- a real, disclosed, narrower gap than
+#45's "what happens if" phrasing, not silently claimed as fixed."""
 
 
 def _classifiable() -> list[GoldenQuestion]:
@@ -358,3 +381,61 @@ def test_golden_35_what_should_i_check_next_is_troubleshooting_not_unknown():
     contains_troubleshooting_question, never left UNKNOWN."""
     context = build_query_context("What should I check next?")
     assert context.intent == AnswerIntent.TROUBLESHOOTING
+
+
+# --- Final Support-Quality Pass, §10 -- L2 guidance + insufficient-evidence -
+# --- distinction: "correctly answered" vs "correctly identified as        -
+# --- insufficient evidence" are both PASSING outcomes; only a fabricated  -
+# --- or search-results-page answer is a failure.                         -
+
+
+def test_golden_l2_guidance_with_evidence_produces_a_real_check_not_boilerplate():
+    from app.engines.chat.orchestrator import ChatOrchestrator
+
+    strategy = _strategy(
+        known_bugs=[
+            KnowledgeMatch(
+                collection=KnowledgeCollection.KNOWN_BUGS, record_id="bug-1",
+                title="AxeI meter stuck in Discovered after firmware update",
+                snippet="Known issue: AxeI meters remain in Discovered state after a failed commissioning handshake.",
+                score=0.75,
+            )
+        ],
+    )
+    text = ChatOrchestrator.__dict__["_compose_l2_guidance_synthesis"].__get__(object.__new__(ChatOrchestrator))(
+        strategy, "AxeI meters are stuck in discovered -- what should L2 check?"
+    )
+    assert text is not None
+    assert "## What L2 should check" in text
+    assert "AxeI meter stuck in Discovered after firmware update" in text
+    assert "I don't have enough evidence" not in text
+
+
+def test_golden_l2_guidance_with_no_evidence_is_honestly_insufficient_not_generic():
+    from app.engines.chat.orchestrator import ChatOrchestrator
+
+    strategy = _strategy()
+    text = ChatOrchestrator.__dict__["_compose_l2_guidance_synthesis"].__get__(object.__new__(ChatOrchestrator))(
+        strategy, "What should L2 check?"
+    )
+    assert text is not None
+    assert "I don't have enough evidence in the current knowledge base" in text
+    for generic in ("check logs", "check network", "check configuration", "restart"):
+        assert generic not in text.lower()
+
+
+def test_golden_45_process_settings_consequence_is_honest_about_insufficient_evidence():
+    """§8's own explicit instruction: do NOT invent an answer when the
+    corpus genuinely lacks documented consequences -- an honest
+    admission is the CORRECT outcome here, not a failure."""
+    context = build_query_context("What happens if process settings are wrong?")
+    strategy = _strategy(
+        known_bugs=[
+            KnowledgeMatch(
+                collection=KnowledgeCollection.KNOWN_BUGS, record_id="bug-1", title="IIS worker crash on large uploads",
+                snippet="w3wp.exe crashes handling multipart uploads over 50MB on IIS 10.", score=0.65,
+            )
+        ]
+    )
+    bundle = build_evidence_bundle("What happens if process settings are wrong?", context, strategy)
+    assert bundle.sufficiency.value in ("weak", "insufficient")

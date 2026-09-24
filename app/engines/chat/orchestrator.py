@@ -51,11 +51,16 @@ from app.domain.chat import (
 )
 from app.domain.enums import EvidenceType, LogLevel
 from app.domain.evidence import Evidence
+from app.domain.evidence_bundle import SufficiencyLevel
 from app.domain.investigation import InvestigationSession
 from app.domain.provenance import EvidenceKind, ResolutionProvenance
 from app.domain.query_understanding import SlotConfidence
 from app.engines.chat.confidence_expansion import contains_unsupported_confidence_claim
-from app.engines.chat.grounding_validator import check_no_material_loss, validate as validate_grounding
+from app.engines.chat.grounding_validator import (
+    check_claim_authority_preserved,
+    check_no_material_loss,
+    validate as validate_grounding,
+)
 from app.engines.chat.historical_expansion import contains_unsupported_resolution_claim
 from app.engines.chat.knowledge_question import (
     contains_knowledge_question,
@@ -69,8 +74,14 @@ from app.engines.chat.log_question import (
     contains_log_analysis_question,
     contains_log_comparison_question,
 )
-from app.engines.chat.query_intent import AnswerIntent, build_query_context, classify_intent
-from app.engines.chat.retrieval_profile import RETRIEVAL_PROFILES, build_evidence_bundle, has_majority_overlap, kind_priority
+from app.engines.chat.query_intent import AnswerIntent, QueryContext, build_query_context, classify_intent
+from app.engines.chat.retrieval_profile import (
+    RETRIEVAL_PROFILES,
+    build_evidence_bundle,
+    has_majority_overlap,
+    kind_priority,
+    rank_items,
+)
 from app.engines.chat.scope_expansion import contains_unsupported_scope_expansion
 from app.engines.chat.scope_question import split_out_scope_clause
 from app.engines.chat.troubleshooting_expansion import contains_unsupported_troubleshooting_action
@@ -84,9 +95,10 @@ from app.engines.log_intelligence.engine import LogIntelligenceEngine
 from app.engines.log_intelligence.flow import reconstruct_flow
 
 if TYPE_CHECKING:
+    from app.domain.evidence_bundle import EvidenceBundle
     from app.domain.log_flow import LogObservationSummary
     from app.domain.recommendation import InvestigationStrategy, RecommendedSolution
-    from app.domain.structured_resolution import StructuredResolution
+    from app.domain.structured_resolution import ResolutionCandidate, StructuredResolution
     from app.engines.chat.conversation_state import ConversationStateEngine
     from app.engines.chat.enhancement import ChatEnhancementService
     from app.engines.chat.log_upload import ChatLogUploadService
@@ -421,8 +433,24 @@ class ChatOrchestrator:
             },
             "selected_evidence": [item.title for item in evidence_bundle.all_evidence()],
             "rejected_evidence": evidence_bundle.rejected_evidence,
+            # Final Support-Quality Pass, §5 -- claim_id/source_ids/
+            # confidence/supported added for internal traceability
+            # (final statement -> claim ID -> EvidenceItem -> source);
+            # every existing key here is unchanged, so no existing
+            # debug consumer that reads only "text"/"authority"/
+            # "category"/"is_current" is affected.
             "claims": [
-                {"text": c.text, "authority": c.authority.value, "category": c.category, "is_current": c.is_current}
+                {
+                    "claim_id": c.claim_id,
+                    "text": c.text,
+                    "supported_by": c.supported_by,
+                    "source_ids": c.source_ids,
+                    "authority": c.authority.value,
+                    "category": c.category,
+                    "is_current": c.is_current,
+                    "confidence": c.confidence,
+                    "supported": c.supported,
+                }
                 for c in evidence_bundle.claims
             ],
             "contradictions": [
@@ -431,6 +459,14 @@ class ChatOrchestrator:
             ],
             "sufficiency": evidence_bundle.sufficiency.value,
             "answer_plan": answer_kind,
+            # Final Support-Quality Pass, §9 -- a real, unanswered-
+            # question signal for future knowledge-base prioritization,
+            # never exposed to normal users by default. Recorded here
+            # (not inside any composer) so it reflects the SAME
+            # independently-built EvidenceBundle every other debug field
+            # already uses -- never a second, divergent sufficiency
+            # judgment.
+            "knowledge_gaps": self._knowledge_gaps_for(text, query_context, evidence_bundle),
             **llm_debug,
         }
         return ChatResponse(
@@ -536,6 +572,50 @@ class ChatOrchestrator:
             answer = f"I found multiple possible {ambiguity.slot_name} matches for this question. Please clarify which one you mean."
         follow_up = f"Which of the following did you mean: {candidates}?"
         return answer, follow_up
+
+    _NO_GAP_INTENTS = (AnswerIntent.FOLLOW_UP, AnswerIntent.UNKNOWN)
+    """Final Support-Quality Pass, §9 -- a knowledge gap is only
+    recorded for a question that was actually ASKING for an answer;
+    FOLLOW_UP (a thin continuation with no subject of its own) and
+    UNKNOWN (not recognized as any real question shape at all) are
+    never real "the knowledge base lacks this" signals -- recording
+    one for either would flood this list with noise no future
+    knowledge-base-improvement effort could act on."""
+
+    @staticmethod
+    def _knowledge_gaps_for(question: str, query_context: "QueryContext", evidence_bundle: "EvidenceBundle") -> list[dict]:
+        """Final Support-Quality Pass, §8/§9 -- a real, disclosed signal
+        that this specific question was NOT well-served by the current
+        knowledge base, for future KB-improvement prioritization. Never
+        a second sufficiency judgment: reuses ``evidence_bundle.
+        sufficiency`` (the exact same, already-computed value every
+        other debug field and every composer's own fallback-to-honesty
+        behavior already relies on) rather than re-deriving one. Only
+        WEAK/INSUFFICIENT count as a gap -- MODERATE/STRONG/
+        AUTHORITATIVE evidence means the question WAS answerable, even
+        if the final answer also had to hedge or disclose uncertainty
+        (that is a correct, working answer, not a gap). CONTRADICTORY
+        is deliberately excluded too: evidence exists and conflicts,
+        which is a data-quality issue (see the "Evidence conflict"
+        sections), not an "evidence is missing" one. Never exposed to
+        normal users by default (``ChatResponse.debug`` only)."""
+        if query_context.intent in ChatOrchestrator._NO_GAP_INTENTS:
+            return []
+        if evidence_bundle.sufficiency not in (SufficiencyLevel.INSUFFICIENT, SufficiencyLevel.WEAK):
+            return []
+        subject = query_context.subject or question
+        gap_type = (
+            "INSUFFICIENT_AUTHORITATIVE_EVIDENCE"
+            if evidence_bundle.sufficiency == SufficiencyLevel.INSUFFICIENT
+            else "WEAK_EVIDENCE_RELEVANCE"
+        )
+        return [
+            {
+                "question": question,
+                "gap_type": gap_type,
+                "missing": f'documentation, historical cases, or known bugs that actually cover "{subject}"',
+            }
+        ]
 
     # --- Standalone vs. investigation-scoped retrieval (§10) ------------------
 
@@ -863,7 +943,7 @@ class ChatOrchestrator:
         a safe, honest fallback clause, and the REPAIRED text is what
         this method returns -- see ``GroundingResult.repaired_text``'s
         own docstring for why a full rejection is not used there."""
-        answer_text, evidence_text = self._generate_llm_answer(question, structured, log_observations, strategy)
+        answer_text, evidence_text, llm_evidence_bundle = self._generate_llm_answer(question, structured, log_observations, strategy)
         if contains_unsupported_confidence_claim(answer_text, structured.confidence):
             # Chat Assistant Phase 49 -- deterministic post-generation
             # gate, checked first (before the scope/troubleshooting gates
@@ -970,6 +1050,30 @@ class ChatOrchestrator:
                 "LLM answer contained an unsupported configuration value; repaired in place."
             )
             answer_text = grounding.repaired_text
+
+        # Final Support-Quality Pass, §5/§6 -- claim-authority
+        # preservation, extending (never replacing) the grounding gate
+        # above: a claim's own citation surviving is not enough if its
+        # authority-appropriate caveat (historical/known-bug/inference)
+        # was dropped along the way -- see ``check_claim_authority_
+        # preserved``'s own docstring for exactly what this checks and
+        # why it is claim-driven, not tier-driven (catches a drop the
+        # tier-scoped gates above would not, e.g. inside an otherwise
+        # LIKELY-tier answer that also cites a historical case inline).
+        # ``llm_evidence_bundle`` is only ``None`` when ``strategy`` was
+        # never supplied (a caller that predates §17's async-parity
+        # wiring); this check is simply skipped then, never a false
+        # rejection of an answer this method can't evaluate.
+        if llm_evidence_bundle is not None:
+            missing_caveats = check_claim_authority_preserved(llm_evidence_bundle.claims, answer_text)
+            if missing_caveats:
+                logger.warning(
+                    "LLM answer dropped %d claim-authority caveat(s) (%s); falling back to deterministic answer.",
+                    len(missing_caveats),
+                    "; ".join(missing_caveats),
+                )
+                return None, f"missing claim-authority caveat(s): {'; '.join(missing_caveats)}"
+
         return answer_text, None
 
     def _compose_deterministic_answer(
@@ -1128,16 +1232,24 @@ class ChatOrchestrator:
         structured: "StructuredResolution",
         log_observations: "LogObservationSummary | None" = None,
         strategy: "InvestigationStrategy | None" = None,
-    ) -> tuple[str, str]:
-        """Returns ``(answer_text, evidence_text)`` -- Final Hardening
-        Pass, Objective 1/Step 4: ``evidence_text`` is the exact
-        ``user_prompt`` string the provider was actually given, handed
-        back so ``_attempt_llm_answer`` can pass it to the grounding
-        validator (``app.engines.chat.grounding_validator.validate``)
-        unchanged -- never a second, separately-reconstructed
-        approximation of what the model saw. Provider-agnostic: this
-        method still knows nothing about validation; it only stops
-        discarding a string it already built.
+    ) -> tuple[str, str, "EvidenceBundle | None"]:
+        """Returns ``(answer_text, evidence_text, evidence_bundle)`` --
+        Final Hardening Pass, Objective 1/Step 4: ``evidence_text`` is
+        the exact ``user_prompt`` string the provider was actually
+        given, handed back so ``_attempt_llm_answer`` can pass it to
+        the grounding validator (``app.engines.chat.grounding_
+        validator.validate``) unchanged -- never a second, separately-
+        reconstructed approximation of what the model saw.
+        Provider-agnostic: this method still knows nothing about
+        validation; it only stops discarding data it already built.
+
+        Final Support-Quality Pass, §5/§6 -- ``evidence_bundle`` (the
+        exact same one just sent to the LLM, or ``None`` when
+        ``strategy`` was not given) is likewise handed back so
+        ``_attempt_llm_answer`` can run ``check_claim_authority_
+        preserved`` against its real ``claims`` -- never a second,
+        separately-rebuilt bundle that could disagree with what the
+        model actually saw.
 
         Chat Assistant Phase 31 -- ``question`` here is already the
         sanitized (scope-clause-stripped, and, since Phase 32, also
@@ -1198,7 +1310,7 @@ class ChatOrchestrator:
                 min_score_secondary=self._KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY,
             )
         system_prompt, user_prompt = self._prompt_builder.build(question, prompt_structured, log_observations, evidence_bundle)
-        return self._llm.generate(user_prompt, system_prompt=system_prompt), user_prompt
+        return self._llm.generate(user_prompt, system_prompt=system_prompt), user_prompt, evidence_bundle
 
     # --- Deterministic answer composition (§4) ---------------------------------
 
@@ -1365,6 +1477,82 @@ class ChatOrchestrator:
                 return synthesis, None, None
         return None
 
+    def _off_topic_disclosure_applies(self, question: str) -> bool:
+        """Final Support-Quality Pass, §8 -- scopes ``_honest_off_topic_
+        disclosure`` to exactly the class of question the real corpus
+        finding was in: a SHORT, subject-only question (``<=
+        _SHORT_QUESTION_WORD_COUNT`` concept words), where ``_tier_
+        answer_is_off_topic``'s majority-overlap rule is a precise
+        signal (proven by that finding). A LONGER, compound question
+        (e.g. "What is the root cause, has this happened before, and
+        what should I check first?") only ever uses the cruder bare-
+        ``overlap > 0`` rule there, which was already known to false-
+        positive on legitimate on-topic answers phrased in different
+        vocabulary (see ``_SHORT_QUESTION_WORD_COUNT``'s own docstring
+        and ``test_troubleshooting_synthesis_never_overrides_a_real_
+        likely_tier``) -- before this phase, that false positive was
+        harmless because the caller's fallback was a silent no-op
+        (return the tier text unchanged regardless). Turning that
+        fallback into an active honest-disclosure rewrite would convert
+        a previously-harmless false positive into a real regression for
+        long questions, so it is deliberately left out of scope here:
+        only short questions, where the signal is trustworthy, get the
+        new disclosure behavior."""
+        return len(extract_concept_words(question)) <= self._SHORT_QUESTION_WORD_COUNT
+
+    def _honest_off_topic_disclosure(
+        self,
+        strategy: "InvestigationStrategy",
+        subject: str | None,
+        primary: "ResolutionCandidate | None" = None,
+    ) -> tuple[str, str | None, str | None]:
+        """Final Support-Quality Pass, §8 -- the fallback both CONFIRMED
+        and LIKELY branches now use when ``_tier_answer_is_off_topic``
+        has already determined the tier's own root cause/resolution is
+        off-topic AND ``_off_topic_tier_override`` found no real
+        composer to substitute (neither a knowledge-shaped question nor
+        a troubleshooting-synthesis-shaped one, or that composer's own
+        majority-overlap bar found nothing either). Before this fix,
+        that combination fell through to ``return text, None, None`` --
+        silently presenting the SAME off-topic tier text this method's
+        own caller had just determined was wrong, exactly the real
+        corpus finding this phase's §8 investigation surfaced ("What
+        happens if process settings are wrong?" answered with an
+        unrelated IIS known bug, restated as fact, purely because no
+        on-topic composer happened to have anything better to say).
+        An honest "I don't have enough evidence" -- naming the
+        off-topic record transparently rather than hiding it -- is
+        always preferable to confidently restating an answer already
+        known to be unrelated (this phase's closing principle: the
+        system must never fabricate relevance merely because retrieval
+        returned *something*).
+
+        ``primary`` (when available) supplies a clean, human-readable
+        ``EvidenceReference.title`` for the disclosure -- ``subject``
+        itself is often ``primary.text``, the FULL templated resolution
+        string (e.g. 'Per known bug "X": <full remediation text>'),
+        which reads badly re-quoted inside this sentence. Falls back to
+        ``subject`` verbatim only when no ``primary`` is available."""
+        # Deliberately single-quoted, never double-quoted: grounding_
+        # validator.check_no_material_loss's _QUOTED_RE treats every
+        # double-quoted title in the deterministic answer as a
+        # load-bearing source citation an LLM candidate must repeat
+        # verbatim -- exactly backwards here, since this sentence exists
+        # to say the record is NOT actually relevant. Double-quoting it
+        # anyway (an earlier version of this fix did) turned that
+        # explicitly-irrelevant title into a phantom required fact and
+        # broke unrelated LLM-acceptance tests.
+        display_name = primary.evidence.title if primary is not None else subject
+        if display_name:
+            text = (
+                f"I don't have enough evidence in the current knowledge base to answer this specific question. "
+                f"The most relevant record found, '{display_name}', does not actually address what was asked, so "
+                f"presenting it as the answer would be misleading."
+            )
+        else:
+            text = "I don't have enough evidence in the current knowledge base to answer this specific question."
+        return text, self._unknown_follow_up(strategy), None
+
     @staticmethod
     def _is_purely_knowledge_shaped_question(question: str) -> bool:
         """Real-Corpus Answer Quality & Final Chat Hardening phase --
@@ -1443,6 +1631,21 @@ class ChatOrchestrator:
                 if log_synthesis is not None:
                     return log_synthesis, None, "log_analysis"
 
+        # Final Support-Quality Pass, §2 -- L2_GUIDANCE ("What should
+        # L2 check?") is checked here, ahead of the tier switch below,
+        # for the same reason log-related questions already are: it is
+        # a fundamentally different question type than "what is the
+        # root cause," and the tier-based text (even at LIKELY/
+        # CONFIRMED, and even when that tier's own root cause is
+        # off-topic) has no way to answer it. _compose_l2_guidance_
+        # synthesis never returns None once it confirms L2_GUIDANCE
+        # classification -- an honest "insufficient evidence" answer is
+        # itself a real, complete answer, never a signal to keep
+        # searching for a different composer.
+        l2_guidance = self._compose_l2_guidance_synthesis(strategy, question, investigation)
+        if l2_guidance is not None:
+            return l2_guidance, None, "l2_guidance"
+
         structured = strategy.structured_resolution
         if structured is None:
             text, follow_up = self._compose_answer_without_structured_resolution(strategy)
@@ -1466,6 +1669,8 @@ class ChatOrchestrator:
                 override = self._off_topic_tier_override(strategy, question, log_evidence)
                 if override is not None:
                     return override
+                if self._off_topic_disclosure_applies(question):
+                    return self._honest_off_topic_disclosure(strategy, subject, primary)
             return text, None, None
 
         if tier == ResolutionProvenance.LIKELY:
@@ -1484,6 +1689,8 @@ class ChatOrchestrator:
                 override = self._off_topic_tier_override(strategy, question, log_evidence)
                 if override is not None:
                     return override
+                if self._off_topic_disclosure_applies(question):
+                    return self._honest_off_topic_disclosure(strategy, subject, primary)
             return text, None, None
 
         # POSSIBLE and UNKNOWN both fall through to the tier boilerplate
@@ -1985,6 +2192,132 @@ class ChatOrchestrator:
 
         return "\n".join(lines)
 
+    _L2_GUIDANCE_MAX_CHECKS = 3
+    """Same capping discipline as every other ranked list in this
+    module -- the strongest few checks, not an unbounded dump."""
+
+    def _compose_l2_guidance_synthesis(
+        self, strategy: "InvestigationStrategy", question: str, investigation: "InvestigationSession | None" = None
+    ) -> str | None:
+        """Final Support-Quality Pass, §2/§3/§4 -- a dedicated answer
+        planner for L2_GUIDANCE questions ("What should L2 check?",
+        "What should L2 verify?", ...), replacing the generic tier-
+        based boilerplate ResolveIQ previously had NOTHING for (this
+        intent classified UNKNOWN before this phase) with "## What is
+        observed/## What L2 should check/## What this can establish/##
+        What is not confirmed/## Next action". Built entirely from the
+        same ``EvidenceBundle`` every other composer uses -- never a
+        new retrieval call, never an LLM, never a paraphrase. Every
+        recommended check is either a real, already-established
+        evidence-backed action (``available_checks(structured)``) or a
+        real citation to review ("Review \"<title>\"") -- never an
+        invented generic action ("check logs, network, configuration").
+        Returns ``None`` when the question is not L2_GUIDANCE-
+        classified (caller falls through to other composers); returns
+        an explicit, honest "I don't have enough evidence" answer
+        (never ``None``) when L2_GUIDANCE-classified but nothing
+        real supports a specific check -- this is a genuine answer,
+        not a "no answer" signal, so ``answer_kind`` stays a real
+        value and the caller never keeps searching for a different
+        composer to paper over the gap.
+
+        ``investigation`` (§4's own context-aware follow-up
+        requirement) -- when given, its ``context_text`` (the
+        conversation's own accumulated raw text) is passed to
+        ``build_query_context`` so a genuinely thin follow-up like
+        "What should L2 check?" (its own concept words are just
+        "should"/"l2"/"check" -- none of which name a real subject)
+        inherits the real prior subject/state ("AxeI meter"/
+        "Discovered") the same anaphora-aware way every other follow-up
+        in this codebase already does, rather than searching for
+        evidence about "l2 check" itself. A fresh session's throwaway
+        investigation has no such accumulated text, so New Chat still
+        starts with nothing inherited."""
+        context_text = investigation.context_text if investigation is not None else ""
+        context = build_query_context(question, context_text=context_text)
+        if context.intent != AnswerIntent.L2_GUIDANCE:
+            return None
+        structured = strategy.structured_resolution
+        established_checks = available_checks(structured) if structured is not None else []
+        # §4 continued -- L2_GUIDANCE_PHRASES are, by construction,
+        # NEVER a real subject on their own ("should"/"l2"/"check" name
+        # no real topic), so unlike a generic follow-up this composer
+        # always merges in the prior turn's real concept words when any
+        # exist, rather than relying on build_query_context's own
+        # anaphora-gated merge (which correctly does NOT fire here --
+        # there is no "it"/"this"/"that" in "What should L2 check?" for
+        # it to key off). This only ever expands what evidence is
+        # searched for; it never changes the L2_GUIDANCE classification
+        # itself (already resolved above) or the literal question text
+        # rendered in "## What is observed" below.
+        concept_words = extract_concept_words(question)
+        if context_text:
+            context_words = extract_concept_words(context_text)
+            merged = list(context_words)
+            for word in concept_words:
+                if word not in merged:
+                    merged.append(word)
+            concept_words = merged
+        search_text = " ".join(concept_words) if concept_words else question
+        bundle = build_evidence_bundle(
+            search_text, context, strategy,
+            min_score=self._KNOWLEDGE_SYNTHESIS_MIN_SCORE, min_score_secondary=self._KNOWLEDGE_SYNTHESIS_MIN_SCORE_SECONDARY,
+            next_actions=established_checks,
+        )
+        candidate_pool = bundle.known_bug_evidence + bundle.documentation + bundle.authoritative_documentation + bundle.historical_case_evidence
+        ranked = rank_items(candidate_pool, concept_words, bundle.retrieval_profile)
+        if concept_words:
+            # Same majority-overlap discipline §3/§13 of the prior
+            # phase already established for troubleshooting-shaped
+            # composers -- a single coincidentally-shared generic word
+            # must never be presented as a real check to perform.
+            ranked = [pair for pair in ranked if not self._is_off_topic_overlap(pair[1], len(concept_words))]
+
+        subject_desc = " ".join(concept_words) if concept_words else "this symptom"
+        if not established_checks and not ranked:
+            missing = f'documented troubleshooting checks, known bugs, or historical cases covering "{subject_desc}"'
+            return (
+                "## What is observed\n"
+                f"- {question}\n\n"
+                "## What L2 should check\n"
+                "I don't have enough evidence in the current knowledge base to recommend a specific L2 check for "
+                "this symptom.\n\n"
+                f"Missing evidence: {missing}.\n\n"
+                "## What this can establish\n"
+                "Nothing beyond the question itself -- no real evidence was found to check against.\n\n"
+                "## What is not confirmed\n"
+                "No evidence-backed check exists for this symptom in the current knowledge base.\n\n"
+                "## Next action\n"
+                "Escalate for manual investigation, or add documentation covering this scenario to the knowledge base."
+            )
+
+        lines = ["## What is observed", f"- {question}", "", "## What L2 should check"]
+        idx = 1
+        for action in established_checks[:2]:
+            lines.append(f"\n{idx}. {action}")
+            lines.append("   Why: An evidence-backed resolution/validation step already established for this investigation.")
+            lines.append(f"   Evidence: {action}")
+            lines.append("   Source: structured resolution")
+            idx += 1
+        remaining_slots = max(0, self._L2_GUIDANCE_MAX_CHECKS - (idx - 1))
+        for item, _overlap in ranked[:remaining_slots]:
+            lines.append(f'\n{idx}. Review "{item.title}"')
+            lines.append(f"   Why: {item.establishes}")
+            lines.append(f"   Evidence: {truncate_extract(item.excerpt, 200)}")
+            lines.append(f"   Source: {item.source_type}")
+            idx += 1
+
+        lines.append("\n## What this can establish")
+        lines.append(
+            "The evidence above shows what has previously been checked, documented, or observed for similar "
+            "symptoms -- it does not by itself confirm the root cause of the current situation."
+        )
+        lines.append("\n## What is not confirmed")
+        lines.append("The root cause is not confirmed from the current evidence.")
+        lines.append("\n## Next action")
+        lines.append("Perform check #1 above first, then proceed through the remaining checks in order.")
+        return "\n".join(lines)
+
     _TROUBLESHOOTING_SYNTHESIS_MAX_CANDIDATES = 3
     """Same capping discipline as everywhere else in this codebase --
     a ranked-hypothesis answer with a dozen entries is not more useful
@@ -2150,12 +2483,6 @@ class ChatOrchestrator:
             reverse=True,
         )
         if concept_words:
-            # Same discipline as _compose_knowledge_synthesis's own
-            # "task" regression fix -- a real word-overlap match is
-            # required whenever the question has extractable subject
-            # words at all; a merely-highest-scoring, zero-overlap
-            # candidate is never presented as a likely cause.
-            #
             # Real-Corpus Answer Quality & Final Chat Hardening phase --
             # when ``force=True`` (this method was invoked ONLY because
             # the tier's own answer was already off-topic), a bare
@@ -2174,6 +2501,29 @@ class ChatOrchestrator:
             # stricter bar only ever applies when the caller has
             # already established the alternative (the tier's own text)
             # is ALSO off-topic.
+            #
+            # Final Support-Quality Pass, §12 -- a real corpus finding of
+            # the exact same false-positive shape was also found in the
+            # NORMAL path ("RFC FAQs - How to Peer Review an RFC" cited
+            # for "What should I check next?" purely because that
+            # document's own unrelated prose contains "should"). Applying
+            # the same majority-overlap discipline unconditionally was
+            # attempted and reverted: ``lexical_overlap``'s own substring
+            # matching for words longer than 3 characters means "check"
+            # (the one real, load-bearing word in that question) also
+            # matches inside "CheckLIST" in the very same off-topic RFC
+            # document, so tightening the overlap RULE alone cannot
+            # distinguish the two cases here -- it only traded one
+            # regression (a real, on-topic candidate produced by ``test_
+            # what_should_i_check_next_uses_troubleshooting_synthesis_
+            # when_evidence_exists`` was wrongly rejected) for fixing
+            # another. A real fix needs either a smarter concept-word
+            # extractor or word-boundary-aware overlap for longer words
+            # too -- out of scope for this pass (see this phase's own
+            # closing instruction against unreviewed rewrites); recorded
+            # as a known, unfixed gap in this phase's final report
+            # instead of a rushed, under-tested change to this already-
+            # hardened composer's default behavior.
             min_overlap_ok = (
                 (lambda ov: not self._is_off_topic_overlap(ov, len(concept_words)))
                 if force

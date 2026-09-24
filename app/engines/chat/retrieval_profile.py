@@ -98,6 +98,13 @@ RETRIEVAL_PROFILES: dict[AnswerIntent, tuple[str, ...]] = {
     AnswerIntent.LOG_ANALYSIS: _LOG_ANALYSIS_PROFILE,
     AnswerIntent.L2_TASK_NOTES: _L2_PROFILE,
     AnswerIntent.L3_ESCALATION: _L3_PROFILE,
+    # Final Support-Quality Pass, §2 -- L2_GUIDANCE reuses the
+    # TROUBLESHOOTING profile (known_bug > documentation > historical):
+    # a support-recommendation question, not a log-specific request
+    # (unlike L2_TASK_NOTES, which is always asked with a log already
+    # attached) -- "log" is not given artificial priority here merely
+    # because the word "L2" appears in the question.
+    AnswerIntent.L2_GUIDANCE: _TROUBLESHOOTING_PROFILE,
     AnswerIntent.COMPARISON: _COMPARISON_PROFILE,
     AnswerIntent.FOLLOW_UP: _DEFAULT_PROFILE,
     AnswerIntent.UNKNOWN: _DEFAULT_PROFILE,
@@ -129,7 +136,7 @@ _DEFINITIONAL_INTENTS = (
     AnswerIntent.CONCEPT_EXPLANATION,
 )
 _CONFIGURATION_INTENTS = (AnswerIntent.CONFIGURATION, AnswerIntent.HOW_TO)
-_TROUBLESHOOTING_INTENTS = (AnswerIntent.TROUBLESHOOTING, AnswerIntent.ROOT_CAUSE)
+_TROUBLESHOOTING_INTENTS = (AnswerIntent.TROUBLESHOOTING, AnswerIntent.ROOT_CAUSE, AnswerIntent.L2_GUIDANCE)
 
 
 def _authority_for_source(source_type: str, intent: AnswerIntent, has_majority_overlap: bool = True) -> SourceAuthority:
@@ -413,8 +420,10 @@ def _claims_for_item(item: EvidenceItem, intent: AnswerIntent, has_recorded_reco
         Claim(
             text=item.establishes,
             supported_by=[item.title],
+            source_ids=[item.source_id] if item.source_id else [],
             authority=item.authority,
             category=category,
+            confidence=item.relevance_score,
             is_current=item.authority == SourceAuthority.CURRENT_OBSERVATION,
         )
     )
@@ -430,8 +439,10 @@ def _claims_for_item(item: EvidenceItem, intent: AnswerIntent, has_recorded_reco
                     f"recommendation, not a confirmed current resolution."
                 ),
                 supported_by=[item.title],
+                source_ids=[item.source_id] if item.source_id else [],
                 authority=SourceAuthority.HISTORICAL_RECOMMENDATION,
                 category="recommendation",
+                confidence=item.relevance_score,
                 is_current=False,
             )
         )
@@ -696,6 +707,14 @@ def build_evidence_bundle(
         claims.extend(_claims_for_item(item, intent, has_recorded_recommendation=hist_has_recommendation.get(item.title, False)))
     for item in known_bug_items + tfs_items + wiki_items + log_items:
         claims.extend(_claims_for_item(item, intent))
+
+    # Final Support-Quality Pass, §5 -- stable, per-response claim IDs,
+    # assigned once here in construction order (never re-derived from
+    # claim content, which could collide or reorder). model_copy is
+    # used rather than mutating in place because Claim (like every
+    # other model in this module) follows this codebase's "computed-
+    # fresh, immutable-by-convention" shape discipline.
+    claims = [claim.model_copy(update={"claim_id": f"claim-{i + 1:03d}"}) for i, claim in enumerate(claims)]
 
     all_items = documentation_items + historical_items + known_bug_items + tfs_items + wiki_items + log_items
     if not all_items:

@@ -45,6 +45,7 @@ from app.engines.chat.knowledge_question import (
     is_definitional_question,
 )
 from app.engines.chat.log_question import (
+    contains_l2_guidance_question,
     contains_l2_task_note_question,
     contains_l3_escalation_question,
     contains_log_analysis_question,
@@ -88,6 +89,7 @@ class AnswerIntent(str, Enum):
     LOG_ANALYSIS = "log_analysis"
     L2_TASK_NOTES = "l2_task_notes"
     L3_ESCALATION = "l3_escalation"
+    L2_GUIDANCE = "l2_guidance"
     FOLLOW_UP = "follow_up"
     UNKNOWN = "unknown"
 
@@ -212,6 +214,22 @@ def classify_intent(
             return AnswerIntent.LOG_ANALYSIS
 
     lowered = question.lower()
+
+    # Final Support-Quality Pass, §2 -- L2_GUIDANCE checked before
+    # CONFIGURATION/troubleshooting: "What should L2 check?" is a
+    # request for a support-team recommendation, never a configuration
+    # procedure or a bare troubleshooting request. Deliberately its own
+    # closed phrase list (contains_l2_guidance_question, anchored on
+    # "L2"/"the support team"), never a widening of the first-person
+    # "what should I check" family (troubleshooting_question.py), which
+    # must keep resolving to plain TROUBLESHOOTING -- the two never
+    # collide since they're anchored on different fixed subjects. Not
+    # gated behind has_log_evidence: unlike L2_TASK_NOTES/L3_ESCALATION
+    # (which summarize log evidence specifically), an L2 guidance
+    # question can be answered from historical/known-bug/documentation
+    # evidence alone, with or without an uploaded log.
+    if contains_l2_guidance_question(question):
+        return AnswerIntent.L2_GUIDANCE
 
     # Configuration/how-to checked BEFORE the troubleshooting/knowledge
     # buckets: "how do I configure X" is a request for a procedure, not

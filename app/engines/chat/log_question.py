@@ -154,6 +154,37 @@ def contains_l2_task_note_question(question: str) -> bool:
     return any(phrase_present(phrase, question) for phrase in L2_TASK_NOTE_PHRASES)
 
 
+L2_GUIDANCE_PHRASES: list[str] = [
+    "what should l2 check",
+    "what should l2 verify",
+    "what should l2 investigate",
+    "what should l2 look at",
+    "what should l2 validate",
+    "what should l2 do next",
+    "what checks should l2 perform",
+    "what should the support team check",
+]
+"""Final Support-Quality Pass, §2 -- a real, disclosed gap the prior
+phase's real-corpus validation left unfixed: "What should L2 check?"
+matches none of ``troubleshooting_question.TROUBLESHOOTING_PHRASES``
+(that list is anchored on the first-person subject "I" -- "what should
+i check" -- never "L2"/"the support team"), so it fell through to
+UNKNOWN. This is a DIFFERENT, closed phrase list, not a widening of
+the first-person one: "Where do I check process settings?" must stay
+CONFIGURATION/HOW_TO-shaped, never L2_GUIDANCE, so the two lists are
+kept deliberately separate, anchored on different fixed subjects
+("L2"/"the support team" here, "I" there) rather than merging into one
+looser pattern that could blur that distinction."""
+
+
+def contains_l2_guidance_question(question: str) -> bool:
+    """True if ``question`` contains any whole-phrase match from
+    ``L2_GUIDANCE_PHRASES``. Conservative by construction: only ever
+    True on an exact, closed-list phrase match, never a heuristic
+    guess -- same idiom as every other classifier in this module."""
+    return any(phrase_present(phrase, question) for phrase in L2_GUIDANCE_PHRASES)
+
+
 L3_ESCALATION_PHRASES: list[str] = [
     "prepare an l3 escalation",
     "prepare l3 escalation",

@@ -301,3 +301,29 @@ def test_retrieval_profile_recorded_on_bundle_matches_the_table():
     context = build_query_context("What is AxeI meter?")
     bundle = build_evidence_bundle("What is AxeI meter?", context, _strategy())
     assert bundle.retrieval_profile == list(RETRIEVAL_PROFILES[AnswerIntent.ENTITY_DEFINITION])
+
+
+# --- Final Support-Quality Pass, §5 -- claim traceability -------------------
+
+
+def test_claims_get_stable_sequential_ids():
+    context = build_query_context("What is AxeI meter?")
+    strategy = _strategy(
+        historical_investigations=[_hist("AxeI meter discovered case", "AxeI meter discovered.", 0.9, resolution="Reset the queue.")]
+    )
+    bundle = build_evidence_bundle("What is AxeI meter?", context, strategy)
+    assert len(bundle.claims) >= 2
+    ids = [c.claim_id for c in bundle.claims]
+    assert ids == [f"claim-{i+1:03d}" for i in range(len(ids))]
+    assert len(set(ids)) == len(ids)  # all unique
+
+
+def test_claim_carries_source_ids_and_confidence():
+    context = build_query_context("What is AxeI meter?")
+    strategy = _strategy(documentation=[_doc("AxeI Meter Overview", "AxeI meter is an RF mesh endpoint.", 0.8, record_id="doc-42")])
+    bundle = build_evidence_bundle("What is AxeI meter?", context, strategy)
+    assert bundle.claims
+    claim = bundle.claims[0]
+    assert claim.source_ids == ["doc-42"]
+    assert claim.confidence == 0.8
+    assert claim.supported is True

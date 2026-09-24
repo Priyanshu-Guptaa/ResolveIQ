@@ -238,3 +238,71 @@ def test_valid_meter_id_still_recognized_after_the_prose_false_positive_fix():
     result = validate("Meter 99999999 failed.", "Meter: 12345678")
     assert not result.valid
     assert any(c.claim_type == "identifier" and c.excerpt == "99999999" for c in result.unsupported_claims)
+
+
+# --- Final Support-Quality Pass, §5/§6 -- claim-authority preservation ------
+
+
+def test_historical_recommendation_caveat_missing_is_flagged():
+    from app.domain.evidence_bundle import Claim, SourceAuthority
+    from app.engines.chat.grounding_validator import check_claim_authority_preserved
+
+    claims = [
+        Claim(
+            claim_id="claim-001", text="A past case recorded taking an action.", supported_by=["RF Mesh timeout case"],
+            authority=SourceAuthority.HISTORICAL_RECOMMENDATION, category="recommendation",
+        )
+    ]
+    missing = check_claim_authority_preserved(claims, 'Per "RF Mesh timeout case", the solution is to reset the queue.')
+    assert missing
+    assert "historical_recommendation" in missing[0]
+
+
+def test_historical_recommendation_caveat_present_is_not_flagged():
+    from app.domain.evidence_bundle import Claim, SourceAuthority
+    from app.engines.chat.grounding_validator import check_claim_authority_preserved
+
+    claims = [
+        Claim(
+            claim_id="claim-001", text="A past case recorded taking an action.", supported_by=["RF Mesh timeout case"],
+            authority=SourceAuthority.HISTORICAL_RECOMMENDATION, category="recommendation",
+        )
+    ]
+    missing = check_claim_authority_preserved(
+        claims,
+        'Per "RF Mesh timeout case", a historical recommendation exists to reset the queue -- this has not been '
+        "independently verified for this situation.",
+    )
+    assert missing == []
+
+
+def test_claim_not_cited_in_answer_is_never_flagged():
+    """A claim whose title never appears in the candidate text at all
+    is not this function's concern -- check_no_material_loss already
+    covers "did a real citation vanish"; this function only checks
+    caveat preservation for claims that DO survive."""
+    from app.domain.evidence_bundle import Claim, SourceAuthority
+    from app.engines.chat.grounding_validator import check_claim_authority_preserved
+
+    claims = [
+        Claim(
+            claim_id="claim-001", text="A past case recorded taking an action.", supported_by=["RF Mesh timeout case"],
+            authority=SourceAuthority.HISTORICAL_RECOMMENDATION, category="recommendation",
+        )
+    ]
+    missing = check_claim_authority_preserved(claims, "A completely unrelated answer with no citations.")
+    assert missing == []
+
+
+def test_authoritative_definition_claim_never_requires_a_caveat():
+    from app.domain.evidence_bundle import Claim, SourceAuthority
+    from app.engines.chat.grounding_validator import check_claim_authority_preserved
+
+    claims = [
+        Claim(
+            claim_id="claim-001", text="Defines what this is.", supported_by=["AxeI Meter Overview"],
+            authority=SourceAuthority.AUTHORITATIVE_DEFINITION, category="definition",
+        )
+    ]
+    missing = check_claim_authority_preserved(claims, 'Per "AxeI Meter Overview", AxeI meter is a real device type.')
+    assert missing == []

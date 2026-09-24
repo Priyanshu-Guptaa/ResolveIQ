@@ -3503,3 +3503,114 @@ def test_historical_lookup_synthesis_returns_none_for_non_historical_question(bu
         ),
         "What is AxeI meter?",
     ) is None
+
+
+# --- Final Support-Quality Pass, §2/§3/§4 -- L2_GUIDANCE --------------------
+
+
+def test_l2_guidance_question_produces_dedicated_planner(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    bug = _save_bug(
+        knowledge_repo, title="AxeI meter stuck in Discovered after firmware update",
+        description="Known issue: AxeI meters remain in Discovered state after a failed commissioning handshake.",
+        workaround="",
+    )
+    bundle["store"].matches[KnowledgeCollection.KNOWN_BUGS] = [_bug_match_for(bug, 0.75)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+    orchestrator.handle_message(session.id, "AxeI meters are stuck in discovered.")
+
+    response = orchestrator.handle_message(session.id, "What should L2 check?")
+
+    assert response.answer_kind == "l2_guidance"
+    assert "## What L2 should check" in response.answer_text
+    assert "## Next action" in response.answer_text
+    assert "AxeI meter stuck in Discovered after firmware update" in response.answer_text
+
+
+def test_l2_guidance_question_with_no_evidence_gives_honest_admission_not_generic_advice(bundle):
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What should L2 check?")
+
+    assert response.answer_kind == "l2_guidance"
+    assert "I don't have enough evidence in the current knowledge base" in response.answer_text
+    for generic in ("check logs, network, configuration", "restart the device", "check power"):
+        assert generic not in response.answer_text.lower()
+
+
+def test_l2_guidance_new_chat_does_not_inherit_prior_investigation(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    bug = _save_bug(
+        knowledge_repo, title="AxeI meter stuck in Discovered after firmware update",
+        description="Known issue: AxeI meters remain in Discovered state after a failed commissioning handshake.",
+        workaround="",
+    )
+    bundle["store"].matches[KnowledgeCollection.KNOWN_BUGS] = [_bug_match_for(bug, 0.75)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+    orchestrator.handle_message(session.id, "AxeI meters are stuck in discovered.")
+    orchestrator.handle_message(session.id, "What should L2 check?")
+
+    new_session = orchestrator.create_session()
+    response = orchestrator.handle_message(new_session.id, "What should L2 check?")
+
+    assert response.answer_kind == "l2_guidance"
+    assert "AxeI" not in response.answer_text
+
+
+def test_where_do_i_check_process_settings_is_not_l2_guidance(bundle):
+    """§2's own explicit anti-example: a first-person "check" question
+    about a configuration topic must never be swept into L2_GUIDANCE."""
+    from app.engines.chat.query_intent import AnswerIntent, build_query_context
+
+    context = build_query_context("Where do I check process settings?")
+    assert context.intent != AnswerIntent.L2_GUIDANCE
+
+
+def test_debug_claims_carry_stable_ids_and_traceability_fields(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Has this happened before?")
+
+    assert response.debug is not None
+    claims = response.debug["claims"]
+    assert claims
+    for claim in claims:
+        assert claim["claim_id"].startswith("claim-")
+        assert "source_ids" in claim
+        assert "confidence" in claim
+        assert "supported" in claim
+    assert len({c["claim_id"] for c in claims}) == len(claims)
+
+
+def test_debug_knowledge_gaps_recorded_for_weak_evidence(bundle):
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is Zorblex 9000?")
+
+    assert response.debug is not None
+    gaps = response.debug["knowledge_gaps"]
+    assert gaps
+    assert gaps[0]["question"] == "What is Zorblex 9000?"
+    assert "gap_type" in gaps[0]
+    assert "missing" in gaps[0]
+
+
+def test_debug_knowledge_gaps_empty_for_well_answered_question(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("AxeI Meter Overview", "AxeI meter is an RF mesh endpoint device.", 0.8)
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is AxeI meter?")
+
+    assert response.debug["knowledge_gaps"] == []

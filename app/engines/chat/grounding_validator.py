@@ -60,6 +60,7 @@ import re
 from dataclasses import dataclass, field
 
 from app.domain.entities import EntityType
+from app.domain.evidence_bundle import Claim, SourceAuthority
 from app.domain.provenance import ResolutionProvenance
 from app.engines.external_knowledge.service import _TICKET_NUMBER_RE
 from app.engines.log_intelligence.entity_extractor import RegexEntityExtractor
@@ -567,4 +568,74 @@ def check_no_material_loss(deterministic_text: str, candidate_text: str) -> list
     for h, m, s in sorted(deterministic_times - candidate_times):
         missing.append(f"timestamp {h}:{m}:{s}")
 
+    return missing
+
+
+# --- Final Support-Quality Pass, §5/§6 -- claim-authority preservation ------
+
+_CAVEAT_MARKERS_BY_AUTHORITY: dict[SourceAuthority, tuple[str, ...]] = {
+    SourceAuthority.HISTORICAL_RECOMMENDATION: (
+        "historical", "not a confirmed", "not confirmed", "not yet independently verified",
+        "not been independently verified", "past case",
+    ),
+    SourceAuthority.HISTORICAL_OBSERVATION: (
+        "historical", "past case", "previously observed", "not a definition", "not a product/concept definition",
+    ),
+    SourceAuthority.KNOWN_BUG: (
+        "known bug", "not a confirmed root cause", "not confirmed", "not yet confirmed",
+    ),
+    SourceAuthority.INFERENCE: (
+        "inference", "not independently confirmed", "reasoned",
+    ),
+}
+"""Final Support-Quality Pass, §6 -- the exact, closed set of caveat
+words this codebase's own deterministic composers already use for each
+non-authoritative ``SourceAuthority`` (see ``retrieval_profile.
+_LIMITATION_TEXT``/``_claims_for_item`` -- these lists are read
+directly from that module's own real, already-tested wording, never
+invented fresh here). Only the four authorities that ever need a
+caveat are listed; AUTHORITATIVE_DEFINITION/AUTHORITATIVE_CONFIGURATION/
+DOCUMENTED_BEHAVIOR/DOCUMENTED_TROUBLESHOOTING/CURRENT_OBSERVATION
+never require one (there is nothing to hedge -- they are already the
+most certain claim types this system makes)."""
+
+
+def check_claim_authority_preserved(claims: list[Claim], candidate_text: str) -> list[str]:
+    """Final Support-Quality Pass, §5/§6 -- extends (never replaces)
+    ``check_no_material_loss``'s own "don't let real facts silently
+    vanish" check with a claim-AUTHORITY-aware companion: for every
+    real ``Claim`` whose authority requires a caveat (see
+    ``_CAVEAT_MARKERS_BY_AUTHORITY``) and whose own supporting source
+    title is quoted anywhere in ``candidate_text``, at least one of
+    that authority's real caveat phrases must ALSO appear somewhere in
+    ``candidate_text`` -- never necessarily adjacent to the title (an
+    LLM may legitimately restructure the sentence), but present
+    SOMEWHERE, so the historical-vs-authoritative or inference-vs-fact
+    distinction this whole system exists to preserve cannot be quietly
+    dropped while the citation itself survives. Returns a list of
+    human-readable descriptions of which claim's caveat went missing;
+    an empty list means every claim requiring a caveat still has one.
+
+    Deliberately claim-driven, not tier-driven (unlike ``historical_
+    expansion.contains_unsupported_resolution_claim``, which is scoped
+    to the whole answer's confidence tier): this catches a claim-level
+    drop even inside an answer whose overall tier gate would not have
+    fired, e.g. a LIKELY-tier answer that also legitimately cites a
+    historical case inline. Never a second, divergent tier check --
+    this function knows nothing about ``ResolutionProvenance`` at all,
+    only about the claims it is given."""
+    missing: list[str] = []
+    for claim in claims:
+        markers = _CAVEAT_MARKERS_BY_AUTHORITY.get(claim.authority)
+        if not markers:
+            continue
+        title_present = any(title and title in candidate_text for title in claim.supported_by)
+        if not title_present:
+            continue
+        candidate_lower = candidate_text.lower()
+        if not any(marker in candidate_lower for marker in markers):
+            missing.append(
+                f'{claim.authority.value} caveat for claim {claim.claim_id or "(unnumbered)"} '
+                f'("{claim.supported_by[0] if claim.supported_by else "?"}")'
+            )
     return missing
