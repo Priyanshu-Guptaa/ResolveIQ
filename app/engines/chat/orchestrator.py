@@ -63,10 +63,13 @@ from app.engines.chat.grounding_validator import (
 )
 from app.engines.chat.historical_expansion import contains_unsupported_resolution_claim
 from app.engines.chat.knowledge_question import (
+    TROUBLESHOOTING_ACTION_WORDS,
     contains_knowledge_question,
     extract_concept_words,
+    extract_troubleshooting_subject_words,
     is_definitional_question,
     lexical_overlap,
+    word_overlap,
 )
 from app.engines.chat.log_question import (
     contains_l2_task_note_question,
@@ -106,6 +109,7 @@ if TYPE_CHECKING:
     from app.engines.llm.provider import LLMProvider
     from app.engines.recommendation.engine import RecommendationEngine
     from app.infrastructure.db.log_knowledge_repository import LogKnowledgeRepository
+    from app.infrastructure.db.lookup_repository import LookupRepository
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +212,7 @@ class ChatOrchestrator:
         async_enabled: bool = False,
         log_upload_service: "ChatLogUploadService | None" = None,
         log_knowledge_repo: "LogKnowledgeRepository | None" = None,
+        lookup_repo: "LookupRepository | None" = None,
     ) -> None:
         self._state = state_engine
         self._recommend = recommendation_engine
@@ -249,6 +254,24 @@ class ChatOrchestrator:
         this method re-fetches that real investigation below; no
         orchestrator change was needed for that branch."""
         self._log_knowledge_repo = log_knowledge_repo
+        self._product_name_tokens: frozenset[str] = self._load_product_name_tokens(lookup_repo)
+        """Phrase-Aware Relevance investigation -- real, governed product
+        names (``LookupRepository.list_products()``, the same source
+        ``RecommendationEngine``/``ApplicabilityRanker`` already use for
+        applicability, never a new or hardcoded list), tokenized once at
+        construction time via the same ``extract_concept_words`` every
+        overlap check already uses. Used by ``_tier_answer_is_off_topic``/
+        ``_compose_knowledge_synthesis`` to recognize that a concept word
+        like "command"/"center" (from the real governed product "Command
+        Center") is the SUBJECT of almost every document in a Command-
+        Center-focused knowledge base, and therefore does not, by itself,
+        distinguish one candidate from another the way a genuinely
+        specific word ("settings") does -- see those methods' own
+        docstrings for the full real-corpus finding. ``None`` (no
+        ``lookup_repo`` wired, e.g. most existing tests) degrades to an
+        empty set, which is a complete no-op: every concept word is then
+        treated as before this phase, byte-identical to the prior,
+        already-tested behavior."""
         """Grounded Conversational Intelligence phase -- None (default,
         every existing caller/test unchanged) means
         ``_compose_documented_flow_section`` never runs and correlation
@@ -263,6 +286,53 @@ class ChatOrchestrator:
         correlating identifier unambiguously matches a real scenario.
         ``flow.py`` itself is never modified -- this is purely an
         additional caller of its existing public function."""
+
+    @staticmethod
+    def _load_product_name_tokens(lookup_repo: "LookupRepository | None") -> frozenset[str]:
+        """One real, bounded DB read at construction time (this
+        codebase's own governed product table has a handful of rows,
+        the same table ``RecommendationEngine``/``ApplicabilityRanker``
+        already query) -- never a per-message query, never a new
+        caching layer. ``None`` (the same ``is not None`` convention
+        ``RecommendationEngine`` already uses for this exact repository)
+        degrades to an empty set, a complete no-op for every caller
+        below."""
+        if lookup_repo is None:
+            return frozenset()
+        tokens: set[str] = set()
+        for product in lookup_repo.list_products():
+            tokens.update(extract_concept_words(product.name))
+        return frozenset(tokens)
+
+    def _distinctive_concept_words(self, concept_words: list[str]) -> list[str]:
+        """Phrase-Aware Relevance investigation -- the real corpus
+        finding behind this method: "Explain process settings in
+        Command Center." shares "process"/"command"/"center" (3 of 4
+        concept words) with "IAD Move Checklist Answers_Master" -- a
+        document about neither process settings nor anything the
+        question is really about -- purely because "Command"/"Center"
+        (the governed product's own name) appear in nearly every
+        Command-Center-focused document, while the one word that
+        actually distinguishes this question, "settings", appears in
+        neither. Plain majority-overlap counting cannot tell "process"
+        (a coincidental, generic hit) apart from "settings" (the real
+        subject) -- both count the same. Filtering out the question's
+        own product-name tokens before counting fixes this without a
+        corpus-wide term-frequency table: "process"+"settings" (what's
+        left) requires BOTH to match for a 2-word majority, so a
+        document sharing only "process" is correctly rejected, while
+        "Process Settings Configuration Guide for Command Center" (which
+        genuinely has both) is correctly accepted.
+
+        Falls back to the full, unfiltered ``concept_words`` whenever
+        removing product-name tokens would leave nothing at all (a
+        question that is ITSELF only the product's own name, e.g. "What
+        is Command Center?") -- there is nothing left to be more
+        specific than, so the original, already-tested majority rule is
+        the right one to apply to the full set, exactly as before this
+        method existed."""
+        distinctive = [w for w in concept_words if w not in self._product_name_tokens]
+        return distinctive or concept_words
 
     # --- Session lifecycle (thin passthrough to ConversationStateEngine) ----
 
@@ -1314,7 +1384,9 @@ class ChatOrchestrator:
 
     # --- Deterministic answer composition (§4) ---------------------------------
 
-    def _tier_answer_is_off_topic(self, question: str, subject: str | None) -> bool:
+    def _tier_answer_is_off_topic(
+        self, question: str, subject: str | None, context_text: str = "", *, is_retrieval_derived: bool = True
+    ) -> bool:
         """Real-Corpus Answer Quality & Final Chat Hardening phase --
         the single most severe bug the real seeded corpus exposed:
         ``RecommendationEngine``'s own root-cause/resolution matching
@@ -1360,10 +1432,107 @@ class ChatOrchestrator:
         Deliberately scoped to CONFIRMED/LIKELY only, and only
         consulted by those two branches immediately before returning --
         never touches POSSIBLE/UNKNOWN's own, already-correct fallback
-        to ``_compose_knowledge_synthesis`` a few lines below."""
+        to ``_compose_knowledge_synthesis`` a few lines below.
+
+        Persistent Knowledge Index & Retrieval Quality investigation --
+        a third real finding, this time surfaced by a controlled
+        baseline-vs-hybrid-retrieval experiment rather than a bare
+        baseline run: "Why did this request fail?" (no real subject of
+        its own) reached LIKELY tier, under hybrid retrieval's different
+        candidate ordering, off an entirely unrelated historical case
+        ("...orders API to fail the whole request"). ``extract_concept_
+        words`` keeps "why"/"request"/"fail" as if they were real
+        subject content; they are not substring artifacts here --
+        "request" and "fail" are genuine, whole, standalone words in
+        that unrelated sentence, purely because ordinary English
+        vocabulary for describing ANY failure naturally contains them.
+        ``_compose_troubleshooting_synthesis`` already solved this exact
+        class of question (frame words -- "why"/"should"/"next"/
+        "request"/"fail" -- describe the SHAPE of a troubleshooting
+        question, not its subject -- see ``TROUBLESHOOTING_FRAME_
+        WORDS``) but only within its own normal/forced dispatch; this
+        method, checked one layer up for CONFIRMED/LIKELY, still used
+        the generic ``extract_concept_words``. Reused here, not
+        re-derived, for the SAME troubleshooting-synthesis-shaped
+        questions ``_off_topic_tier_override``'s own ``elif`` branch
+        already recognizes (``contains_troubleshooting_synthesis_
+        question``/``contains_troubleshooting_question``) -- every other
+        question shape (entity/configuration/historical-lookup/...)
+        is completely unaffected, since none of those phrases ever
+        match and this falls through to the original, unmodified
+        concept-word path."""
+        if contains_troubleshooting_synthesis_question(question) or contains_troubleshooting_question(question):
+            concept_words = ChatOrchestrator._troubleshooting_subject_words(question, context_text)
+            if not subject:
+                return False
+            if not concept_words:
+                # No real subject to check overlap against at all -- only
+                # distrust the tier when its answer came from a RETRIEVAL
+                # match (the only case this method ever guards). A log/
+                # entity-derived root cause (``StructuredResolution.root_
+                # cause_evidence[0].kind == EvidenceKind.ENTITY_HEURISTIC``
+                # -- note ``StructuredResolution.source_kind`` is always
+                # the fixed literal "investigation" for every chat-path
+                # structured resolution regardless of where its root
+                # cause actually came from, so it cannot be used for this
+                # distinction) is grounded in the session's own uploaded
+                # log, verified by Log Intelligence's own entity/event
+                # extraction -- it was never found via text similarity to
+                # the question, so having no question-side subject words
+                # to compare against says nothing about whether it's
+                # correct. A real regression this exact distinction
+                # fixed: "Why did it fail?" in a log session,
+                # with a genuine log-derived root cause ("Unhandled
+                # application exception: CommandTimeoutException",
+                # matching the log's own ERROR line) was wrongly replaced
+                # with an honest-insufficiency answer, discarding a
+                # correct, evidence-grounded hypothesis.
+                return is_retrieval_derived
+            overlap = word_overlap(concept_words, subject)
+            return self._is_off_topic_overlap(overlap, len(concept_words))
         concept_words = extract_concept_words(question)
         if not concept_words or not subject:
             return False
+        # Fix Remaining Off-Topic Answers -- acceptance review finding:
+        # "Explain process settings in Command Center." (CONCEPT_
+        # EXPLANATION, 4 concept words: "process"/"settings"/"command"/
+        # "center") reached LIKELY tier off the SAME unrelated "IIS
+        # worker PROCESS crash" known bug this method's own docstring
+        # already names as its motivating example -- because 4 words is
+        # already past ``_SHORT_QUESTION_WORD_COUNT`` (3), so ``_is_off_
+        # topic_overlap`` used the lenient bare-``overlap > 0`` rule
+        # meant for a longer, narrative, INVESTIGATIVE question ("RF
+        # Mesh IP command timeout -- why did this fail?", where most of
+        # the extra words really are filler around one distinctive
+        # term). A knowledge-shaped question's concept words are never
+        # filler that way -- "process"/"settings"/"command"/"center" are
+        # ALL real, load-bearing parts of ONE compound subject, so word
+        # count alone is the wrong signal here. Reuses ``_is_purely_
+        # knowledge_shaped_question`` (already the exact test ``_off_
+        # topic_tier_override`` uses one layer up to decide whether a
+        # knowledge answer applies) rather than re-deriving a second
+        # notion of "knowledge-shaped" -- for these intents, real
+        # subject-content words are never long enough to need the
+        # narrative-filler exception, so majority overlap (word-
+        # boundary-aware, not substring) always applies regardless of
+        # count. Every other question shape reaching this branch (e.g.
+        # a non-troubleshooting-phrased ROOT_CAUSE question) is
+        # completely unaffected -- still the original, unmodified
+        # substring-``lexical_overlap`` + length-based rule.
+        if ChatOrchestrator._is_purely_knowledge_shaped_question(question) and len(concept_words) >= 3:
+            # Real regression this floor exists to prevent: "Tell me
+            # about dashboard in CC" has only 2 concept words ("dashboard",
+            # "cc"); the matching evidence shared "dashboard" (the real,
+            # distinctive word) but not "cc" (the product's own generic
+            # abbreviation) -- a GOOD relevance signal, not a bad one, yet
+            # bare majority math (2 of 2 required) would reject it. With
+            # only 1-2 words there is too little room for a spurious
+            # coincidental match to hide among them the way there was in
+            # the real 4-word finding this branch exists for -- so 1-2
+            # word questions keep the original, more lenient rule below.
+            words = self._distinctive_concept_words(concept_words)
+            overlap = word_overlap(words, subject)
+            return not has_majority_overlap(overlap, len(words))
         overlap = lexical_overlap(concept_words, subject)
         return self._is_off_topic_overlap(overlap, len(concept_words))
 
@@ -1450,7 +1619,11 @@ class ChatOrchestrator:
         return self._compose_knowledge_synthesis(strategy, question)
 
     def _off_topic_tier_override(
-        self, strategy: "InvestigationStrategy", question: str, log_evidence: "list[Evidence] | None"
+        self,
+        strategy: "InvestigationStrategy",
+        question: str,
+        log_evidence: "list[Evidence] | None",
+        context_text: str = "",
     ) -> tuple[str, str | None, str | None] | None:
         """Real-Corpus Answer Quality & Final Chat Hardening phase --
         the single place both the CONFIRMED and LIKELY branches above
@@ -1472,7 +1645,9 @@ class ChatOrchestrator:
             if synthesis is not None:
                 return synthesis, None, "knowledge"
         elif contains_troubleshooting_synthesis_question(question) or contains_troubleshooting_question(question):
-            synthesis = self._compose_troubleshooting_synthesis(strategy, question, log_evidence, force=True)
+            synthesis = self._compose_troubleshooting_synthesis(
+                strategy, question, log_evidence, force=True, context_text=context_text
+            )
             if synthesis is not None:
                 return synthesis, None, None
         return None
@@ -1665,8 +1840,17 @@ class ChatOrchestrator:
                 text += f" ({structured.confidence_rationale})"
             if primary is not None:
                 text += f" Recommended resolution: {primary.text}"
-            if self._tier_answer_is_off_topic(question, subject):
-                override = self._off_topic_tier_override(strategy, question, log_evidence)
+            if self._tier_answer_is_off_topic(
+                question, subject, investigation.context_text if investigation is not None else "",
+                is_retrieval_derived=not (
+                    structured.root_cause
+                    and structured.root_cause_evidence
+                    and structured.root_cause_evidence[0].kind == EvidenceKind.ENTITY_HEURISTIC
+                ),
+            ):
+                override = self._off_topic_tier_override(
+                    strategy, question, log_evidence, investigation.context_text if investigation is not None else ""
+                )
                 if override is not None:
                     return override
                 if self._off_topic_disclosure_applies(question):
@@ -1685,8 +1869,17 @@ class ChatOrchestrator:
             text += " This has not been independently verified."
             if primary is not None:
                 text += f" A likely resolution, not yet independently verified: {primary.text}"
-            if self._tier_answer_is_off_topic(question, subject):
-                override = self._off_topic_tier_override(strategy, question, log_evidence)
+            if self._tier_answer_is_off_topic(
+                question, subject, investigation.context_text if investigation is not None else "",
+                is_retrieval_derived=not (
+                    structured.root_cause
+                    and structured.root_cause_evidence
+                    and structured.root_cause_evidence[0].kind == EvidenceKind.ENTITY_HEURISTIC
+                ),
+            ):
+                override = self._off_topic_tier_override(
+                    strategy, question, log_evidence, investigation.context_text if investigation is not None else ""
+                )
                 if override is not None:
                     return override
                 if self._off_topic_disclosure_applies(question):
@@ -1761,7 +1954,9 @@ class ChatOrchestrator:
         # activates when the clause is still genuinely present in the
         # text reaching this method.
         if contains_troubleshooting_synthesis_question(question) or contains_troubleshooting_question(question):
-            synthesis = self._compose_troubleshooting_synthesis(strategy, question, log_evidence)
+            synthesis = self._compose_troubleshooting_synthesis(
+                strategy, question, log_evidence, context_text=investigation.context_text if investigation is not None else ""
+            )
             if synthesis is not None:
                 return synthesis, None, None
 
@@ -1925,7 +2120,34 @@ class ChatOrchestrator:
             # override here. Only a real word-overlap match, or a
             # question with no extractable subject words to compare
             # against at all, counts as answerable.
-            answerable = top_overlap > 0 or not concept_words
+            #
+            # Acceptance review finding -- a bare "any overlap" bar is
+            # not enough when the product's own name ("Command"/
+            # "Center") is one of the question's concept words: it is so
+            # ubiquitous across this corpus that nearly every document
+            # shares it, so 1-2 of 4 words (never a majority) let an
+            # unrelated document ("IAD Move Checklist Answers_Master")
+            # through for "Explain process settings in Command Center."
+            # Reuses the same majority-overlap, word-boundary-aware
+            # primitives ``_tier_answer_is_off_topic``'s knowledge-shaped
+            # branch already applies one layer up -- both must agree on
+            # what "really shares the subject" means, never two
+            # independently-calibrated notions of it.
+            # Same word-count floor as _tier_answer_is_off_topic's sibling
+            # fix, and for the identical reason: "Tell me about dashboard
+            # in CC" (2 concept words) shares only "dashboard" (the real,
+            # distinctive one) with "Access to Dashboard and Views in
+            # CRM" -- a genuinely on-topic match a strict 2-of-2 majority
+            # requirement would wrongly reject. 1-2 word questions keep
+            # the original bare-overlap>0 rule; only 3+ word questions
+            # (where the real "process settings"/"IIS worker PROCESS
+            # crash" finding lived) require a real majority.
+            if len(concept_words) >= 3:
+                words = self._distinctive_concept_words(concept_words)
+                top_word_overlap = word_overlap(words, f"{top_match.title} {top_match.snippet[:500]}")
+                answerable = bool(words) and has_majority_overlap(top_word_overlap, len(words))
+            else:
+                answerable = top_overlap > 0 or not concept_words
             if answerable:
                 primary_match, primary_kind = top_match, top_kind
                 excerpt = truncate_extract(primary_match.snippet, 240)
@@ -2059,6 +2281,37 @@ class ChatOrchestrator:
         primary_pool = bundle.authoritative_documentation or bundle.documentation
         if not primary_pool and not bundle.historical_case_evidence:
             return None
+
+        # Emerge acceptance-matrix finding -- documentation was preferred
+        # over a historical case UNCONDITIONALLY, regardless of which one
+        # actually shares the question's real subject. Real example: "How
+        # do I start the services on Emerge?" cited "GSIS v3_5_0+ Post
+        # Install Configuration Checklist" (2 of 3 concept words, 0.67
+        # score, no "Emerge" anywhere in it) over "Start the services on
+        # Emerge." (3 of 3 concept words, 0.90 score) -- an unrelated
+        # system's checklist, purely because it happened to be a
+        # DOCUMENTATION record and the correct answer was a HISTORICAL
+        # one. Not a generic-word collision this composer's existing
+        # relevance bar already guards against (GSIS clears the bar on
+        # its own 2-word overlap) -- a cross-source-TYPE ordering bug,
+        # independent of any product's governance status. Only overrides
+        # the existing, already-tested documentation-first default when
+        # the historical case's own top candidate shares STRICTLY MORE of
+        # the question's real subject words (word-boundary, not
+        # substring) than the chosen documentation candidate does, and
+        # clears the same majority bar every other relevance check in
+        # this file already requires -- a tie or documentation-ahead
+        # keeps today's behavior exactly as it is, so a genuinely
+        # authoritative, well-matching document is never displaced by a
+        # merely-as-good historical case.
+        concept_words = extract_concept_words(question)
+        if primary_pool and bundle.historical_case_evidence and concept_words:
+            doc_top, hist_top = primary_pool[0], bundle.historical_case_evidence[0]
+            doc_overlap = word_overlap(concept_words, f"{doc_top.title} {doc_top.excerpt}")
+            hist_overlap = word_overlap(concept_words, f"{hist_top.title} {hist_top.excerpt}")
+            if hist_overlap > doc_overlap and has_majority_overlap(hist_overlap, len(concept_words)):
+                primary_pool = bundle.historical_case_evidence
+
         primary = primary_pool[0] if primary_pool else bundle.historical_case_evidence[0]
         is_authoritative = primary in bundle.authoritative_documentation
 
@@ -2363,6 +2616,43 @@ class ChatOrchestrator:
                     )
         return "No contradicting evidence identified in the current evidence."
 
+    _SUBJECTLESS_TROUBLESHOOTING_INSUFFICIENCY = (
+        "I don't have enough evidence in the current knowledge base to name a likely cause. This question doesn't say "
+        "which component, symptom, or error it is about, so there is nothing specific to match evidence against, and I "
+        "won't present an unrelated record as the explanation. Tell me what is affected (for example the component, the "
+        "symptom, or an error message), or upload the relevant log, and I'll look for matching evidence."
+    )
+
+    @staticmethod
+    def _troubleshooting_subject_words(question: str, context_text: str = "") -> list[str]:
+        """The words ``_compose_troubleshooting_synthesis`` matches
+        candidates against. A question that names its own subject uses
+        only that. A follow-up whose own words are only question-shape/
+        action words ("What should I check next?") inherits the
+        investigation's subject words from ``context_text`` instead -- the
+        same follow-up convention the L2 guidance planner uses.
+
+        Fix Remaining Off-Topic Answers & Subjectless Follow-Ups phase,
+        Part 2 -- returns ``[]`` (never the bare action words themselves)
+        when NEITHER the question NOR the context names a real subject.
+        An earlier version fell back to the action words alone (e.g.
+        ``["check"]`` for a completely fresh "What should I check
+        next?"), which let ``_compose_troubleshooting_synthesis`` match
+        on the word "check" against WHATEVER historical record happened
+        to contain it -- an arbitrary, unrelated case presented as "the
+        most likely explanation" to a user who never gave any subject at
+        all. Both callers already treat an empty return as "ask for the
+        missing detail instead of guessing" (see ``_SUBJECTLESS_
+        TROUBLESHOOTING_INSUFFICIENCY``), which is the correct behavior
+        here: a fresh, genuinely subject-less question should prompt for
+        the missing component/symptom/log, never retrieve or promote an
+        arbitrary case."""
+        own = extract_troubleshooting_subject_words(question)
+        subject = [word for word in own if word not in TROUBLESHOOTING_ACTION_WORDS]
+        if subject:
+            return subject
+        return [word for word in extract_troubleshooting_subject_words(context_text) if word not in TROUBLESHOOTING_ACTION_WORDS]
+
     def _compose_troubleshooting_synthesis(
         self,
         strategy: "InvestigationStrategy",
@@ -2370,6 +2660,7 @@ class ChatOrchestrator:
         log_evidence: "list[Evidence] | None" = None,
         *,
         force: bool = False,
+        context_text: str = "",
     ) -> str | None:
         """Final Hardening Pass, Objective 2 -- a richer, ranked-
         hypothesis deterministic answer for "why did this fail?"-style
@@ -2441,7 +2732,25 @@ class ChatOrchestrator:
         if not (hist_matches or bug_matches or doc_matches):
             return None
 
-        concept_words = extract_concept_words(question)
+        # Subject words = what the question is actually ABOUT (question-
+        # shape words like "why"/"should"/"next"/"request" removed; the
+        # prior turns' subject inherited for a subject-less follow-up).
+        # Matching below is whole-word, so neither a frame word nor an
+        # incidental substring ("check" in "Checklist") can make an
+        # unrelated record look relevant.
+        # Uploaded log lines live in the same context text as the user's own
+        # turns; their words ("timeout", "command", "request") are not a
+        # subject the user named, so with log evidence present nothing is
+        # inherited and the log-analysis paths keep owning that case.
+        inherit_from = "" if log_evidence else context_text
+        concept_words = self._troubleshooting_subject_words(question, inherit_from)
+        subject_was_inherited = not any(
+            word not in TROUBLESHOOTING_ACTION_WORDS for word in extract_troubleshooting_subject_words(question)
+        ) and any(word not in TROUBLESHOOTING_ACTION_WORDS for word in concept_words)
+        if not concept_words:
+            if force or log_evidence:
+                return None
+            return self._SUBJECTLESS_TROUBLESHOOTING_INSUFFICIENCY
         kind_labels = {
             "historical": "Similar historical case",
             "known_bug": "Relevant known bug",
@@ -2476,63 +2785,34 @@ class ChatOrchestrator:
         ranked = sorted(
             pool,
             key=lambda item: (
-                lexical_overlap(concept_words, f"{item[0].title} {item[0].snippet[:500]}"),
+                word_overlap(concept_words, f"{item[0].title} {item[0].snippet[:500]}"),
                 _KIND_PRIORITY[item[1]],
                 item[0].score,
             ),
             reverse=True,
         )
-        if concept_words:
-            # Real-Corpus Answer Quality & Final Chat Hardening phase --
-            # when ``force=True`` (this method was invoked ONLY because
-            # the tier's own answer was already off-topic), a bare
-            # overlap>0 bar is not enough: "What happens if process
-            # settings are wrong?" shares just the single generic word
-            # "process" with "IIS worker PROCESS crash..." (1 of 3
-            # concept words), which the normal >0 bar happily accepts
-            # -- but presenting that as "the most likely explanation"
-            # would just replace one confidently-wrong answer with
-            # another. Forced invocations require a REAL MAJORITY of
-            # the question's concept words (``retrieval_profile.has_
-            # majority_overlap``, the same bar §3's authority fix
-            # already established) -- an honest "insufficient evidence"
-            # is preferred over a confident, barely-related guess. The
-            # NORMAL (non-forced) path is completely unaffected: this
-            # stricter bar only ever applies when the caller has
-            # already established the alternative (the tier's own text)
-            # is ALSO off-topic.
-            #
-            # Final Support-Quality Pass, §12 -- a real corpus finding of
-            # the exact same false-positive shape was also found in the
-            # NORMAL path ("RFC FAQs - How to Peer Review an RFC" cited
-            # for "What should I check next?" purely because that
-            # document's own unrelated prose contains "should"). Applying
-            # the same majority-overlap discipline unconditionally was
-            # attempted and reverted: ``lexical_overlap``'s own substring
-            # matching for words longer than 3 characters means "check"
-            # (the one real, load-bearing word in that question) also
-            # matches inside "CheckLIST" in the very same off-topic RFC
-            # document, so tightening the overlap RULE alone cannot
-            # distinguish the two cases here -- it only traded one
-            # regression (a real, on-topic candidate produced by ``test_
-            # what_should_i_check_next_uses_troubleshooting_synthesis_
-            # when_evidence_exists`` was wrongly rejected) for fixing
-            # another. A real fix needs either a smarter concept-word
-            # extractor or word-boundary-aware overlap for longer words
-            # too -- out of scope for this pass (see this phase's own
-            # closing instruction against unreviewed rewrites); recorded
-            # as a known, unfixed gap in this phase's final report
-            # instead of a rushed, under-tested change to this already-
-            # hardened composer's default behavior.
-            min_overlap_ok = (
-                (lambda ov: not self._is_off_topic_overlap(ov, len(concept_words)))
-                if force
-                else (lambda ov: ov > 0)
-            )
-            ranked = [
-                item for item in ranked
-                if min_overlap_ok(lexical_overlap(concept_words, f"{item[0].title} {item[0].snippet[:500]}"))
-            ]
+        # A candidate must share real subject words with the question.
+        # Forced invocations (the tier's own answer was already off-topic)
+        # and every normal invocation use the same length-aware rule
+        # (``_is_off_topic_overlap``): a SHORT question needs a majority of
+        # its subject words, a longer one at least one. Because frame words
+        # and substring hits no longer count, "What should I check next?"
+        # no longer ranks an RFC change-review FAQ, and a single shared
+        # generic word ("process", "request") no longer suffices for a
+        # short question.
+        #
+        # Subject words inherited from earlier turns are a larger, less
+        # precise set than a question's own, so a candidate must match a
+        # real MAJORITY of them (never one incidental word) to be shown.
+        def _relevant(overlap: int) -> bool:
+            if subject_was_inherited:
+                return has_majority_overlap(overlap, len(concept_words))
+            return not self._is_off_topic_overlap(overlap, len(concept_words))
+
+        ranked = [
+            item for item in ranked
+            if _relevant(word_overlap(concept_words, f"{item[0].title} {item[0].snippet[:500]}"))
+        ]
         if not ranked:
             return None
         candidates = ranked[: self._TROUBLESHOOTING_SYNTHESIS_MAX_CANDIDATES]

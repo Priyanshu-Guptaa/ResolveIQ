@@ -599,6 +599,21 @@ def _orchestrator_with_llm(bundle, llm_provider) -> ChatOrchestrator:
     return ChatOrchestrator(bundle["state_engine"], bundle["rec_engine"], bundle["investigation_engine"], llm_provider)
 
 
+def _orchestrator_with_lookup_repo(bundle) -> ChatOrchestrator:
+    """A second ChatOrchestrator sharing the same real engines/state as
+    bundle['orchestrator'], differing only in having ``lookup_repo``
+    wired -- constructed fresh, AFTER the fixture's own
+    ``lookup_repo.save_product(Product(name="Command Center"))`` already
+    ran, so ``_product_name_tokens`` is populated (unlike bundle's own
+    ``orchestrator``, built before that save, for which the new
+    mechanism is a no-op -- deliberately left that way so every
+    pre-existing test's behavior is completely undisturbed)."""
+    return ChatOrchestrator(
+        bundle["state_engine"], bundle["rec_engine"], bundle["investigation_engine"],
+        lookup_repo=bundle["lookup_repo"],
+    )
+
+
 def test_llm_success_becomes_answer_text_with_no_follow_up(bundle):
     knowledge_repo = bundle["knowledge_repo"]
     record = _save_hi(knowledge_repo)
@@ -3368,13 +3383,18 @@ def test_likely_tier_on_topic_root_cause_is_never_overridden_by_knowledge_synthe
     assert "AxeI meter collector lost network route" in response.answer_text
 
 
-def test_what_should_i_check_next_uses_troubleshooting_synthesis_when_evidence_exists(bundle):
-    """Real corpus finding: "What should I check next?" found real,
-    on-topic evidence (a real documented check) yet still collapsed
-    into the generic "A possible explanation may exist..." boilerplate,
-    because only contains_troubleshooting_synthesis_question (not
-    contains_troubleshooting_question) was wired to the richer
-    composer. Must now use the ranked-hypothesis answer instead."""
+def test_fresh_what_should_i_check_next_asks_for_the_missing_subject_even_with_a_coincidental_match(bundle):
+    """Fix Remaining Off-Topic Answers & Subjectless Follow-Ups phase,
+    Part 2 -- supersedes this test's own earlier version (which asserted
+    the OPPOSITE: that a bare, completely fresh "What should I check
+    next?" should surface whatever historical record happens to contain
+    the word "check"). That was the exact anti-pattern the new, explicit
+    product decision forbids: "Fresh chat, no subject/context: ask a
+    concise clarifying question... Do not retrieve or promote an
+    arbitrary historical case as the answer." A record existing that
+    happens to match on "check" does not make the question any less
+    subject-less -- the user never named a component, symptom, or
+    error, so nothing here is really "evidence for THIS problem"."""
     knowledge_repo = bundle["knowledge_repo"]
     record = _save_hi(
         knowledge_repo, title="Post-work check: validate register reads after midnight",
@@ -3387,12 +3407,9 @@ def test_what_should_i_check_next_uses_troubleshooting_synthesis_when_evidence_e
 
     response = orchestrator.handle_message(session.id, "What should I check next?")
 
-    assert response.answer_text != (
-        "A possible explanation may exist, but the evidence found is limited. Evidence is not yet sufficient to "
-        "verify this -- treat it as a hypothesis to check, not a resolution to act on."
-    )
-    assert "## Likely causes" in response.answer_text
-    assert "Post-work check: validate register reads after midnight" in response.answer_text
+    assert "I don't have enough evidence" in response.answer_text
+    assert "## Likely causes" not in response.answer_text
+    assert "Post-work check: validate register reads after midnight" not in response.answer_text
 
 
 def test_ambiguous_response_with_no_prior_context_gives_helpful_clarification(bundle):
@@ -3614,3 +3631,938 @@ def test_debug_knowledge_gaps_empty_for_well_answered_question(bundle):
     response = orchestrator.handle_message(session.id, "What is AxeI meter?")
 
     assert response.debug["knowledge_gaps"] == []
+
+
+# --- Troubleshooting synthesis: whole-word, subject-aware evidence selection ---
+#
+# Real-corpus regression (Q12/Q13/Q12-ctx): the normal troubleshooting
+# synthesis path accepted any candidate sharing ONE substring with the
+# question, so unrelated records became "the most likely explanation".
+
+
+def _save_axei_case(knowledge_repo):
+    return _save_hi(
+        knowledge_repo, title="Fort Payne || AXei meters stuck in discovered",
+        description="AXei meters stuck in discovered after registration.",
+        root_cause="", resolution="", next_step="",
+    )
+
+
+def test_check_next_does_not_promote_a_record_that_only_contains_checklist(bundle):
+    """The exact substring defect: "check" must not match "Checklist",
+    and "should"/"next" are question shape, not subject."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "RFC FAQs - How to Peer Review an RFC",
+            "RFC Basic Content Checklist items (all RFCs): getting through CAB approval should be much quicker. "
+            "Is the Planned start date after the next CAB meeting?",
+            0.82,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What should I check next?")
+
+    assert "RFC FAQs" not in response.answer_text
+    assert "## Likely causes" not in response.answer_text
+    assert "most likely explanation" not in response.answer_text
+
+
+def test_request_failure_question_without_a_subject_gets_honest_insufficiency(bundle):
+    """Q13: the only shared word is "request" (question shape). The answer
+    must say there is no subject to match, not cite the ticket."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "Glitch Request for reference- 495079", "Glitch Request for reference: 495079 (Access to CRM)", 0.82
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Why did this request fail?")
+
+    assert response.answer_text == ChatOrchestrator._SUBJECTLESS_TROUBLESHOOTING_INSUFFICIENCY
+    assert "Glitch" not in response.answer_text
+    assert "495079" not in response.answer_text
+
+
+def test_insufficiency_answer_makes_no_causal_claim_or_recommendation(bundle):
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Glitch Request for reference- 495079", "Glitch Request for reference: 495079", 0.82)
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    text = orchestrator.handle_message(session.id, "Why did it fail?").answer_text
+
+    assert "I don't have enough evidence" in text
+    for forbidden in ("Confidence:", "## Likely causes", "most likely explanation", "Recommended", "restart", "Restart"):
+        assert forbidden not in text
+
+
+def test_insufficiency_response_keeps_the_debug_and_claim_contract(bundle):
+    """Compatibility: the response contract and claim/source traceability
+    fields are unchanged for this answer."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Glitch Request for reference- 495079", "Glitch Request for reference: 495079", 0.82)
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Why did this request fail?")
+
+    assert response.debug is not None
+    for key in ("intent", "claims", "sufficiency", "knowledge_gaps", "selected_evidence", "rejected_evidence"):
+        assert key in response.debug
+    claim_ids = [c["claim_id"] for c in response.debug["claims"]]
+    assert len(claim_ids) == len(set(claim_ids))
+    assert response.resolution_provenance is not None
+
+
+def test_check_next_followup_inherits_the_investigation_subject_not_an_unrelated_bug(bundle):
+    """Q12-ctx: with AxeI-stuck-in-discovered as the subject, "What should
+    I check next?" must surface the AxeI case, not an unrelated known bug
+    that merely says "should"/"check"."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_axei_case(knowledge_repo)
+    bug = _save_bug(
+        knowledge_repo, title="NullPointerException in OrderProcessor.calculateTotal for addressless customers",
+        description="The handler should check the customer address before totalling the order.",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    bundle["store"].matches[KnowledgeCollection.KNOWN_BUGS] = [_bug_match_for(bug, 0.6)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    orchestrator.handle_message(session.id, "AxeI meters are stuck in discovered.")
+    response = orchestrator.handle_message(session.id, "What should I check next?")
+
+    assert "AXei meters stuck in discovered" in response.answer_text
+    assert "NullPointerException" not in response.answer_text
+
+
+def test_new_chat_check_next_does_not_inherit_a_previous_chats_subject(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_axei_case(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    orchestrator = bundle["orchestrator"]
+
+    first = orchestrator.create_session()
+    orchestrator.handle_message(first.id, "AxeI meters are stuck in discovered.")
+    fresh = orchestrator.create_session()
+    response = orchestrator.handle_message(fresh.id, "What should I check next?")
+
+    assert "AXei meters stuck in discovered" not in response.answer_text
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "AxeI meters are stuck in discovered.",
+        "What caused the failure of the RF Mesh collector?",
+    ],
+)
+def test_genuinely_on_topic_troubleshooting_evidence_still_matches(bundle, question):
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(
+        knowledge_repo, title="RF Mesh collector route loss || AXei meters stuck in discovered",
+        description="Collector lost its route to the mesh gateway; AXei meters stuck in discovered.",
+        root_cause="", resolution="", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, question)
+
+    assert "## Likely causes" in response.answer_text
+    assert "RF Mesh collector route loss" in response.answer_text
+
+
+def test_subjectless_why_question_inherits_the_investigation_subject(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_axei_case(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Glitch Request for reference- 495079", "Glitch Request for reference: 495079", 0.82)
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    orchestrator.handle_message(session.id, "AxeI meters are stuck in discovered.")
+    response = orchestrator.handle_message(session.id, "Why did this request fail?")
+
+    assert "AXei meters stuck in discovered" in response.answer_text
+    assert "Glitch" not in response.answer_text
+
+
+def test_short_question_with_one_shared_generic_word_is_not_promoted(bundle):
+    """"Why did the dashboard crash?" has two subject words after frame
+    removal ("dashboard", "crash") and shares only "crash" with an
+    unrelated record -- 1 of 2 is not a majority for a short question."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(
+        knowledge_repo, title="IIS worker process crash on multipart uploads", description="w3wp.exe crash on large uploads.",
+        root_cause="", resolution="", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Why did the dashboard crash?")
+
+    assert "IIS worker process crash" not in response.answer_text
+
+
+def _async_orchestrator(bundle):
+    llm = GatedFakeLLMProvider(response="LLM text that must not replace the deterministic answer.")
+    service = ChatEnhancementService(max_concurrent=1, max_queued=1)
+    return _orchestrator_with_async_llm(bundle, llm, service), llm
+
+
+@pytest.mark.parametrize(
+    "turns",
+    [
+        ["Why did this request fail?"],
+        ["What should I check next?"],
+        ["AxeI meters are stuck in discovered.", "What should I check next?"],
+    ],
+)
+def test_async_deterministic_answer_matches_the_synchronous_answer(bundle, turns):
+    """The instant deterministic answer is computed by the same code in
+    both modes; enabling async enhancement must not change it."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_axei_case(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Glitch Request for reference- 495079", "Glitch Request for reference: 495079", 0.82)
+    ]
+
+    sync_orchestrator = bundle["orchestrator"]
+    sync_session = sync_orchestrator.create_session()
+    sync_response = None
+    for turn in turns:
+        sync_response = sync_orchestrator.handle_message(sync_session.id, turn)
+
+    async_orchestrator, llm = _async_orchestrator(bundle)
+    async_session = async_orchestrator.create_session()
+    async_response = None
+    try:
+        for turn in turns:
+            async_response = async_orchestrator.handle_message(async_session.id, turn)
+    finally:
+        llm.release.set()
+
+    assert async_response.answer_text == sync_response.answer_text
+
+
+def test_log_session_why_did_it_fail_keeps_the_log_grounded_root_cause(bundle):
+    """A log-derived root cause (``StructuredResolution.source_kind ==
+    "investigation"``, synthesized from THIS session's own uploaded log --
+    here, its real ERROR line) is grounded in the log itself, not in a
+    text-similarity match against the question -- it must survive
+    ``_tier_answer_is_off_topic`` even though "Why did it fail?" has no
+    subject words of its own to compare against. An unrelated known bug
+    that merely happens to score well must not silently REPLACE it either;
+    it may still be offered as a resolution candidate, clearly labeled as
+    unverified, alongside the real log-grounded cause. A first version of
+    the fix for the sibling real-corpus finding (retrieval-derived off-
+    topic answers) wrongly generalized to this case too -- caught by this
+    test, which failed until the fix was scoped to retrieval-derived
+    answers only."""
+    knowledge_repo = bundle["knowledge_repo"]
+    bug = _save_bug(
+        knowledge_repo, title="Intermittent 500 errors on /api/v1/orders due to downstream timeout",
+        description="Requests spent most of their time waiting on a downstream timeout; correlation IDs traced it.",
+    )
+    bundle["store"].matches[KnowledgeCollection.KNOWN_BUGS] = [_bug_match_for(bug, 0.6)]
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _L_METER_LOG.encode())
+
+    orchestrator.handle_message(session.id, "Analyze this log.")
+    response = orchestrator.handle_message(session.id, "Why did it fail?")
+
+    assert "I don't have enough evidence" not in response.answer_text
+    assert "CommandTimeoutException" in response.answer_text
+    assert response.resolution_provenance is not None
+
+
+def test_retrieval_derived_answer_with_no_subject_words_still_gets_honest_insufficiency(bundle):
+    """The counterpart to the log-grounded test above: when the tier's
+    answer IS retrieval-derived (a real historical-investigation match,
+    ``root_cause_evidence[0].kind == EvidenceKind.HISTORICAL_INVESTIGATION``,
+    not ``ENTITY_HEURISTIC``) and the question has no subject words of
+    its own even after inheriting context, the honest-insufficiency path
+    must still fire -- the log-grounded exception above is a narrow,
+    deliberate carve-out, not a general loosening."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(
+        knowledge_repo, title="Intermittent 500 errors on /api/v1/orders due to downstream timeout",
+        description="Requests spent most of their time waiting on a downstream timeout.",
+        root_cause="The inventory-service was under-provisioned.", resolution="Scaled out inventory-service.",
+        next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Why did this request fail?")
+
+    # Either honest-insufficiency phrasing is acceptable (which one
+    # depends on whether the answer resolved to POSSIBLE or LIKELY tier
+    # upstream) -- what matters is that the unrelated record is never
+    # presented as the answer.
+    assert "I don't have enough evidence" in response.answer_text
+    assert "## Likely causes" not in response.answer_text
+    assert "most likely explanation" not in response.answer_text
+    assert "Confidence: Likely" not in response.answer_text
+    assert "Scaled out inventory-service" not in response.answer_text
+
+
+def test_inherited_subject_requires_a_majority_of_its_words(bundle):
+    """A follow-up inherits the prior turns' subject words; a record that
+    shares just one of them (a generic "meters") must not be shown next to
+    the real case."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_axei_case(knowledge_repo)
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("SM Registration Removal and Disposal for Japanese Meters", "Steps to dispose of meters.", 0.82)
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    orchestrator.handle_message(session.id, "AxeI meters are stuck in discovered.")
+    response = orchestrator.handle_message(session.id, "What should I check next?")
+
+    assert "AXei meters stuck in discovered" in response.answer_text
+    assert "Japanese Meters" not in response.answer_text
+
+
+# --- Knowledge-synthesis relevance (Fix Remaining Off-Topic Answers &
+# Subjectless Follow-Ups phase, Part 1) ------------------------------------
+#
+# Real-corpus regression: "What is the deprecated FooBarWidget rollback
+# procedure?" (a deliberately nonsense query) got a confident answer from
+# an unrelated document ("LandisGyr Recycling Standard") purely because
+# that document's own boilerplate template header contains the word
+# "procedure" as a genuine whole word.
+
+
+def test_nonsense_knowledge_query_gets_honest_knowledge_gap_not_an_unrelated_document(bundle):
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "LandisGyr Recycling Standard",
+            "Note: The controlled version of this document is maintained as part of Landis+Gyr's IMS. "
+            "Procedure Template CQ-T-001 Revision 18. Recycling Standard. Doc Number: EHS-P-017.",
+            0.75,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is the deprecated FooBarWidget rollback procedure?")
+
+    # The unrelated document may still be listed as a secondary "related
+    # documentation" reference (transparency), but it must never be
+    # presented as the confident answer.
+    assert "Based on ResolveIQ's documentation" not in response.answer_text
+    assert '"LandisGyr Recycling Standard" (documentation) -- directly addresses' not in response.answer_text
+    assert "couldn't find documentation" in response.answer_text
+
+
+def test_genuine_knowledge_question_still_retrieves_and_explains_relevant_documentation(bundle):
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "ITIL - Work Instruction - Remote Semaphore settings in CC and Automation tool",
+            "Process settings in Command Center control how the semaphore governs concurrent command execution.",
+            0.8,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is process settings in CC?")
+
+    assert 'Based on ResolveIQ\'s documentation "ITIL - Work Instruction' in response.answer_text
+    assert "## Answer" in response.answer_text
+
+
+def test_real_identifier_with_punctuation_is_not_rejected_by_tokenization(bundle):
+    """A real technical identifier ("CommandProcessorHost") and its
+    punctuation-heavy real-world phrasing must still match -- the fix
+    must not incidentally break genuine overlap detection."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "CommandProcessorHost Troubleshooting Guide",
+            "CommandProcessorHost.exe: queue depth, retry policy, and restart procedure for the command processor host.",
+            0.8,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is CommandProcessorHost?")
+
+    assert '"CommandProcessorHost Troubleshooting Guide"' in response.answer_text
+    assert "couldn't find documentation" not in response.answer_text
+
+
+def test_no_supporting_documentation_at_all_produces_honest_knowledge_gap(bundle):
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is a Zorblex 9000?")
+
+    assert response.debug is not None
+    assert response.debug["knowledge_gaps"]
+
+
+def test_irrelevant_historical_record_is_never_described_as_confirmed_current_behavior(bundle):
+    """Even when a historical record IS the best (only) available
+    candidate and clears the overlap bar, it must be explicitly labeled
+    as a past case, never presented as current, confirmed behavior or a
+    confirmed resolution."""
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(
+        knowledge_repo, title="AxeI meter registration failure",
+        description="AxeI meter registration failed during onboarding.",
+        resolution="Re-ran the registration script.", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.8)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is AxeI meter?")
+
+    assert "not a product/concept definition" in response.answer_text
+    assert "historical recommendation, not a confirmed resolution" in response.answer_text
+
+
+# --- Subjectless follow-up handling (Part 2) --------------------------------
+
+
+def test_fresh_check_next_with_zero_matching_evidence_asks_for_the_missing_subject(bundle):
+    """Real-corpus shape: the knowledge base is never truly EMPTY (Chroma
+    always returns its nearest neighbors once any records are indexed),
+    it just has nothing that actually matches "check next" -- seeded
+    here with one weakly-related record so this exercises the same code
+    path a real, populated corpus does (confirmed directly against the
+    isolated real-corpus copy), not the separate, unrelated "zero
+    evidence anywhere at all" defensive fallback."""
+    knowledge_repo = bundle["knowledge_repo"]
+    bug = _save_bug(
+        knowledge_repo, title="NullPointerException in OrderProcessor.calculateTotal for addressless customers",
+        description="OrderProcessor.calculateTotal throws when a customer has no saved address.",
+    )
+    bundle["store"].matches[KnowledgeCollection.KNOWN_BUGS] = [_bug_match_for(bug, 0.6)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What should I check next?")
+
+    assert "I don't have enough evidence" in response.answer_text
+    assert "component" in response.answer_text or "symptom" in response.answer_text
+    assert "## Likely causes" not in response.answer_text
+    assert "NullPointerException" not in response.answer_text
+
+
+def test_established_subject_followup_uses_context_and_evidence(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(
+        knowledge_repo, title="Fort Payne || AXei meters stuck in discovered",
+        description="AXei meters stuck in discovered after registration.",
+        root_cause="", resolution="", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    orchestrator.handle_message(session.id, "AxeI meters are stuck in discovered.")
+    response = orchestrator.handle_message(session.id, "What should I check next?")
+
+    assert "AXei meters stuck in discovered" in response.answer_text
+    assert "## Likely causes" in response.answer_text
+
+
+def test_new_chat_check_next_still_does_not_inherit_prior_subject(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(
+        knowledge_repo, title="Fort Payne || AXei meters stuck in discovered",
+        description="AXei meters stuck in discovered after registration.",
+        root_cause="", resolution="", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+    orchestrator = bundle["orchestrator"]
+
+    first = orchestrator.create_session()
+    orchestrator.handle_message(first.id, "AxeI meters are stuck in discovered.")
+    fresh = orchestrator.create_session()
+    response = orchestrator.handle_message(fresh.id, "What should I check next?")
+
+    assert "AXei meters stuck in discovered" not in response.answer_text
+    assert "I don't have enough evidence" in response.answer_text
+
+
+def test_established_subject_but_insufficient_evidence_asks_for_missing_detail_not_a_fabricated_check(bundle):
+    """Context establishes a real subject ("Kafka consumer"), but nothing
+    in the knowledge base actually covers it -- the answer must say so
+    and ask for the missing detail, never invent a generic-sounding but
+    unevidenced troubleshooting step."""
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    orchestrator.handle_message(session.id, "The Kafka consumer group is rebalancing constantly.")
+    response = orchestrator.handle_message(session.id, "What should I check next?")
+
+    assert "I don't have enough evidence" in response.answer_text
+    for forbidden in ("Check the logs", "Check network connectivity", "restart the service", "Restart the service"):
+        assert forbidden not in response.answer_text
+
+
+# --- Compatibility -----------------------------------------------------------
+
+
+def test_knowledge_gap_fix_preserves_claim_and_debug_contract(bundle):
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is the deprecated FooBarWidget rollback procedure?")
+
+    assert response.debug is not None
+    for key in ("intent", "claims", "sufficiency", "knowledge_gaps", "selected_evidence", "rejected_evidence"):
+        assert key in response.debug
+
+
+def test_subjectless_checknext_fix_preserves_claim_and_debug_contract(bundle):
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What should I check next?")
+
+    assert response.debug is not None
+    for key in ("intent", "claims", "sufficiency", "knowledge_gaps"):
+        assert key in response.debug
+
+
+def test_check_next_sync_and_async_answers_match(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    record = _save_hi(
+        knowledge_repo, title="Fort Payne || AXei meters stuck in discovered",
+        description="AXei meters stuck in discovered after registration.",
+        root_cause="", resolution="", next_step="",
+    )
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [_match_for(record, 0.82)]
+
+    sync_orchestrator = bundle["orchestrator"]
+    sync_session = sync_orchestrator.create_session()
+    sync_orchestrator.handle_message(sync_session.id, "AxeI meters are stuck in discovered.")
+    sync_response = sync_orchestrator.handle_message(sync_session.id, "What should I check next?")
+
+    llm = GatedFakeLLMProvider(response="An LLM answer that must not replace the deterministic one.")
+    service = ChatEnhancementService(max_concurrent=1, max_queued=1)
+    async_orchestrator = _orchestrator_with_async_llm(bundle, llm, service)
+    async_session = async_orchestrator.create_session()
+    try:
+        async_orchestrator.handle_message(async_session.id, "AxeI meters are stuck in discovered.")
+        async_response = async_orchestrator.handle_message(async_session.id, "What should I check next?")
+    finally:
+        llm.release.set()
+
+    assert async_response.answer_text == sync_response.answer_text
+
+
+def test_log_grounded_troubleshooting_path_still_unaffected(bundle):
+    """Neither fix touches log-evidence-driven answers -- a real,
+    evidence-grounded log analysis must still work exactly as before."""
+    log_upload_service = _real_chat_log_upload_service()
+    orchestrator = _orchestrator_with_llm_and_log_upload(bundle, None, log_upload_service)
+    session = orchestrator.create_session()
+    log_upload_service.upload(session.id, "meter.log", _L_METER_LOG.encode())
+
+    response = orchestrator.handle_message(session.id, "Analyze this log.")
+
+    assert response.answer_kind == "log_analysis"
+    assert "parsed event(s)" in response.answer_text
+
+
+# --- Acceptance review: knowledge-shaped questions at LIKELY/CONFIRMED tier ---
+#
+# Real UI finding: "Explain process settings in Command Center." (4 concept
+# words: process/settings/command/center) reached LIKELY tier off an
+# entirely unrelated known bug ("IIS worker process crash..."), because 4
+# words is already past _SHORT_QUESTION_WORD_COUNT (3), so the generic
+# branch of _tier_answer_is_off_topic used the lenient bare-overlap>0 rule
+# meant for long, narrative questions -- not appropriate for a compact,
+# all-substantive knowledge question.
+
+
+def test_knowledge_shaped_question_at_likely_tier_requires_majority_overlap_regardless_of_word_count(bundle):
+    knowledge_repo = bundle["knowledge_repo"]
+    bug = _save_bug(
+        knowledge_repo, title="IIS worker process crash on multipart uploads over 50MB",
+        description="w3wp.exe crashes with an access violation handling multipart uploads over 50MB.",
+    )
+    bundle["store"].matches[KnowledgeCollection.KNOWN_BUGS] = [_bug_match_for(bug, 0.6)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Explain process settings in Command Center.")
+
+    # The unrelated bug may still be listed as secondary "related" evidence
+    # (transparency), but never presented as the confident answer.
+    assert "AspNetCoreModuleV2" not in response.answer_text
+    assert "Recommended resolution" not in response.answer_text
+    assert "Based on the available evidence, this issue" not in response.answer_text
+    assert '"IIS worker process crash on multipart uploads over 50MB" (known bug) -- a related known bug' in response.answer_text
+
+
+def test_knowledge_shaped_question_with_real_majority_overlap_still_answers_at_likely_tier(bundle):
+    """Positive control: a genuinely on-topic known bug -- sharing a real
+    majority of the question's concept words, not just one generic one --
+    must still be presented normally. The fix must not become "never
+    trust LIKELY/CONFIRMED for a knowledge question"."""
+    knowledge_repo = bundle["knowledge_repo"]
+    bug = _save_bug(
+        knowledge_repo, title="Process settings queue backlog in Command Center",
+        description="Process settings misconfiguration in Command Center causes a queue backlog.",
+    )
+    bundle["store"].matches[KnowledgeCollection.KNOWN_BUGS] = [_bug_match_for(bug, 0.6)]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Explain process settings in Command Center.")
+
+    assert "Process settings queue backlog in Command Center" in response.answer_text
+
+
+# --- Acceptance review: _compose_knowledge_synthesis's own answerable gate ---
+#
+# Real UI finding: once the tier-level check above correctly rejected the
+# off-topic known bug, the fallback knowledge composer's own bare
+# overlap>0 bar still accepted an unrelated document ("IAD Move Checklist
+# Answers_Master") because the product's own name ("Command"/"Center") is
+# so ubiquitous across the corpus that even 2 of 4 words is not real
+# evidence of relevance.
+
+
+def test_knowledge_synthesis_rejects_a_document_sharing_only_the_ubiquitous_product_name(bundle):
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "IAD Move Checklist Answers_Master",
+            "Command Center Version | Database Server | Database Name | Central Server Web Service | Time Zone",
+            0.7,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Explain process settings in Command Center.")
+
+    assert (
+        "couldn't find documentation" in response.answer_text
+        or "does not have authoritative documentation" in response.answer_text
+    )
+    assert 'Based on ResolveIQ\'s documentation "IAD Move Checklist' not in response.answer_text
+
+
+def test_knowledge_synthesis_still_accepts_a_genuinely_on_topic_document(bundle):
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "Process Settings Configuration Guide for Command Center",
+            "Process settings in Command Center control how commands are queued and dispatched.",
+            0.75,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Explain process settings in Command Center.")
+
+    assert "Process Settings Configuration Guide for Command Center" in response.answer_text
+    assert 'Based on ResolveIQ\'s documentation' in response.answer_text
+
+
+# --- Phrase-Aware Relevance investigation: regression matrix (Step 2) -----
+#
+# All of these use _orchestrator_with_lookup_repo (product-name tokens
+# populated) rather than bundle["orchestrator"] (for which the new
+# mechanism is a documented no-op -- see that helper's own docstring).
+
+
+def test_matrix_1_unrelated_checklist_not_accepted_as_primary_evidence(bundle):
+    """Case 1: "Explain process settings in Command Center." must not
+    treat a document sharing only the product's own name ("Command"/
+    "Center") plus one coincidental generic hit ("process") as
+    sufficient -- it is missing "settings", the one word that actually
+    names the question's subject."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "IAD Move Checklist Answers_Master",
+            "Command Center Version | Database Server | Warehouse Update Process History | Database Name",
+            0.7,
+        )
+    ]
+    orchestrator = _orchestrator_with_lookup_repo(bundle)
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Explain process settings in Command Center.")
+
+    assert 'Based on ResolveIQ\'s documentation "IAD Move Checklist' not in response.answer_text
+    assert (
+        "couldn't find documentation" in response.answer_text
+        or "does not have authoritative documentation" in response.answer_text
+    )
+
+
+def test_matrix_2_relevant_emerge_evidence_preserved(bundle):
+    """Case 2: a genuine match ("settings"+"emerge", the real subject)
+    must still be accepted even though it does NOT share "process" at
+    all -- distinctive-word filtering must not become stricter than the
+    original majority rule for a legitimately relevant document."""
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [
+        _match_for(
+            _save_hi(
+                bundle["knowledge_repo"], title="Review Emerge Settings listed in CIL-98-3114",
+                description="Settings id 1126 missing in Emerge System Settings page.",
+                root_cause="", resolution="", next_step="",
+            ),
+            0.75,
+        )
+    ]
+    orchestrator = _orchestrator_with_lookup_repo(bundle)
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What are process settings in Emerge?")
+
+    assert "Review Emerge Settings listed in CIL-98-3114" in response.answer_text
+
+
+def test_matrix_3_short_dashboard_cc_question_still_preserved(bundle):
+    """Case 3: the 2-concept-word short-question behavior from the
+    prior fix must survive unchanged -- "cc" is not a recognized
+    product-name token (only "command"/"center" are, from the governed
+    "Command Center" name), so this remains governed by the existing
+    word-count floor, not the new mechanism, and must still accept a
+    document sharing only the distinctive word "dashboard"."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for("Access to Dashboard and Views in CRM", "How to access Dashboard and Views in CRM.", 0.73)
+    ]
+    orchestrator = _orchestrator_with_lookup_repo(bundle)
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Tell me about dashboard in CC")
+
+    assert "Access to Dashboard and Views in CRM" in response.answer_text
+
+
+def test_matrix_4_exact_meaningful_phrase_present_is_accepted(bundle):
+    """Case 4: a document that genuinely contains BOTH distinctive
+    words ("process" and "settings", not just the product name) must
+    be accepted as the primary answer."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "Process Settings Configuration Guide for Command Center",
+            "Process settings in Command Center control how commands are queued and dispatched.",
+            0.75,
+        )
+    ]
+    orchestrator = _orchestrator_with_lookup_repo(bundle)
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Explain process settings in Command Center.")
+
+    assert "Process Settings Configuration Guide for Command Center" in response.answer_text
+    assert 'Based on ResolveIQ\'s documentation' in response.answer_text
+
+
+def test_matrix_5_scattered_concept_words_without_the_real_concept_rejected(bundle):
+    """Case 5: concept words appearing SEPARATELY, in an unrelated
+    source, without the meaningful phrase/concept -- a clean synthetic
+    fixture isolating exactly this shape (deterministic, corpus-
+    independent). "process" and "command"/"center" appear; "settings"
+    does not."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "Unrelated Command Center Process Audit Log",
+            "This audit log records every Command Center process start and stop event for compliance purposes.",
+            0.72,
+        )
+    ]
+    orchestrator = _orchestrator_with_lookup_repo(bundle)
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Explain process settings in Command Center.")
+
+    assert 'Based on ResolveIQ\'s documentation "Unrelated Command Center Process Audit Log' not in response.answer_text
+
+
+def test_matrix_6_pure_product_name_question_falls_back_gracefully(bundle):
+    """Case 6: a question made ENTIRELY of product-name tokens ("What
+    is Command Center?") must not have every candidate rejected just
+    because there is nothing left to be "more specific" than -- the
+    graceful fallback to the original, full-concept-word majority rule
+    must apply."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "Command Center Product Overview",
+            "Command Center is ResolveIQ's core product for managing meter communications.",
+            0.8,
+        )
+    ]
+    orchestrator = _orchestrator_with_lookup_repo(bundle)
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is Command Center?")
+
+    assert "Command Center Product Overview" in response.answer_text
+
+
+def test_matrix_7_nonsense_query_remains_honest(bundle):
+    """Case 7: an unsupported/nonsense query must still produce an
+    honest insufficiency response, unaffected by the product-name
+    mechanism (no concept word here is a product-name token at all)."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "LandisGyr Recycling Standard",
+            "Procedure Template CQ-T-001 Revision 18. Recycling Standard. Doc Number: EHS-P-017.",
+            0.75,
+        )
+    ]
+    orchestrator = _orchestrator_with_lookup_repo(bundle)
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "What is the deprecated FooBarWidget rollback procedure?")
+
+    assert "Based on ResolveIQ's documentation" not in response.answer_text
+    assert "couldn't find documentation" in response.answer_text
+
+
+# --- Compatibility: no lookup_repo wired stays byte-identical to before ---
+
+
+def test_no_lookup_repo_wired_keeps_the_prior_word_count_floor_behavior(bundle):
+    """bundle['orchestrator'] (no lookup_repo) must behave exactly as
+    it did before this phase -- the new mechanism is opt-in via DI,
+    never a silent behavior change for a caller that doesn't wire it."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "IAD Move Checklist Answers_Master",
+            "Command Center Version | Database Server | Warehouse Update Process History | Database Name",
+            0.7,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "Explain process settings in Command Center.")
+
+    # 3 of 4 words (process/command/center) still clears bare majority
+    # without product-name filtering -- the documented, pre-existing
+    # fallback behavior for a caller with no lookup_repo wired.
+    assert "IAD Move Checklist" in response.answer_text
+
+
+# --- Emerge acceptance matrix finding: documentation-vs-historical priority
+# in _compose_configuration_synthesis -----------------------------------
+#
+# Real-corpus regression: "How do I start the services on Emerge?" cited
+# an unrelated system's checklist ("GSIS v3_5_0+ Post Install
+# Configuration Checklist", 2 of 3 concept words, no "Emerge" anywhere in
+# it) over a historical case that is a PERFECT match ("Start the services
+# on Emerge.", 3 of 3 concept words) -- purely because the composer
+# unconditionally preferred ANY non-empty documentation pool over
+# historical evidence, regardless of which one actually shares the
+# question's real subject.
+
+
+def test_better_matching_historical_case_wins_over_a_weaker_documentation_match(bundle):
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "GSIS v3_5_0+ Post Install Configuration Checklist",
+            "GSIS Post Install Steps. Confirm all LandisGyr.GSIS Services are set to Automatic (Delayed Start).",
+            0.67,
+        )
+    ]
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [
+        _match_for(
+            _save_hi(
+                bundle["knowledge_repo"], title="Start the services on Platypus",
+                description="Start the services on Platypus. Resolution: Started all services.",
+                root_cause="", resolution="Started all services.", next_step="",
+            ),
+            0.90,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "How do I start the services on Platypus?")
+
+    # The weaker documentation match may still be listed as secondary
+    # "## Evidence" (transparency), but must never be the confident answer.
+    assert "does not have authoritative documentation on record" in response.answer_text
+    assert 'Based on ResolveIQ\'s documentation "GSIS' not in response.answer_text
+    assert "## Answer\nResolveIQ does not have authoritative documentation" in response.answer_text
+    assert "Start the services on Platypus" in response.answer_text
+
+
+def test_documentation_still_wins_when_it_matches_at_least_as_well(bundle):
+    """Protects the already-valid behavior: a documentation candidate
+    that matches AT LEAST as well as the best historical case must not
+    be displaced -- the override is strictly "historical is BETTER", not
+    "historical also exists"."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "ITIL -Work Instruction - Remote Semaphore settings in CC and Automation tool",
+            "Remote Semaphore settings in Command Center and the Automation tool control concurrent command execution.",
+            0.9,
+        )
+    ]
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [
+        _match_for(
+            _save_hi(
+                bundle["knowledge_repo"], title="CC Server Error", description="Need help in setting up command center.",
+                root_cause="", resolution="", next_step="",
+            ),
+            0.68,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(
+        session.id, "How do I configure remote semaphore settings in CC and the Automation tool?"
+    )
+
+    assert "ITIL -Work Instruction - Remote Semaphore settings" in response.answer_text
+    assert 'Based on ResolveIQ\'s documentation' in response.answer_text
+
+
+def test_tied_overlap_keeps_the_existing_documentation_preference(bundle):
+    """A genuine tie (same overlap) must not flip to historical -- the
+    override requires the historical case to be STRICTLY better."""
+    bundle["store"].matches[KnowledgeCollection.DOCUMENTATION] = [
+        _doc_match_for(
+            "Widget Settings Configuration Guide", "Widget settings configuration for the gadget system.", 0.7,
+        )
+    ]
+    bundle["store"].matches[KnowledgeCollection.HISTORICAL_INVESTIGATIONS] = [
+        _match_for(
+            _save_hi(
+                bundle["knowledge_repo"], title="Widget settings issue", description="Widget settings configuration problem.",
+                root_cause="", resolution="", next_step="",
+            ),
+            0.72,
+        )
+    ]
+    orchestrator = bundle["orchestrator"]
+    session = orchestrator.create_session()
+
+    response = orchestrator.handle_message(session.id, "How do I configure widget settings?")
+
+    assert "Widget Settings Configuration Guide" in response.answer_text
+    assert 'Based on ResolveIQ\'s documentation' in response.answer_text

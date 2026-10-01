@@ -440,6 +440,7 @@ def get_chat_orchestrator() -> ChatOrchestrator:
         settings.llm_async_enabled,
         _chat_log_upload_service(),
         _log_knowledge_repository(),
+        _lookup_repository(),
     )
 
 

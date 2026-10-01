@@ -172,6 +172,7 @@ _CONCEPT_STOPWORDS: frozenset[str] = frozenset(
         "summary", "for", "this", "that", "these", "those", "seen", "before", "happened", "related", "case",
         "cases", "previous", "prior", "past", "and", "or", "with", "can", "you", "us", "please", "there",
         "i", "it", "its", "issue", "issues", "problem", "problems", "where", "if", "happens",
+        "procedure", "procedures",
     }
 )
 """Closed stopword list for ``extract_concept_words`` -- the fixed
@@ -191,7 +192,20 @@ silently switching ``_tier_answer_is_off_topic`` from its intended
 majority-overlap rule to the lenient bare-``overlap > 0`` rule meant
 for longer, sentence-like questions. That let an unrelated known bug
 ("IIS worker PROCESS crash...") sharing only the single generic word
-"process" pass as "on-topic" and be presented as the answer."""
+"process" pass as "on-topic" and be presented as the answer.
+
+Fix Remaining Off-Topic Answers & Subjectless Follow-Ups phase, Part 1
+-- "procedure"/"procedures" added after a real corpus finding: "What is
+the deprecated FooBarWidget rollback procedure?" (a deliberately
+nonsense query, real subject words "foobarwidget"/"rollback") got a
+confident answer from "LandisGyr Recycling Standard", an entirely
+unrelated document, because that document's own boilerplate template
+header ("Procedure Template CQ-T-001") contains the word "procedure" as
+a genuine whole word -- not a substring artifact, so word-boundary-
+aware matching alone would not have caught it. "procedure" describes
+the KIND of document being asked for, the same category "documentation"/
+"docs"/"overview"/"summary" above are already excluded for -- it was
+simply missing from that set."""
 
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 
@@ -262,5 +276,68 @@ def lexical_overlap(concept_words: list[str], text: str) -> int:
             if phrase_present(word, lowered):
                 count += 1
         elif word in lowered:
+            count += 1
+    return count
+
+
+TROUBLESHOOTING_FRAME_WORDS: frozenset[str] = frozenset(
+    {
+        "why", "should", "next", "first", "happen", "fail", "fails", "failed", "failing", "failure", "failures",
+        "request", "requests", "wrong", "not", "working", "work", "l2", "l3",
+    }
+)
+"""Words that make up the SHAPE of a troubleshooting question ("why did
+this request fail?", "what should I check next?", "what should L2 check
+first?") without naming what the question is ABOUT. Kept separate from
+``_CONCEPT_STOPWORDS`` on purpose: those are removed for every consumer of
+``extract_concept_words``, while these are only removed by the
+troubleshooting-synthesis composer (via ``extract_troubleshooting_subject_
+words``), so no other relevance check in the codebase changes behavior.
+Deliberately does NOT include "check" -- a documented "check" is a real,
+matchable kind of evidence for "what should I check next?", so it stays a
+content word (matched whole-word only, see ``word_overlap``).
+
+Real-corpus finding this exists for: "What should I check next?" ranked an
+RFC change-review FAQ first because it contains "should" and "next" as
+ordinary prose, and "Why did this request fail?" ranked unrelated "Glitch
+Request" tickets first on the single shared word "request"."""
+
+TROUBLESHOOTING_ACTION_WORDS: frozenset[str] = frozenset({"check", "verify", "validate", "investigate", "look"})
+"""Verbs a support question uses to ask for a next step. Unlike
+``TROUBLESHOOTING_FRAME_WORDS`` they are still matchable evidence ("Post-
+work check: validate register reads" answers "what should I check next?")
+-- but only when the question offers nothing more specific: as soon as a
+real subject exists (the question's own, or the investigation's), these
+stop counting so a record cannot pass on the word "check" alone."""
+
+# Suffixes a real inflection may add to a concept word ("meter"->"meters",
+# "check"->"checking"). Intentionally short: an unrecognized ending such as
+# "list" in "checklist" must NOT count as the word "check".
+_INFLECTION_SUFFIXES = r"(?:s|es|ed|ing)?"
+
+
+def extract_troubleshooting_subject_words(text: str) -> list[str]:
+    """``extract_concept_words`` minus ``TROUBLESHOOTING_FRAME_WORDS`` --
+    the words that actually name what a troubleshooting question is about
+    (empty for "why did this request fail?", ``["check"]`` for "what should
+    I check next?")."""
+    return [word for word in extract_concept_words(text) if word not in TROUBLESHOOTING_FRAME_WORDS]
+
+
+def word_overlap(concept_words: list[str], text: str) -> int:
+    """Like ``lexical_overlap`` (how many of ``concept_words`` appear in
+    ``text``, case-insensitive) but a word only counts when it appears as
+    a WHOLE token: bounded by anything that is not a letter/digit (so
+    "collector_reboot", "mesh-router" and "AXeI." all still match), with an
+    optional plural/verb ending. Unlike ``lexical_overlap`` it does not
+    substring-match, so "check" does not match "Checklist" and "process"
+    does not match "processor". Used only where a false-positive substring hit would
+    promote an unrelated record as a likely cause (see
+    ``ChatOrchestrator._compose_troubleshooting_synthesis``)."""
+    lowered = text.lower()
+    count = 0
+    for word in concept_words:
+        suffix = _INFLECTION_SUFFIXES if len(word) > 3 else ""
+        if re.search(rf"(?<![a-z0-9]){re.escape(word)}{suffix}(?![a-z0-9])", lowered):
             count += 1
     return count
