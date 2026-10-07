@@ -1,0 +1,33 @@
+# Runtime dependencies for the API (no torch, no test tooling).
+# Install with `pip install -r requirements-base.txt`; add
+# requirements-st.txt only if you want the sentence-transformers embedding
+# backend (RESOLVEIQ_EMBEDDING_BACKEND=sentence-transformers) instead of ONNX.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-multipart==0.0.20
+python-dateutil==2.9.0.post0
+SQLAlchemy==2.0.36
+chromadb==0.5.23
+# chromadb's own embedding-function deps pin tokenizers; keep it explicit so
+# pip's resolver can't pick an inconsistent combination.
+tokenizers==0.20.3
+protobuf<6,>=4.21
+requests==2.32.3
+httpx==0.28.1
+PyJWT==2.10.1
+
+# External Knowledge (TFS live connector): Windows-only SSPI/NTLM auth.
+# Skipped on Linux/containers, where RESOLVEIQ_TFS_PERSONAL_ACCESS_TOKEN is
+# used instead; the app degrades gracefully (TfsConnectorError) without it.
+requests-negotiate-sspi==0.5.2; sys_platform == "win32"
+
+# Evidence Ingestion Pipeline (RFC rev 1, §04)
+python-docx==1.1.2
+openpyxl==3.1.5
+PyMuPDF==1.25.2
+pytesseract==0.3.13
+Pillow==11.1.0
+python-evtx==0.8.1
+python-pptx==1.0.2

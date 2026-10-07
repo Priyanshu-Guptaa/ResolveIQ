@@ -36,3 +36,29 @@ def get_chroma_client(persist_dir: Path):
             path=key, settings=ChromaSettings(anonymized_telemetry=False)
         )
     return _client_cache[key]
+
+
+def get_chroma_http_client(host: str, port: int = 8000, *, ssl: bool = False, auth_token: str | None = None):
+    """Returns a process-wide client for a standalone Chroma server.
+
+    Used when the API runs as more than one replica (an embedded
+    ``PersistentClient`` is single-process: two processes opening the same
+    directory corrupt each other) or when the vector index must live on its
+    own service. The collection layout and every query are identical to the
+    embedded mode -- only where the index lives changes.
+    """
+    import chromadb
+    from chromadb.config import Settings as ChromaSettings
+
+    key = f"http://{host}:{port}|ssl={ssl}"
+    if key not in _client_cache:
+        logger.info("Connecting to ChromaDB server at %s:%s (ssl=%s)", host, port, ssl)
+        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else None
+        _client_cache[key] = chromadb.HttpClient(
+            host=host,
+            port=port,
+            ssl=ssl,
+            headers=headers,
+            settings=ChromaSettings(anonymized_telemetry=False),
+        )
+    return _client_cache[key]

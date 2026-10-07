@@ -1,0 +1,63 @@
+# Self-hosted stack: API + UI + PostgreSQL + Chroma server.
+# Not run where it was authored (no Docker available) -- validate with
+# `docker compose config` and `docker compose up --build`.
+#
+# Required before `up`: copy .env.example to .env and set
+#   RESOLVEIQ_AUTH_SECRET_KEY (>=32 chars), POSTGRES_PASSWORD,
+#   RESOLVEIQ_AUTH_BOOTSTRAP_ADMIN_USERNAME / _PASSWORD, CHROMA_TOKEN.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: resolveiq
+      POSTGRES_USER: resolveiq
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resolveiq -d resolveiq"]
+      interval: 10s
+      retries: 5
+
+  chroma:
+    image: chromadb/chroma:0.5.23
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+      CHROMA_SERVER_AUTHN_PROVIDER: chromadb.auth.token_authn.TokenAuthenticationServerProvider
+      CHROMA_SERVER_AUTHN_CREDENTIALS: ${CHROMA_TOKEN:?set CHROMA_TOKEN in .env}
+    volumes: [chromadata:/chroma/chroma]
+
+  api:
+    build: { context: ., dockerfile: Dockerfile }
+    depends_on:
+      postgres: { condition: service_healthy }
+      chroma: { condition: service_started }
+    environment:
+      RESOLVEIQ_DATABASE_URL: postgresql+psycopg://resolveiq:${POSTGRES_PASSWORD}@postgres:5432/resolveiq
+      RESOLVEIQ_CHROMA_HOST: chroma
+      RESOLVEIQ_CHROMA_PORT: "8000"
+      RESOLVEIQ_CHROMA_AUTH_TOKEN: ${CHROMA_TOKEN}
+      RESOLVEIQ_AUTH_ENABLED: "true"
+      RESOLVEIQ_AUTH_SECRET_KEY: ${RESOLVEIQ_AUTH_SECRET_KEY:?set RESOLVEIQ_AUTH_SECRET_KEY in .env}
+      RESOLVEIQ_AUTH_BOOTSTRAP_ADMIN_USERNAME: ${RESOLVEIQ_AUTH_BOOTSTRAP_ADMIN_USERNAME:?set in .env}
+      RESOLVEIQ_AUTH_BOOTSTRAP_ADMIN_PASSWORD: ${RESOLVEIQ_AUTH_BOOTSTRAP_ADMIN_PASSWORD:?set in .env}
+      RESOLVEIQ_KNOWLEDGE_UPLOAD_DIR: /srv/resolveiq/data/uploads/knowledge
+      RESOLVEIQ_TFS_BASE_URL: ${RESOLVEIQ_TFS_BASE_URL:-}
+      RESOLVEIQ_TFS_PROJECT: ${RESOLVEIQ_TFS_PROJECT:-}
+      RESOLVEIQ_TFS_PERSONAL_ACCESS_TOKEN: ${RESOLVEIQ_TFS_PERSONAL_ACCESS_TOKEN:-}
+    volumes: [uploads:/srv/resolveiq/data/uploads]
+    # Keep the API on the internal network; expose only the UI (and put TLS
+    # termination in front of it). Uncomment to reach the API directly.
+    # ports: ["8000:8000"]
+
+  ui:
+    build: { context: ., dockerfile: Dockerfile.ui }
+    depends_on: [api]
+    environment:
+      RESOLVEIQ_API_URL: http://api:8000
+    ports: ["8501:8501"]
+
+volumes:
+  pgdata:
+  chromadata:
+  uploads:

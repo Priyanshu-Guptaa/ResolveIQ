@@ -15,6 +15,7 @@ from functools import lru_cache
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import sessionmaker
 
+from app.auth.service import AuthService
 from app.config import Settings, get_settings
 from app.engines.chat.conversation_state import ConversationStateEngine
 from app.engines.chat.enhancement import ChatEnhancementService
@@ -24,11 +25,13 @@ from app.engines.ingestion.engine import IngestionEngine
 from app.engines.ingestion.file_type_registry import FileTypeRegistry
 from app.engines.investigation.engine import InvestigationEngine
 from app.engines.knowledge.classification import DocumentClassificationEngine
-from app.engines.knowledge.embedding_provider import EmbeddingProvider, SentenceTransformerEmbeddingProvider
+from app.engines.knowledge.embedding_provider import (
+    EmbeddingProvider,
+    OnnxEmbeddingProvider,
+    SentenceTransformerEmbeddingProvider,
+)
 from app.engines.knowledge.engine import KnowledgeEngine
-from app.engines.knowledge.hybrid_store import HybridKnowledgeStore
 from app.engines.knowledge.knowledge_store import ChromaKnowledgeStore, KnowledgeStore
-from app.engines.knowledge.lexical_store import LexicalKnowledgeStore
 from app.engines.knowledge_management.engine import KnowledgeManagementEngine
 from app.engines.knowledge_object_framework.adapters import KnowledgeObjectAdapter, build_adapters
 from app.engines.knowledge_object_framework.service import KnowledgeObjectService
@@ -60,8 +63,11 @@ from app.infrastructure.db.playbook_repository import PlaybookRepository, SqlAlc
 from app.infrastructure.db.relationship_repository import RelationshipRepository, SqlAlchemyRelationshipRepository
 from app.infrastructure.db.repository import InvestigationRepository, SqlAlchemyInvestigationRepository
 from app.infrastructure.db.seed_migration import migrate_all
+from app.infrastructure.storage.blob_store import BlobStore, LocalBlobStore, S3BlobStore
+from app.infrastructure.vectorstore.chroma_client import get_chroma_http_client
 from app.infrastructure.db.session import get_session_factory
 from app.infrastructure.db.sql_template_repository import SqlAlchemySqlTemplateRepository, SqlTemplateRepository
+from app.infrastructure.db.user_repository import SqlAlchemyUserRepository
 from app.infrastructure.db.version_repository import SqlAlchemyVersionRepository, VersionRepository
 from app.domain.knowledge_relationships import KnowledgeObjectType
 
@@ -69,29 +75,23 @@ from app.domain.knowledge_relationships import KnowledgeObjectType
 @lru_cache
 def _embedding_provider() -> EmbeddingProvider:
     settings = get_settings()
+    if settings.embedding_backend == "onnx":
+        return OnnxEmbeddingProvider()
     return SentenceTransformerEmbeddingProvider(settings.embedding_model_name)
-
-
-@lru_cache
-def _lexical_knowledge_store() -> LexicalKnowledgeStore:
-    return LexicalKnowledgeStore()
 
 
 @lru_cache
 def _knowledge_store() -> KnowledgeStore:
     settings = get_settings()
-    vector_store = ChromaKnowledgeStore(settings.chroma_persist_dir, _embedding_provider())
-    if not settings.rrf_enabled:
-        return vector_store
-    return HybridKnowledgeStore(
-        vector_store,
-        _lexical_knowledge_store(),
-        rrf_k=settings.rrf_k,
-        fusion_mode=settings.hybrid_fusion_mode,
-        vector_weight=settings.hybrid_vector_weight,
-        lexical_weight=settings.hybrid_lexical_weight,
-        identifier_protection_enabled=settings.identifier_protection_enabled,
-    )
+    client = None
+    if settings.chroma_host:
+        client = get_chroma_http_client(
+            settings.chroma_host,
+            settings.chroma_port,
+            ssl=settings.chroma_ssl,
+            auth_token=settings.chroma_auth_token,
+        )
+    return ChromaKnowledgeStore(settings.chroma_persist_dir, _embedding_provider(), client=client)
 
 
 @lru_cache
@@ -134,6 +134,18 @@ def _sql_library_engine() -> SqlLibraryEngine:
 
 
 @lru_cache
+def _blob_store() -> BlobStore:
+    settings = get_settings()
+    if settings.upload_backend == "s3":
+        return S3BlobStore(
+            settings.upload_s3_bucket or "",
+            settings.upload_s3_prefix,
+            settings.upload_s3_endpoint_url,
+        )
+    return LocalBlobStore(settings.knowledge_upload_dir)
+
+
+@lru_cache
 def _knowledge_management_engine() -> KnowledgeManagementEngine:
     settings = get_settings()
     return KnowledgeManagementEngine(
@@ -141,7 +153,7 @@ def _knowledge_management_engine() -> KnowledgeManagementEngine:
         _component_profile_repository(),
         _ingestion_engine(),
         _knowledge_engine_singleton(),
-        settings.knowledge_upload_dir,
+        _blob_store(),
     )
 
 
@@ -307,6 +319,7 @@ def _tfs_connector() -> TfsConnector:
         base_url=settings.tfs_base_url,
         project=settings.tfs_project,
         timeout_seconds=settings.external_knowledge_timeout_seconds,
+        personal_access_token=settings.tfs_personal_access_token,
     )
 
 
@@ -497,7 +510,6 @@ def reset_singletons() -> None:
     for fn in (
         _embedding_provider,
         _knowledge_store,
-        _lexical_knowledge_store,
         _knowledge_engine_singleton,
         _db_session_factory,
         _investigation_repository,
@@ -528,3 +540,22 @@ def reset_singletons() -> None:
         _llm_provider,
     ):
         fn.cache_clear()
+
+
+# --- Authentication (hosted deployment) --------------------------------------
+
+
+@lru_cache
+def _user_repository() -> SqlAlchemyUserRepository:
+    return SqlAlchemyUserRepository(_db_session_factory())
+
+
+def get_auth_service() -> AuthService:
+    return AuthService(_user_repository(), get_settings())
+
+
+def bootstrap_auth() -> None:
+    """Startup hook: when auth is on, make sure a first admin exists."""
+    settings = get_settings()
+    if settings.auth_enabled:
+        get_auth_service().bootstrap_admin()

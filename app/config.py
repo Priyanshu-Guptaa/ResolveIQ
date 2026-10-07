@@ -36,6 +36,46 @@ class Settings(BaseSettings):
     search only ever uses the extracted ``content`` stored in SQLite,
     never reads this back."""
 
+    # --- Hosted-deployment overrides ---------------------------------------
+    # Every value defaults to the local single-process behavior above, so a
+    # fresh checkout is unchanged; set these to run against shared services.
+    database_url: str | None = None
+    """Full SQLAlchemy URL (e.g. ``postgresql+psycopg://user:pw@host/db``).
+    When set it replaces ``sqlite_path``; unset keeps the local SQLite file."""
+    chroma_host: str | None = None
+    """When set, talk to a standalone Chroma server over HTTP instead of
+    opening ``chroma_persist_dir`` in-process -- required once more than one
+    API replica runs (an embedded persistent client is single-process)."""
+    chroma_port: int = 8000
+    chroma_ssl: bool = False
+    chroma_auth_token: str | None = None
+    upload_backend: Literal["local", "s3"] = "local"
+    """Where Knowledge Management keeps original uploaded bytes. ``local``
+    writes under ``knowledge_upload_dir`` (needs a persistent volume);
+    ``s3`` uses any S3-compatible bucket (needs the optional ``boto3``)."""
+    upload_s3_bucket: str | None = None
+    upload_s3_prefix: str = "knowledge/"
+    upload_s3_endpoint_url: str | None = None
+    """Set for S3-compatible stores (MinIO, etc.); leave unset for AWS S3."""
+    embedding_backend: Literal["sentence-transformers", "onnx"] = "sentence-transformers"
+    """``onnx`` runs the same all-MiniLM-L6-v2 weights through onnxruntime
+    (no torch) for a much smaller image; vectors match sentence-transformers
+    to float tolerance (cosine 1.000000 measured), so existing indexes
+    remain valid."""
+
+    # --- Authentication (hosted deployment) --------------------------------
+    auth_enabled: bool = False
+    """False (default): every route is open, exactly as in local use. True:
+    all routes except /health and /auth/login require a bearer token, and
+    /admin/* additionally requires the ``admin`` role."""
+    auth_secret_key: str | None = None
+    auth_token_ttl_minutes: int = 480
+    auth_bootstrap_admin_username: str | None = None
+    auth_bootstrap_admin_password: str | None = None
+    """When the users table is empty at startup, an admin is created from
+    these two values (so a fresh deployment can sign in). Ignored once any
+    user exists."""
+
     # --- Knowledge / embeddings -------------------------------------------
     embedding_model_name: str = "all-MiniLM-L6-v2"
     sample_knowledge_dir: Path = BASE_DIR / "data" / "sample_knowledge"
@@ -90,6 +130,12 @@ class Settings(BaseSettings):
     tfs_project: str | None = None
     """e.g. "Command Center" -- the TFS project to scope every query
     to; required alongside tfs_base_url."""
+
+    tfs_personal_access_token: str | None = None
+    """Optional TFS PAT. When set, the connector authenticates with it
+    (Basic, empty username) instead of Windows SSPI -- required on a
+    Linux/container host, where SSPI is unavailable. Never logged or
+    returned by any API; set via RESOLVEIQ_TFS_PERSONAL_ACCESS_TOKEN."""
 
     wiki_base_url: str | None = None
     """e.g. "https://wiki.landisgyr.net" -- unset disables the Wiki
@@ -222,126 +268,27 @@ class Settings(BaseSettings):
             )
         return self
 
-    # --- Hybrid Retrieval: BM25 + RRF foundation (Chat Assistant Phase 2) ---
-    # Kill switch defaults to False, same idiom as llm_enabled/
-    # external_knowledge_enabled -- a fresh checkout runs with the existing,
-    # unchanged ChromaKnowledgeStore (pure vector search) until this is
-    # explicitly enabled AND the existing 1,222-record real corpus has been
-    # backfilled into the lexical index (operational step: re-run
-    # KnowledgeEngine.seed_from_directory(force=True) once HybridKnowledgeStore
-    # is wired in -- see app/engines/knowledge/hybrid_store.py).
-    rrf_enabled: bool = False
-    """False (default): _knowledge_store() returns the existing, unmodified
-    ChromaKnowledgeStore exactly as before Phase 2 -- behavior is
-    byte-identical to pre-Phase-2 retrieval."""
-    rrf_k: int = 60
-    """Reciprocal Rank Fusion's own constant -- the literature-standard
-    default (Cormack et al.), robust across very different score
-    distributions between retrievers. See
-    app/engines/knowledge/rank_fusion.py."""
-
-    # --- Hybrid Retrieval calibration (Chat Assistant Phase 2C) -------------
-    # Phase 2C (read-only investigation) found current RRF fusion
-    # structurally vulnerable to a rank-based tie-break artifact at the
-    # real production overfetch depth (20): a record with two mediocre
-    # signals can out-accumulate a record with one perfect signal (a
-    # ticket ID or exact identifier found only by BM25). Weighted score
-    # fusion was the only tested calibration strategy immune to this --
-    # see PHASE 2C — RRF CALIBRATION REPORT, Section 14. Both settings
-    # below are completely inert unless BOTH ``rrf_enabled=True`` AND
-    # ``hybrid_fusion_mode="score"`` -- neither is true by default, so a
-    # fresh checkout's behavior is unaffected by this phase.
-    hybrid_fusion_mode: Literal["rrf", "score"] = "rrf"
-    """Which algorithm HybridKnowledgeStore uses to combine vector +
-    lexical candidates when ``rrf_enabled=True``. "rrf" (default)
-    preserves the exact Phase 2 behavior. "score" is Phase 2C's
-    recommended calibration (weighted linear combination of the real
-    vector/lexical scores) -- not yet enabled by default pending the
-    natural-language-query validation gap the Phase 2C report explicitly
-    left open."""
-    hybrid_vector_weight: float = 0.25
-    """Weight given to the real vector (cosine similarity) score under
-    ``hybrid_fusion_mode="score"``. Phase 2C's recommended value --
-    see that report's Section 5 (6/6 ground-truth top-1, MRR 1.00)."""
-    hybrid_lexical_weight: float = 0.75
-    """Weight given to the real lexical (BM25, already normalized to
-    [0,1] by LexicalKnowledgeStore) score under
-    ``hybrid_fusion_mode="score"``. Phase 2C's recommended value --
-    see that report's Section 5."""
-
-    # --- Exact-Identifier Protection (Chat Assistant Phase 2D) --------------
-    # Kill switch defaults to False, same idiom as every other Phase 2/2C
-    # flag -- inert unless BOTH rrf_enabled=True AND this is explicitly
-    # True, so a fresh checkout's behavior is unaffected. See
-    # app/engines/knowledge/identifier_protection.py and PHASE 2D — EXACT
-    # IDENTIFIER PROTECTION DESIGN. Deliberately no configurable boost
-    # weight -- the +0.30 adjustment is a fixed, evidence-derived
-    # constant (IDENTIFIER_PROTECTION_BOOST in that module), not a new
-    # tuning knob.
-    identifier_protection_enabled: bool = False
-    """False (default): HybridKnowledgeStore.query() never applies the
-    exact-identifier boost -- behavior is byte-identical to
-    pre-Phase-2D retrieval."""
-
     @model_validator(mode="after")
-    def _validate_hybrid_fusion_weights(self) -> "Settings":
-        """Fail fast on a nonsensical weight configuration rather than
-        silently normalizing it away -- see Phase 2C implementation
-        Section 5's explicit "prefer failing fast" instruction. Only
-        checked here (not deferred to first query) so a misconfigured
-        ``.env`` is caught at startup, not at an engineer's first
-        Analyze click."""
-        if self.hybrid_vector_weight < 0 or self.hybrid_lexical_weight < 0:
-            raise ValueError(
-                "hybrid_vector_weight and hybrid_lexical_weight must both be >= 0 "
-                f"(got vector={self.hybrid_vector_weight!r}, lexical={self.hybrid_lexical_weight!r})"
-            )
-        if self.hybrid_vector_weight + self.hybrid_lexical_weight <= 0:
-            raise ValueError(
-                "hybrid_vector_weight + hybrid_lexical_weight must be > 0 -- "
-                "at least one retrieval signal must carry weight"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _warn_identifier_protection_under_rrf(self) -> "Settings":
-        """Observability only (Phase 2E — RRF / Identifier Protection
-        Compatibility Review, Option A) -- deliberately a WARNING, never
-        a ``raise``: the combination below is not invalid, only
-        limited. Never modifies either setting, never blocks
-        construction, never changes retrieval behavior.
-
-        Phase 2E's real-corpus investigation found that a lexical-only
-        candidate's ``KnowledgeMatch.score`` is intentionally
-        materialized as ``0.0`` under ``hybrid_fusion_mode="rrf"`` (see
-        ``HybridKnowledgeStore``'s own CRITICAL SCORE CONTRACT) --
-        Phase 2D's identifier-protection boost is a small, bounded
-        addition on top of whatever score fusion already produced, not
-        a substitute for it, so ``0.0 + IDENTIFIER_PROTECTION_BOOST``
-        is frequently still far below a genuinely unrelated but
-        vector-similar competitor's real cosine score (Phase 2E
-        measured real competitors at ~0.6-0.73 against a boosted
-        ~0.3-0.4). A ``both``-sourced candidate (e.g. a known bug
-        found by both retrievers) is NOT affected by this and still
-        benefits from protection under RRF -- which is exactly why
-        this is a warning, not a hard failure: the combination has
-        real, partial value, just not a reliable fix for lexical-only
-        exact identifiers. ``hybrid_fusion_mode="score"`` remains the
-        recommended pairing whenever identifier protection is
-        enabled."""
-        if self.identifier_protection_enabled and self.hybrid_fusion_mode == "rrf":
-            logger.warning(
-                "identifier_protection_enabled=True with hybrid_fusion_mode='rrf': exact identifier "
-                "protection is not reliably effective for lexical-only candidates in this mode, because "
-                "RRF intentionally materializes a lexical-only KnowledgeMatch.score as 0.0 before the "
-                "protection boost is applied -- a genuinely unrelated vector-similar candidate routinely "
-                "outscores it even after boosting. hybrid_fusion_mode='score' is the recommended pairing "
-                "when identifier protection is enabled; both-sourced candidates still benefit under 'rrf'."
-            )
+    def _validate_auth_and_storage(self) -> "Settings":
+        """Fail fast at startup rather than boot an open or broken
+        deployment: auth needs a real signing key, S3 needs a bucket."""
+        if self.auth_enabled:
+            if not self.auth_secret_key or len(self.auth_secret_key) < 32:
+                raise ValueError("auth_enabled requires auth_secret_key of at least 32 characters")
+            if self.auth_token_ttl_minutes <= 0:
+                raise ValueError("auth_token_ttl_minutes must be positive")
+        if (self.auth_bootstrap_admin_username is None) != (self.auth_bootstrap_admin_password is None):
+            raise ValueError("auth_bootstrap_admin_username and auth_bootstrap_admin_password must be set together")
+        if self.upload_backend == "s3" and not self.upload_s3_bucket:
+            raise ValueError("upload_backend='s3' requires upload_s3_bucket")
         return self
 
     @property
     def sqlite_url(self) -> str:
+        """The database URL actually used. Name kept for existing callers;
+        ``database_url`` (hosted) takes precedence over the local file."""
+        if self.database_url:
+            return self.database_url
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         return f"sqlite:///{self.sqlite_path.as_posix()}"
 

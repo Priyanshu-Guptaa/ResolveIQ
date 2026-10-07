@@ -1,0 +1,21 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.claude
+.env
+# Runtime state and large local data never go into an image: the database and
+# vector index live in Postgres / the Chroma service (or a mounted volume).
+data/resolveiq.db
+data/chroma
+data/chroma_slim
+data/uploads
+tests
+docs
+*.pdf
+*.md
+!README.md

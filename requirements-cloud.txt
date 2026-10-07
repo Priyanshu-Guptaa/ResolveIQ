@@ -1,0 +1,3 @@
+# Optional backends for a hosted deployment.
+psycopg[binary]==3.2.3   # PostgreSQL (RESOLVEIQ_DATABASE_URL=postgresql+psycopg://...)
+boto3==1.35.90           # S3-compatible uploads (RESOLVEIQ_UPLOAD_BACKEND=s3)

@@ -98,6 +98,35 @@ pytest
 python -m scripts.seed_knowledge --force
 ```
 
+## Hosted deployment
+
+Local use is unchanged (SQLite + embedded Chroma + no login). For a shared
+deployment everything is switched on by environment variables (see
+`.env.example`), and `docker-compose.yml` wires the whole stack
+(API, UI, PostgreSQL, Chroma server):
+
+| Concern | Setting | Notes |
+|---|---|---|
+| Login + roles | `RESOLVEIQ_AUTH_ENABLED`, `RESOLVEIQ_AUTH_SECRET_KEY`, `RESOLVEIQ_AUTH_BOOTSTRAP_ADMIN_*` | `/auth/login` issues a JWT; `/admin/*` needs role `admin`; `/health` stays open. Fails fast at startup if enabled without a >=32-char key. |
+| Database | `RESOLVEIQ_DATABASE_URL` | Any SQLAlchemy URL (PostgreSQL via `requirements-cloud.txt`). |
+| Vector index | `RESOLVEIQ_CHROMA_HOST/PORT/AUTH_TOKEN` | Standalone Chroma server instead of an embedded directory. |
+| Uploaded originals | `RESOLVEIQ_UPLOAD_BACKEND=s3`, `RESOLVEIQ_UPLOAD_S3_BUCKET` | Or keep `local` on a persistent volume. |
+| Embeddings | `RESOLVEIQ_EMBEDDING_BACKEND=onnx` | Same all-MiniLM-L6-v2 vectors without torch (cosine 1.000000 on all 1,222 real records). |
+| TFS from Linux | `RESOLVEIQ_TFS_PERSONAL_ACCESS_TOKEN` | Replaces Windows SSPI. |
+
+Dependencies are split: `requirements-base.txt` (API runtime),
+`requirements-ui.txt`, `requirements-st.txt` (torch embeddings, optional),
+`requirements-cloud.txt` (Postgres/S3 drivers), `requirements-dev.txt`
+(tests). `requirements.txt` is the full local install.
+
+Moving existing data to a hosted environment (sources are only read; the
+targets must be empty):
+
+```
+python -m scripts.migrate_database --source sqlite:///data/resolveiq.db --target postgresql+psycopg://...
+python -m scripts.slim_chroma_index --source data/chroma --dest-host <chroma-host> --dest-token <token>
+```
+
 ## Design notes / deliberate Sprint 1 simplifications
 
 - Extracted entities and log events are stored as JSON columns on the

@@ -634,3 +634,16 @@ class ChatMessageModel(Base):
     message's text contained a recognized deictic cue."""
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class UserModel(Base):
+    """Application user for the hosted deployment's authentication (see
+    ``app.auth``). Only a salted password hash is ever stored."""
+
+    __tablename__ = "users"
+
+    username: Mapped[str] = mapped_column(String(100), primary_key=True)
+    password_hash: Mapped[str] = mapped_column(String(300))
+    role: Mapped[str] = mapped_column(String(20), default="engineer")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

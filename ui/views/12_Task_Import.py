@@ -14,7 +14,7 @@ No role gate: see app/api/routers/admin/__init__.py.
 from __future__ import annotations
 
 import streamlit as st
-from api_client import API_BASE_URL, api_get, api_post, ensure_api_available
+from api_client import API_BASE_URL, api_get, api_post, auth_headers, ensure_api_available
 import requests
 
 from theme import inject_theme
@@ -49,6 +49,7 @@ with tab_import:
                     f"{API_BASE_URL}/admin/task-import",
                     params={"actor": actor},
                     files={"file": (uploaded.name, uploaded.getvalue())},
+                    headers=auth_headers(),
                     timeout=300,
                 )
                 response.raise_for_status()

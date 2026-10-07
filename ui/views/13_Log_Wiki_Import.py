@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import requests
 import streamlit as st
-from api_client import API_BASE_URL, ensure_api_available
+from api_client import API_BASE_URL, auth_headers, ensure_api_available
 
 from theme import inject_theme
 
@@ -51,6 +51,7 @@ if uploaded and st.button("Import", type="primary"):
                 f"{API_BASE_URL}/admin/log-knowledge/import",
                 params={"product": product, "actor": actor},
                 files={"file": (uploaded.name, uploaded.getvalue())},
+                headers=auth_headers(),
                 timeout=300,
             )
             response.raise_for_status()

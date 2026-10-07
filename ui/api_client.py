@@ -25,15 +25,33 @@ import streamlit as st
 
 API_BASE_URL = os.environ.get("RESOLVEIQ_API_URL", "http://localhost:8000")
 
+_TOKEN_KEY = "resolveiq_auth_token"
+
+
+def auth_headers() -> dict:
+    """Bearer header for the signed-in user (empty when auth is off or the
+    user hasn't signed in). The token lives in the per-browser-session
+    ``st.session_state``, never in the process-wide ``st.cache_data``."""
+    token = st.session_state.get(_TOKEN_KEY)
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _drop_expired_token(response) -> None:
+    """A 401 means the stored token expired/was revoked -- forget it so the
+    next page run shows the sign-in form instead of repeating failures."""
+    if response is not None and response.status_code == 401 and _TOKEN_KEY in st.session_state:
+        del st.session_state[_TOKEN_KEY]
+
 
 def api_get(path: str, params: dict | None = None) -> dict | list | None:
     try:
-        response = requests.get(f"{API_BASE_URL}{path}", params=params, timeout=30)
+        response = requests.get(f"{API_BASE_URL}{path}", params=params, headers=auth_headers(), timeout=30)
         response.raise_for_status()
         return response.json()
     except requests.RequestException as exc:
         detail = ""
         if getattr(exc, "response", None) is not None:
+            _drop_expired_token(exc.response)
             detail = f" -- {exc.response.text}"
         st.error(f"API request failed: GET {path} -- {exc}{detail}")
         return None
@@ -47,12 +65,13 @@ def api_post(path: str, json_body: dict | None = None, files=None, *, timeout: i
     60s was found too short for a real 1.5MB zip upload -- see the two
     ``files=`` call sites, which now pass 300s."""
     try:
-        response = requests.post(f"{API_BASE_URL}{path}", json=json_body, files=files, timeout=timeout)
+        response = requests.post(f"{API_BASE_URL}{path}", json=json_body, files=files, headers=auth_headers(), timeout=timeout)
         response.raise_for_status()
         return response.json()
     except requests.RequestException as exc:
         detail = ""
         if getattr(exc, "response", None) is not None:
+            _drop_expired_token(exc.response)
             detail = f" -- {exc.response.text}"
         st.error(f"API request failed: POST {path} -- {exc}{detail}")
         return None
@@ -60,12 +79,13 @@ def api_post(path: str, json_body: dict | None = None, files=None, *, timeout: i
 
 def api_patch(path: str, json_body: dict | None = None) -> dict | list | None:
     try:
-        response = requests.patch(f"{API_BASE_URL}{path}", json=json_body, timeout=30)
+        response = requests.patch(f"{API_BASE_URL}{path}", json=json_body, headers=auth_headers(), timeout=30)
         response.raise_for_status()
         return response.json()
     except requests.RequestException as exc:
         detail = ""
         if getattr(exc, "response", None) is not None:
+            _drop_expired_token(exc.response)
             detail = f" -- {exc.response.text}"
         st.error(f"API request failed: PATCH {path} -- {exc}{detail}")
         return None
@@ -76,12 +96,13 @@ def api_delete(path: str) -> bool:
     relationship, Sprint 3 Phase 3.3) return 204 with no body, so there's
     nothing to hand back the way api_get/api_post/api_patch do."""
     try:
-        response = requests.delete(f"{API_BASE_URL}{path}", timeout=30)
+        response = requests.delete(f"{API_BASE_URL}{path}", headers=auth_headers(), timeout=30)
         response.raise_for_status()
         return True
     except requests.RequestException as exc:
         detail = ""
         if getattr(exc, "response", None) is not None:
+            _drop_expired_token(exc.response)
             detail = f" -- {exc.response.text}"
         st.error(f"API request failed: DELETE {path} -- {exc}{detail}")
         return False
@@ -100,13 +121,56 @@ def api_available() -> bool:
 def ensure_api_available() -> None:
     """Call once at the top of a page. Stops page execution with one clear
     message if the API is unreachable -- replaces the 4-line
-    check/error/stop block that was copy-pasted across all 8 pages."""
+    check/error/stop block that was copy-pasted across all 8 pages.
+
+    Also the single sign-in gate: when the API runs with auth enabled and
+    this browser session has no valid token, shows the login form and
+    stops. With auth disabled (local use) it adds one cheap request and
+    nothing else changes."""
     if not api_available():
         st.error(
             "Can't reach the ResolveIQ API. Start it with "
             "`uvicorn app.api.main:app --reload` and reload this page."
         )
         st.stop()
+    _ensure_signed_in()
+
+
+def _ensure_signed_in() -> None:
+    try:
+        me = requests.get(f"{API_BASE_URL}/auth/me", headers=auth_headers(), timeout=5)
+    except requests.RequestException:
+        return  # liveness already passed; don't block the page on a transient blip
+    if me.status_code != 401:
+        return
+    _drop_expired_token(me)
+    _render_login_form()
+    st.stop()
+
+
+def _render_login_form() -> None:
+    st.title("Sign in to ResolveIQ")
+    with st.form("resolveiq_login"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in")
+    if not submitted:
+        return
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/auth/login", json={"username": username, "password": password}, timeout=15
+        )
+    except requests.RequestException as exc:
+        st.error(f"Can't reach the sign-in service: {exc}")
+        return
+    if response.ok:
+        st.session_state[_TOKEN_KEY] = response.json()["access_token"]
+        st.rerun()
+    st.error("Invalid username or password.")
+
+
+def sign_out() -> None:
+    st.session_state.pop(_TOKEN_KEY, None)
 
 
 # --- Cached reads (Phase 1.5 caching strategy) ------------------------------

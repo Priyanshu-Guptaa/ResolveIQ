@@ -1,0 +1,7 @@
+# Optional: torch-based embeddings (the local default). Not needed when
+# RESOLVEIQ_EMBEDDING_BACKEND=onnx.
+sentence-transformers==3.3.1
+# Pinned explicitly: sentence-transformers doesn't pin transformers tightly
+# enough, and a too-new transformers pulls a tokenizers version newer than
+# chromadb allows.
+transformers==4.46.3

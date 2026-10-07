@@ -18,11 +18,11 @@ st.set_page_config(page_title="ResolveIQ", page_icon="🔎", layout="wide")
 
 # Sprint 3, Phase 3.2 introduces the Administration Portal's first
 # module (Knowledge Management) -- grouped nav sections now, per
-# RFC-003. No role gate yet: authentication is a later, not-yet-
-# scheduled phase (RFC-003's User Management), and every prior Sprint 3
-# phase was explicitly told not to build it early. Every Sprint 3
-# Administration page currently accepts any visitor -- a known,
-# documented gap, not an oversight (see app/api/routers/admin/__init__.py).
+# RFC-003. Access control is enforced by the API, not by hiding pages:
+# with RESOLVEIQ_AUTH_ENABLED the sign-in gate lives in
+# api_client.ensure_api_available(), and every /admin/* endpoint
+# requires the admin role (an engineer opening an Administer page gets
+# a 403 from the API). With auth disabled (local use) every page is open.
 navigation = st.navigation(
     {
         "Investigate": [

@@ -29,6 +29,7 @@ from app.domain.enums import DocumentStatus
 from app.domain.evidence import DocumentationRecord
 from app.domain.knowledge_management import DocumentPage, KnowledgeDashboardStats, UploadedDocumentResult
 from app.engines.ingestion.engine import IngestionEngine
+from app.infrastructure.storage.blob_store import BlobStore, LocalBlobStore
 
 if TYPE_CHECKING:
     from app.engines.knowledge.engine import KnowledgeEngine
@@ -59,13 +60,13 @@ class KnowledgeManagementEngine:
         component_repository: "ComponentProfileRepository",
         ingestion_engine: IngestionEngine,
         knowledge_engine: "KnowledgeEngine",
-        upload_dir: Path,
+        upload_dir: Path | BlobStore,
     ) -> None:
         self._repository = repository
         self._component_repository = component_repository
         self._ingestion = ingestion_engine
         self._knowledge = knowledge_engine
-        self._upload_dir = upload_dir
+        self._blobs: BlobStore = LocalBlobStore(upload_dir) if isinstance(upload_dir, Path) else upload_dir
 
     # --- Dashboard -------------------------------------------------------
 
@@ -148,11 +149,10 @@ class KnowledgeManagementEngine:
         document it fans out into) so the original is always
         retrievable for audit. ``Path(filename).name`` strips any
         directory component a browser might send, preventing writes
-        outside ``upload_dir``."""
-        self._upload_dir.mkdir(parents=True, exist_ok=True)
+        outside the storage location."""
         token = uuid.uuid4().hex[:12]
         safe_name = f"{token}_{Path(filename).name}"
-        (self._upload_dir / safe_name).write_bytes(content)
+        self._blobs.save(safe_name, content)
         return safe_name
 
     # --- Metadata step ---------------------------------------------------

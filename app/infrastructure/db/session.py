@@ -1,4 +1,4 @@
-"""SQLAlchemy engine/session wiring for SQLite.
+"""SQLAlchemy engine/session wiring (SQLite locally, any SQLAlchemy URL when hosted).
 
 ``create_engine`` is cached per URL (mirroring the Chroma client pattern)
 so both the FastAPI app and test suite can create isolated engines without
@@ -12,6 +12,7 @@ import sqlite3
 from functools import lru_cache
 
 from sqlalchemy import Engine, create_engine, inspect, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.infrastructure.db.models import Base
@@ -21,11 +22,13 @@ logger = logging.getLogger(__name__)
 
 @lru_cache
 def get_engine(sqlite_url: str) -> Engine:
-    logger.info("Connecting to database: %s", sqlite_url)
-    engine = create_engine(
-        sqlite_url,
-        connect_args={"check_same_thread": False},
-    )
+    logger.info("Connecting to database: %s", make_url(sqlite_url).render_as_string(hide_password=True))
+    if sqlite_url.startswith("sqlite"):
+        engine = create_engine(sqlite_url, connect_args={"check_same_thread": False})
+    else:
+        # Hosted database (e.g. PostgreSQL): pre-ping so a connection the
+        # server/pooler dropped is replaced instead of failing a request.
+        engine = create_engine(sqlite_url, pool_pre_ping=True)
     Base.metadata.create_all(engine)
     _add_missing_columns(engine)
     _reconcile_orphaned_columns(engine)
@@ -65,7 +68,7 @@ def _add_missing_columns(engine: Engine) -> None:
             if column.name in existing_columns:
                 continue
             ddl_type = column.type.compile(engine.dialect)
-            default_clause = _scalar_default_clause(column)
+            default_clause = _scalar_default_clause(column, engine.dialect.name)
             logger.warning(
                 "Adding missing column %s.%s (%s)%s -- existing DB predates this field",
                 table.name,
@@ -152,6 +155,10 @@ def _reconcile_orphaned_columns(engine: Engine) -> None:
     this function needs to reproduce; a real, single ``DROP COLUMN``
     is simpler and exactly as safe once the guarding index is gone.
     """
+    if engine.dialect.name != "sqlite":
+        # The orphaned column is local SQLite file drift (see
+        # ``_ORPHANED_COLUMNS``); a hosted database never had it.
+        return
     if sqlite3.sqlite_version_info < (3, 35, 0):
         logger.warning(
             "Skipping orphaned-column reconciliation: SQLite %s predates DROP COLUMN support (3.35.0+) -- "
@@ -194,7 +201,7 @@ def _reconcile_orphaned_columns(engine: Engine) -> None:
             )
 
 
-def _scalar_default_clause(column) -> str:
+def _scalar_default_clause(column, dialect_name: str = "sqlite") -> str:
     """Renders a SQLAlchemy column's configured Python-side scalar
     default as a SQLite ``DEFAULT ...`` clause, or ``""`` if the column
     has no default (or a non-scalar one, e.g. a callable like
@@ -205,6 +212,8 @@ def _scalar_default_clause(column) -> str:
         return ""
     value = default.arg
     if isinstance(value, bool):
+        if dialect_name == "postgresql":
+            return f"DEFAULT {'TRUE' if value else 'FALSE'}"  # PostgreSQL booleans reject 1/0
         return f"DEFAULT {1 if value else 0}"
     if isinstance(value, (int, float)):
         return f"DEFAULT {value}"

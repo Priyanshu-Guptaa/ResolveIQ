@@ -13,7 +13,10 @@ This client branches per type rather than assuming one shared shape.
 Auth: NTLM/Negotiate via Windows SSPI (``requests-negotiate-sspi``),
 confirmed live this session -- authenticates transparently as whatever
 Windows identity the ResolveIQ process runs under, no password/token
-ever touches this code.
+ever touches this code. When ``personal_access_token`` is supplied
+(hosted/Linux deployments, where SSPI does not exist) it is used instead
+as HTTP Basic auth with an empty username -- the PAT path has NOT been
+verified against the real TFS server.
 """
 
 from __future__ import annotations
@@ -135,7 +138,9 @@ class TfsRestConnector:
         base_url: str | None,
         project: str | None,
         timeout_seconds: float,
+        personal_access_token: str | None = None,
     ) -> None:
+        self._pat = personal_access_token
         self._base_url = base_url.rstrip("/") if base_url else None
         self._project = project
         self._timeout = timeout_seconds
@@ -164,6 +169,12 @@ class TfsRestConnector:
         if self._session is not None:
             return self._session
         with self._session_lock:
+            if self._session is None and self._pat:
+                # Hosted/non-Windows deployments: a TFS/Azure DevOps personal
+                # access token over Basic auth (empty username), no SSPI.
+                session = requests.Session()
+                session.auth = ("", self._pat)
+                self._session = session
             if self._session is None:
                 try:
                     from requests_negotiate_sspi import HttpNegotiateAuth

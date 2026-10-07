@@ -55,3 +55,34 @@ class SentenceTransformerEmbeddingProvider:
     @property
     def dimensions(self) -> int:
         return self._dimensions
+
+
+class OnnxEmbeddingProvider:
+    """``all-MiniLM-L6-v2`` through onnxruntime (via ChromaDB's bundled
+    runner) -- the same weights and tokenizer as
+    :class:`SentenceTransformerEmbeddingProvider`, without torch/
+    transformers (roughly 1.5-2 GB smaller in a container image).
+
+    Measured against sentence-transformers on sample texts: cosine
+    similarity 1.000000, so an index built with either backend is valid
+    for the other. The model file (~80 MB) is downloaded once to
+    ``~/.cache/chroma`` on first use -- bake it into the image at build
+    time rather than letting every container fetch it on start.
+    """
+
+    DIMENSIONS = 384
+
+    def __init__(self) -> None:
+        from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+
+        logger.info("Loading ONNX embedding model (all-MiniLM-L6-v2)...")
+        self._embed = ONNXMiniLM_L6_V2()
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        return [[float(x) for x in vector] for vector in self._embed(texts)]
+
+    @property
+    def dimensions(self) -> int:
+        return self.DIMENSIONS

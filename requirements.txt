@@ -1,41 +1,5 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-pydantic==2.10.4
-pydantic-settings==2.7.1
-python-multipart==0.0.20
-python-dateutil==2.9.0.post0
-SQLAlchemy==2.0.36
-chromadb==0.5.23
-sentence-transformers==3.3.1
-# Pinned explicitly: sentence-transformers doesn't pin transformers tightly
-# enough, and a too-new transformers pulls a tokenizers version newer than
-# chromadb (via its embedding-function deps) allows -- pinning both here
-# keeps pip's resolver from picking an inconsistent combination.
-transformers==4.46.3
-tokenizers==0.20.3
-protobuf<6,>=4.21
-rank_bm25==0.2.2
-# Hybrid Retrieval / RRF (Chat Assistant Phase 2): lexical (BM25) retrieval
-# alongside the existing ChromaDB vector search. Pure Python, no new
-# transitive dependency -- its only requirement (numpy) is already pulled
-# in by chromadb/sentence-transformers.
-streamlit==1.41.1
-requests==2.32.3
-requests-negotiate-sspi==0.5.2
-# External Knowledge (TFS live connector): Windows-only SSPI/NTLM auth,
-# so the app must still start and degrade gracefully (TfsConnectorError,
-# not an ImportError at startup) if this is ever unavailable -- see
-# app/engines/external_knowledge/tfs_rest_client.py's _auth().
-pytest==8.3.4
-httpx==0.28.1
-
-# Evidence Ingestion Pipeline (RFC rev 1, §04)
-python-docx==1.1.2
-openpyxl==3.1.5
-PyMuPDF==1.25.2
-pytesseract==0.3.13
-Pillow==11.1.0
-python-evtx==0.8.1
-python-pptx==1.0.2
-# Sprint 3 Phase 3.2: Knowledge Management's PPTX support -- pulls in
-# XlsxWriter as a transitive dependency; not used directly.
+# Full local-development install (API + UI + torch embeddings + tests).
+# Hosted images install the slimmer requirements-base.txt /
+# requirements-ui.txt (+ requirements-cloud.txt) instead -- see Dockerfile.
+-r requirements-dev.txt
+-r requirements-ui.txt

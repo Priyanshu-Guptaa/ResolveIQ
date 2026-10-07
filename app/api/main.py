@@ -10,10 +10,11 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
-from app.api.dependencies import get_knowledge_engine, run_knowledge_foundation_migration
+from app.api.dependencies import bootstrap_auth, get_knowledge_engine, run_knowledge_foundation_migration
 from app.api.routers import (
+    auth as auth_router,
     chat,
     dashboard,
     health,
@@ -30,6 +31,7 @@ from app.api.routers.admin import task_import as admin_task_import
 from app.api.routers.admin import knowledge_relationships as admin_knowledge_relationships
 from app.api.routers.admin import classification as admin_classification
 from app.api.routers.admin import resolution_verification as admin_resolution_verification
+from app.auth.dependencies import require_admin, require_user
 from app.config import get_settings
 from app.logging_config import configure_logging
 
@@ -41,6 +43,7 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
     logger.info("Starting %s", settings.app_name)
+    bootstrap_auth()
 
     if settings.auto_seed_knowledge:
         # Phase 3.1: JSON/constant -> governed SQLite tables (idempotent,
@@ -61,18 +64,25 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# /health and /auth/login stay open (liveness probes, sign-in itself); every
+# other router requires a signed-in user, and /admin/* requires the admin
+# role. With Settings.auth_enabled=False both dependencies are no-ops.
+_USER = [Depends(require_user)]
+_ADMIN = [Depends(require_admin)]
+
 app.include_router(health.router)
-app.include_router(chat.router)
-app.include_router(investigations.router)
-app.include_router(dashboard.router)
-app.include_router(settings_router.router)
-app.include_router(knowledge.router)
-app.include_router(sql_studio.router)
-app.include_router(product_intelligence.router)
-app.include_router(admin_knowledge_management.router)
-app.include_router(admin_knowledge_relationships.router)
-app.include_router(admin_knowledge_objects.router)
-app.include_router(admin_task_import.router)
-app.include_router(admin_log_knowledge.router)
-app.include_router(admin_classification.router)
-app.include_router(admin_resolution_verification.router)
+app.include_router(auth_router.router)
+app.include_router(chat.router, dependencies=_USER)
+app.include_router(investigations.router, dependencies=_USER)
+app.include_router(dashboard.router, dependencies=_USER)
+app.include_router(settings_router.router, dependencies=_USER)
+app.include_router(knowledge.router, dependencies=_USER)
+app.include_router(sql_studio.router, dependencies=_USER)
+app.include_router(product_intelligence.router, dependencies=_USER)
+app.include_router(admin_knowledge_management.router, dependencies=_ADMIN)
+app.include_router(admin_knowledge_relationships.router, dependencies=_ADMIN)
+app.include_router(admin_knowledge_objects.router, dependencies=_ADMIN)
+app.include_router(admin_task_import.router, dependencies=_ADMIN)
+app.include_router(admin_log_knowledge.router, dependencies=_ADMIN)
+app.include_router(admin_classification.router, dependencies=_ADMIN)
+app.include_router(admin_resolution_verification.router, dependencies=_ADMIN)
